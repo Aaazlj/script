@@ -97,7 +97,7 @@ async function viaLogin(server,ref,log,idx,us){
   let ld=l.result;
   if(!ld||ld.errcode!==0){log("❌ silent_login 失败");return null;}
   let d=ld.data;
-  log("✅ 登录成功，用户："+String(d.nick_name);)
+  log("✅ 登录成功，用户："+String(d.nick_name));
   return d;
 }
 //===== 朴朴用户类 =====
@@ -148,7 +148,7 @@ class Pupu extends BReq{
       let x=await this.rq({fn:"near",method:"get",url:"https://j1.pupuapi.com/client/store/place/near_location_by_city/v2",searchParams:{lng:"119"+CU.rs(5),lat:"26"+CU.rs(5)}});
       let ec=CU.get(x.result,"errcode",x.statusCode);
       if(ec==0){
-        let loc=CU.pick(x.result.data;
+        let loc=CU.pick(x.result.data);
         this.store_id=loc.service_store_id;
         this.zip=loc.city_zip;
         this.ext({"pp_storeid":loc.service_store_id,"pp-cityzip":loc.city_zip});
@@ -175,10 +175,10 @@ async sign(){
         let cs=dd.coupon_list?dd.coupon_list:[];
         for(let c of cs){
           let ca=(c.condition_amount/100).toFixed(2);
-          let da=(c.discount_amount/100).toFixed(2;
+          let da=(c.discount_amount/100).toFixed(2);
           rw.push("满"+ca+"减"+da+"券");
         }
-        this.log("📅 [签到] 成功："+rw.join("，");
+        this.log("📅 [签到] 成功："+rw.join("，"));
       }else{this.log("📅 [签到] 失败["+ec+"]");}
     }catch(e){this.log(e.message);}
   }
@@ -240,7 +240,7 @@ async join(t){
         let tag=df>0?"+"+df:df;
         this.log("💰 总朴分："+dd.balance+"（本次 "+tag+"）");
         if(dd.expiring_coin&&dd.expire_time){
-          let ed=CU.date(dd.expire_time;
+          let ed=CU.date(dd.expire_time);
           this.log("⏰ "+String(dd.expiring_coin)+"朴分 "+ed+" 过期");
         }
       }else{this.log("❌ 查询朴分失败["+ec+"]");}
@@ -259,10 +259,10 @@ async join(t){
   }
   async cafter(){
     try{
-      await CU.wait(3000;
+      await CU.wait(3000);
       let x=await this.rq({fn:"coin_after",method:"get",url:"https://j1.pupuapi.com/client/coin"});
       let ec=CU.get(x.result,"errcode",x.statusCode);
-      if(ec==0){this.log("💰 执行后朴分："+x.result.data.balance;)
+      if(ec==0){this.log("💰 执行后朴分："+x.result.data.balance);}
     }catch(e){this.log(e.message;}}
   }
 async task(){
@@ -281,7 +281,7 @@ function mkTargets(){
   for(let line of lines){
     let e=pent(line);
     if(!e){
-      if(line.trim()){CU.log("⚠️ YYB_SERVER 忽略行："+line.trim();}
+      if(line.trim()){CU.log("⚠️ YYB_SERVER 忽略行："+line.trim());}
       continue;
     }
     arr.push({server:e.server,ref:e.ref,remark:"",nickname:"",index:arr.length+1});
@@ -292,7 +292,7 @@ async function mkLabels(arr){
   let g={};
   for(let t of arr){
     if(!g[t.server]){g[t.server]=[];}
-    g[t.server].push(t;
+    g[t.server].push(t);
   }
   for(let s of Object.keys(g)){
     try{
@@ -320,7 +320,7 @@ async function mkLabels(arr){
           }
         }
       }
-    }catch(e){CU.log("⚠️ 读取备注失败["+s+"]："+e.message;}
+    }catch(e){CU.log("⚠️ 读取备注失败["+s+"]："+e.message);}
   }
 }
 async function load(){
@@ -330,12 +330,12 @@ async function load(){
     if(!arr.length){CU.log("❌ YYB_SERVER 未读到有效账号（格式：地址@账号ID）");return false;}
     await mkLabels(arr);
     for(let t of arr){
-      CU.list.push(new Pupu("",t.ref,t.server,t.remark,t.nickname);
+      CU.list.push(new Pupu("",t.ref,t.server,t.remark,t.nickname));
     }
   }else if(WXURL&&PPOPENID){
     let rs=PPOPENID.split(/[,，&\r\n]+/).map(r=>r.trim()).filter(r=>r);
     let s=WXURL.replace(/\/+$/,"");
-    for(let r of rs){CU.list.push(new Pupu("",r,s;;}
+    for(let r of rs){CU.list.push(new Pupu("",r,s));}
   }else{
     CU.log("❌ 未配置 YYB_SERVER（格式：地址@账号ID或OpenID）");
     return false;
@@ -354,7 +354,7 @@ async function load(){
     u.log("🌍 来源："+u.server);
     let ok=await u.silent_login();
     if(!ok){u.log("❌ 登录失败，跳过");continue;}
-    vs.push(u;
+    vs.push(u);
     await u.task();
     await u.cafter();
     await u.coin();
