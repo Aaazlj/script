@@ -1,22 +1,18 @@
 /**
-Author: Aaa
-Date: 2026.09.12
-Description: 美团优惠券自动领取
-Cron: 0 10 * * *
-
-* 美团优惠券 · 青龙脚本
+* @name         美团自动领券
+* @author       Aaa
+* @date         2026-09-12
+* @description  美团优惠券自动领取
+* @cron         0 10 * * *
 *
-* ── 配置选项（青龙面板 → 环境变量）──────────────────────────
-* MT_TOKEN        必填。美团的登录 token，多账号用 # 或换行分隔
-* MT_TOKEN_FILE   可选。token 文件路径（未设置环境变量时从这里读）
-* MT_PUSH_URL     可选。自定义推送地址，脚本 POST 一段 JSON {title, content}
-* MT_MAX_COUPONS  可选。通知里最多展示几张券，默认 8
+* 环境变量：
+* MT_TOKEN        必填，美团登录 Token，多账号使用 # 或换行分隔
+* MT_TOKEN_FILE   可选，Token 文件路径
+* MT_PUSH_URL     可选，自定义推送地址
+* MT_MAX_COUPONS  可选，通知最多展示几张券，默认 8
 *
-* ── 定时建议 ──────────────────────────────────────────────
-* Cron: 0 10 * * *       每天 10:00 自动领券（注意容器时区建议设为 Asia/Shanghai）
-*
-* ── 获取 token ────────────────────────────────────────────
-* 用配套的 token-web 扫码登录，复制 token 填入青龙环境变量即可。
+* 定时：每天 10:00
+* 时区：Asia/Shanghai
 */
 
 const https = require('https');
