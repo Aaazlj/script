@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>美团 Token 获取 · 本地服务</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">团</div>
+        <div class="brand-text">
+          <h1>美团 Token 获取</h1>
+          <p>扫码登录 → 复制 token → 喂给青龙</p>
+        </div>
+      </div>
+      <span id="statusBadge" class="badge badge-loading">检查中…</span>
+    </header>
+
+    <main class="layout">
+      <!-- 登录 -->
+      <section class="card">
+        <div class="card-head">
+          <h2>扫码登录</h2>
+          <span class="card-sub">用美团 App 扫码，完成后自动拿到 token</span>
+        </div>
+        <div class="card-body">
+          <div class="login-area">
+            <div id="qrWrap" class="qr-wrap"><span class="empty">尚未开始登录</span></div>
+            <div class="login-side">
+              <p id="loginLink" class="hint"></p>
+              <p id="loginTip" class="hint"></p>
+            </div>
+          </div>
+          <div class="form-row">
+            <button id="btnLogin" class="btn btn-primary">开始扫码登录</button>
+            <button id="btnLogout" class="btn btn-ghost">退出登录</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Token -->
+      <section class="card">
+        <div class="card-head">
+          <h2>Token</h2>
+          <span class="card-sub">本机保存，不会上传到任何地方</span>
+        </div>
+        <div class="card-body">
+          <div class="kv">
+            <span id="tokenMask">—</span>
+            <span id="tokenLen" class="hint"></span>
+          </div>
+          <textarea id="tokenBox" class="textarea" rows="4" placeholder="登录后会在这里显示完整 token" readonly></textarea>
+          <div class="form-row">
+            <button id="btnToggle" class="btn btn-ghost">显示完整 token</button>
+            <button id="btnCopy" class="btn btn-primary">复制 token</button>
+            <button id="btnCopyEnv" class="btn btn-ghost">复制青龙变量</button>
+            <button id="btnExport" class="btn btn-ghost">导出到文件</button>
+            <button id="btnVerify" class="btn btn-ghost">验证是否可用</button>
+          </div>
+          <p id="exportInfo" class="hint"></p>
+          <pre id="qlSnippet" class="code">export MT_TOKEN=</pre>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
