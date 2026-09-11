@@ -1,1 +1,6 @@
 .env
+
+# token-web 运行产物（含明文 token，禁止入库）
+token-web/data/
+mt_token.txt
+.workbuddy/
