@@ -6,7 +6,7 @@ Date: 2026-04-04
 new Env("顺丰速运日常任务")
 变量名:sfsyUrl
 mcs-mimp-web.sf-express.com中的cookie
-cron 13 13 * * *
+cron: 13 13 * * *
 """
 # 扫码获取ck地址：https://sm.9999.blue/
 import hashlib

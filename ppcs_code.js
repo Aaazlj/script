@@ -3,7 +3,8 @@ Author: anonymous
 Date: 2026.08.21
 Adapted: YYB-Go-Enhanced edition
 Description: 朴朴超市签到code本（YYB-Go-Enhanced 适配版）
-Cron: 20 8,12,20 * * *
+cron: 20 8,12,20 * * *
+new Env('朴朴超市Code版')
 ----------------------------------------------------------------------------------------------
 朴朴超市签到 code 本 v1.2.0 (YYB-Go-Enhanced 适配版)
 

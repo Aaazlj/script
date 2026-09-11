@@ -32,7 +32,9 @@ const IN_QINGLONG = typeof Env === 'function';
 const $ = (() => {
   if (IN_QINGLONG) {
     try {
-      return new Env(SCRIPT_NAME);
+      // 注意：青龙靠扫描 Env 构造参数里的【字符串字面量】取任务名，
+      // 这里必须写字面量，不能传 SCRIPT_NAME 变量（否则任务名会变成 "SCRIPT_NAME"）
+      return new Env('美团自动领券');
     } catch (_) { /* 降级到本地实现 */ }
   }
   return {

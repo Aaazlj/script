@@ -23,6 +23,31 @@ ql repo https://github.com/Aaazlj/script.git "" "token-web|node_modules|yyb_go" 
 ql repo https://github.com/Aaazlj/script.git "meituan_coupon|ppcs|sfsy" "token-web|node_modules" "" "master" "js|py"
 ```
 
+## 青龙自动添加任务 · 名称与定时约定
+
+青龙 `shell/update.sh` 的 `add_cron()` 按下面顺序取**任务名**：
+
+1. `grep "new Env"` → 取 `(` 与 `)` 之间被**单/双引号包裹的字面量**
+2. 取不到 → `grep "name:"` 取冒号后内容
+3. 还取不到 → 用文件名
+
+所以脚本里必须写成字面量：
+
+```js
+new Env('朴朴超市')     // ✅ 任务名 = 朴朴超市
+new Env(SCRIPT_NAME)    // ❌ 任务名会变成 "SCRIPT_NAME"
+```
+
+定时同理，只认小写 `cron:`（`grep "cron:"` 大小写敏感）：
+
+```
+cron: 9 8 * * *         // ✅
+Cron: 9 8 * * *         // ❌ 匹配不到，会退化成随机定时
+cron 9 8 * * *          // ❌ 同上
+```
+
+> 已存在的定时任务不会因为改脚本而自动改名，需在面板手动改，或删掉后重新拉库。
+
 ## 朴朴签到 · YYB-Go-Enhanced 网关
 
 `ppcs_code.js` 不填 ck，登录 code 由本地网关 `yyb_go` 提供：
