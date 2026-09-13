@@ -4,3 +4,7 @@
 token-web/data/
 mt_token.txt
 .workbuddy/
+
+# 领券脚本运行产物
+data/
+mt_coupons_cache.json
