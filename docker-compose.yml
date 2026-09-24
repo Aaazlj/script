@@ -53,6 +53,23 @@ services:
       - panel
       - qinglong
 
+  # 把面板通过 Cloudflare Tunnel 暴露到自定义域名，无需在服务器上开任何入站端口。
+  # 连接器 token 放在同目录 .env（已被 .gitignore 忽略，勿提交）：
+  #   CF_TUNNEL_TOKEN=<cloudflared 隧道 token>
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: scan-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - panel
+    environment:
+      # cloudflared 会直接读这个环境变量，避免 token 出现在命令行里
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:-}
+      TZ: Asia/Shanghai
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:2000 run
+    networks:
+      - panel
+
 networks:
   panel:
     name: script_panel

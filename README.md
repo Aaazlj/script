@@ -15,6 +15,20 @@ docker compose up -d --build     # 面板 http://<服务器IP>:5180 ，后台 /a
 
 细节见 [`panel/README.md`](panel/README.md)。
 
+### 用 Cloudflare Tunnel 挂到自定义域名
+
+不用在服务器上开放任何入站端口，Cloudflare 自动签证书并反代。
+
+```bash
+# 1) 建隧道 + 配 ingress（hostname → http://scan-panel:5180），拿到 tunnel_id 和 token
+# 2) 在 leozai.com 区域加 CNAME：scan → <tunnel_id>.cfargotunnel.com（必须开代理）
+# 3) 服务器上写 token 并启动连接器
+echo "CF_TUNNEL_TOKEN=<token>" > /root/script/.env && chmod 600 /root/script/.env
+docker compose up -d
+```
+
+隧道配置与排错见 [`panel/README.md`](panel/README.md#通过-cloudflare-tunnel-暴露到自定义域名)。
+
 ### 部署到 /root/script（阿里云）
 
 ```bash

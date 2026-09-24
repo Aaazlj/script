@@ -57,6 +57,53 @@ docker compose up -d --build
 
 ---
 
+## 通过 Cloudflare Tunnel 暴露到自定义域名
+
+服务器不需要开放任何入站端口（5180 可以只在安全组里放行给内网或干脆关掉），
+Cloudflare 会自动签发证书并把 `https://<域名>` 反代到面板。
+
+1. 建隧道并配置 ingress（把公网域名指到 compose 里的面板服务）：
+
+   ```
+   PUT /accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations
+   {
+     "config": {
+       "ingress": [
+         { "hostname": "scan.leozai.com", "service": "http://scan-panel:5180" },
+         { "service": "http_status:404" }
+       ]
+     }
+   }
+   ```
+
+   `service` 用 compose 网络里的容器名/服务名，因为 cloudflared 也跑在 `script_panel` 网络里。
+
+2. 在 `leozai.com` 区域建一条 DNS：
+
+   | 类型 | 名称 | 内容 | 代理状态 |
+   |------|------|------|----------|
+   | CNAME | `scan` | `<tunnel_id>.cfargotunnel.com` | 已代理（橙色云） |
+
+   > 这条记录**必须存在**，否则 Cloudflare 不会把请求交给隧道。
+   > 若用 API：`POST /zones/{zone_id}/dns_records`，需要 token 具备 `Zone → DNS → Edit`。
+
+3. 把连接器 token 写进服务器上的 `.env`，然后启动：
+
+   ```bash
+   echo "CF_TUNNEL_TOKEN=<token>" > /root/script/.env && chmod 600 /root/script/.env
+   docker compose up -d
+   ```
+
+   token 通过环境变量 `TUNNEL_TOKEN` 注入，不会出现在容器的命令行里（`ps` 看不到）。
+
+4. 验证隧道已连上：
+
+   ```
+   GET /accounts/{account_id}/cfd_tunnel/{tunnel_id}/connections
+   ```
+
+   有 `conns` 且 `is_pending_reconnect: false` 即为健康。
+
 ## 本地不用 Docker 直接跑
 
 ```bash
