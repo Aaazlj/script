@@ -191,7 +191,7 @@ route('POST', '/api/admin/setup', async (req, res) => {
 
   // 防止别人抢先设置密码：只允许本机或首个访问者
   auth.setPassword(password);
-  res.setHeader('Set-Cookie', auth.sessionCookie(auth.issueSession()));
+  res.setHeader('Set-Cookie', auth.sessionCookie(auth.issueSession(), auth.isSecureRequest(req)));
   httpx.ok(res, { configured: true });
 });
 
@@ -205,7 +205,7 @@ route('POST', '/api/admin/login', async (req, res) => {
     return httpx.fail(res, 401, '密码错误');
   }
   auth.clearFailures(ip);
-  res.setHeader('Set-Cookie', auth.sessionCookie(auth.issueSession()));
+  res.setHeader('Set-Cookie', auth.sessionCookie(auth.issueSession(), auth.isSecureRequest(req)));
   httpx.ok(res, { loggedIn: true });
 });
 
@@ -221,7 +221,7 @@ route('POST', '/api/admin/password', async (req, res) => {
   if (next.length < 8) return httpx.fail(res, 400, '新密码至少 8 位');
   if (next !== String(body.confirm || '')) return httpx.fail(res, 400, '两次输入的新密码不一致');
   auth.setPassword(next);
-  res.setHeader('Set-Cookie', auth.sessionCookie(auth.issueSession()));
+  res.setHeader('Set-Cookie', auth.sessionCookie(auth.issueSession(), auth.isSecureRequest(req)));
   httpx.ok(res, { changed: true });
 }, { admin: true });
 
