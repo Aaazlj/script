@@ -31,7 +31,8 @@ services:
     depends_on:
       - yyb-go
     ports:
-      - "5180:5180"
+      # 只绑回环：对外统一走宿主机 nginx（scan.leozai.com），不直接暴露面板
+      - "127.0.0.1:5180:5180"
     environment:
       PORT: "5180"
       TZ: Asia/Shanghai
