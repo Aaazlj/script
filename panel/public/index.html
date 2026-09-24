@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>扫码登录面板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1 class="page-title">扫码登录面板</h1>
+  <p class="page-sub">选一个平台扫码，登录成功后会自动把凭据写进青龙面板。</p>
+
+  <div id="banner"></div>
+
+  <div class="tabs">
+    <button class="tab active" data-mode="yyb">
+      <div class="t-name">应用宝扫码</div>
+      <div class="t-desc">微信扫码授权 · 写入 yyb_server</div>
+    </button>
+    <button class="tab" data-mode="meituan">
+      <div class="t-name">美团扫码</div>
+      <div class="t-desc">美团 App 扫码 · 写入 MT_TOKEN</div>
+    </button>
+  </div>
+
+  <div class="card">
+    <div class="qr-box" id="qrBox">正在生成二维码…</div>
+    <div class="status pending" id="status"></div>
+    <div class="countdown" id="countdown"></div>
+    <div class="center row" style="justify-content:center">
+      <button class="btn small" id="restartBtn">重新生成二维码</button>
+      <a class="btn small ghost" id="linkBtn" style="display:none" target="_blank" rel="noopener">在浏览器中打开授权链接</a>
+    </div>
+    <div id="result"></div>
+  </div>
+
+  <div class="footer">
+    默认不采集任何额外信息，仅把扫码得到的凭据写入你自己的青龙面板 ·
+    <a href="/admin">管理后台</a>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+let mode = 'yyb';
+let sid = null;
+let stopped = true;
+let cdTimer = null;
+let secsLeft = 0;
+
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok || !data || data.ok !== true) {
+    const err = new Error((data && data.error) || `HTTP ${res.status}`);
+    err.payload = data;
+    err.status = res.status;
+    throw err;
+  }
+  return data.data;
+}
+
+function setStatus(text, cls) {
+  const s = $('status');
+  s.textContent = text || '';
+  s.className = 'status ' + (cls || '');
+}
+
+function setQr(html) { $('qrBox').innerHTML = html; }
+
+function note(kind, lines) {
+  const box = document.createElement('div');
+  box.className = 'note ' + kind;
+  for (const line of lines) {
+    const div = document.createElement('div');
+    if (typeof line === 'string') div.textContent = line;
+    else div.appendChild(line);
+    box.appendChild(div);
+  }
+  $('result').appendChild(box);
+}
+
+function kv(rows) {
+  const t = document.createElement('table');
+  t.className = 'kv';
+  for (const [k, v] of rows) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td');
+    td1.className = 'k';
+    td1.textContent = k;
+    const td2 = document.createElement('td');
+    td2.textContent = v;
+    tr.append(td1, td2);
+    t.appendChild(tr);
+  }
+  return t;
+}
+
+function clearResult() { $('result').innerHTML = ''; }
+function stopTimers() { if (cdTimer) clearInterval(cdTimer); cdTimer = null; stopped = true; }
+
+function startCountdown(seconds, onExpire) {
+  secsLeft = seconds;
+  $('countdown').textContent = `二维码 ${secsLeft}s 后自动刷新`;
+  cdTimer = setInterval(() => {
+    secsLeft -= 1;
+    $('countdown').textContent = secsLeft > 0
+      ? `二维码 ${secsLeft}s 后自动刷新`
+      : '二维码已过期，正在刷新…';
+    if (secsLeft <= 0) { clearInterval(cdTimer); cdTimer = null; onExpire(); }
+  }, 1000);
+}
+
+/* ---------- 上传结果渲染 ---------- */
+
+function renderUpload(up) {
+  if (!up) return ['ℹ️ 未上传（没有生成可写入的凭据）', 'info'];
+  if (!up.ok) return [`❌ 写青龙失败：${up.error || '未知错误'}`, 'err'];
+  const name = up.variable || '环境变量';
+  if (up.action === 'created') return [`✅ 已在青龙新建 ${name}`, 'ok'];
+  if (up.action === 'updated') return [`✅ 已更新青龙 ${name}`, 'ok'];
+  if (up.action === 'appended') return [`✅ 已追加到青龙 ${name}（当前共 ${up.existingLines || 1} 行）`, 'ok'];
+  if (up.action === 'unchanged') return [`ℹ️ 青龙 ${name} 已是最新，无需改动`, 'info'];
+  return [`✅ 已写入青龙 ${name}`, 'ok'];
+}
+
+function renderUploadDetail(up) {
+  if (!up || !up.ok) return null;
+  const rows = [];
+  if (up.host) rows.push(['青龙', up.host]);
+  rows.push(['变量名', up.variable || '-']);
+  if (up.variable === 'yyb_server') {
+    rows.push(['写入值', up.value || '-']);
+    if (up.previous !== undefined && up.previous !== up.value) rows.push(['原值', up.previous || '（空）']);
+  } else {
+    rows.push(['token', up.masked || '****']);
+  }
+  if (up.duplicates) rows.push(['提示', `青龙里还有 ${up.duplicates} 条同名变量，本次只改了第一条`]);
+  return kv(rows);
+}
+
+/* ---------- 应用宝 ---------- */
+
+async function startYyb() {
+  stopTimers();
+  clearResult();
+  $('linkBtn').style.display = 'none';
+  setQr('正在生成二维码…');
+  setStatus('正在获取二维码…', 'pending');
+  $('countdown').textContent = '';
+
+  let r;
+  try {
+    r = await api('POST', '/api/yyb/qr');
+  } catch (e) {
+    setStatus('获取二维码失败', 'err');
+    setQr('<span style="color:#d64545">×</span>');
+    note('err', [`无法连上应用宝网关：${e.message}`, '请确认 yyb_go 已启动，且管理后台里的网关地址正确。']);
+    return;
+  }
+
+  sid = r.sid;
+  setQr(r.imageBase64
+    ? `<img src="${r.imageBase64}" alt="应用宝二维码">`
+    : `<img src="${r.imageUrl}" alt="应用宝二维码">`);
+  setStatus('等待微信扫码…', 'pending');
+  stopped = false;
+  startCountdown(110, startYyb);
+  pollYyb();
+}
+
+async function pollYyb() {
+  while (!stopped && sid) {
+    let st;
+    try {
+      st = await api('GET', `/api/yyb/poll?sid=${encodeURIComponent(sid)}`);
+    } catch (e) {
+      if (e.status === 404) { stopTimers(); setStatus('会话已过期，请重新生成二维码', 'err'); return; }
+      await sleep(1500);
+      continue;
+    }
+    if (stopped) return;
+
+    if (st.status === 'pending') setStatus('等待微信扫码…', 'pending');
+    else if (st.status === 'scanned') setStatus('已扫码，请在手机上确认登录', 'scanned');
+    else if (st.status === 'authorized' || st.status === 'confirmed') {
+      stopTimers();
+      clearInterval(cdTimer); cdTimer = null;
+      await finishYyb();
+      return;
+    } else if (st.status === 'cancelled') {
+      stopTimers(); $('countdown').textContent = '';
+      setStatus('已在手机上取消，请重新生成二维码', 'err');
+      return;
+    } else if (st.status === 'expired' || st.status === 'unknown') {
+      stopTimers(); startYyb();
+      return;
+    }
+    await sleep(1500);
+  }
+}
+
+async function finishYyb() {
+  setStatus('授权成功，正在写入青龙…', 'done');
+  $('countdown').textContent = '';
+  let r;
+  try {
+    r = await api('POST', '/api/yyb/confirm', { sid });
+  } catch (e) {
+    setStatus('确认授权失败', 'err');
+    note('err', [`${e.message}`, '如果是「buffer not ready」，稍等一下重新扫码即可。']);
+    return;
+  }
+  setQr('<span class="tick">✓</span>');
+  setStatus('✓ 添加完成', 'done');
+  const acc = r.account || {};
+  note('info', [kv([
+    ['账号', acc.nickname || acc.openid || '-'],
+    ['openid', acc.openid || '-'],
+    ['状态', acc.status || '-'],
+  ])]);
+  const [text, kind] = renderUpload(r.upload);
+  note(kind, [text]);
+  const detail = renderUploadDetail(r.upload);
+  if (detail) note('info', [detail]);
+}
+
+/* ---------- 美团 ---------- */
+
+async function startMeituan() {
+  stopTimers();
+  clearResult();
+  $('linkBtn').style.display = 'none';
+  setQr('正在唤起美团登录…');
+  setStatus('正在获取登录二维码…', 'pending');
+  $('countdown').textContent = '';
+
+  let r;
+  try {
+    r = await api('POST', '/api/meituan/start');
+  } catch (e) {
+    setStatus('获取二维码失败', 'err');
+    setQr('<span style="color:#d64545">×</span>');
+    note('err', [e.message]);
+    return;
+  }
+
+  sid = r.sid;
+
+  if (r.mode === 'token') {
+    setQr('<span class="tick">✓</span>');
+    setStatus('✓ 已有有效登录态', 'done');
+    const [text, kind] = renderUpload(r.upload);
+    note(kind, [text]);
+    const detail = renderUploadDetail(r.upload);
+    if (detail) note('info', [detail]);
+    return;
+  }
+
+  if (r.imageUrl) {
+    setQr(`<img src="${r.imageUrl}" alt="美团登录二维码">`);
+  } else if (r.imageBase64) {
+    setQr(`<img src="${r.imageBase64}" alt="美团登录二维码">`);
+  } else {
+    setQr('<span style="font-size:13px">二维码图片生成失败，请点下方按钮用美团 App 打开授权链接</span>');
+  }
+  if (r.authUrl) {
+    const btn = $('linkBtn');
+    btn.href = r.authUrl;
+    btn.style.display = '';
+  }
+  setStatus('请用美团 App 扫码并确认登录', 'pending');
+  $('countdown').textContent = '链接有效期约 10 分钟，登录完成后会自动继续';
+  stopped = false;
+  pollMeituan();
+}
+
+async function pollMeituan() {
+  while (!stopped && sid) {
+    let st;
+    try {
+      st = await api('GET', `/api/meituan/status?sid=${encodeURIComponent(sid)}`);
+    } catch (e) {
+      if (e.status === 404) { stopTimers(); setStatus('会话已过期，请重新生成二维码', 'err'); return; }
+      await sleep(2000);
+      continue;
+    }
+    if (stopped) return;
+
+    if (st.status === 'running') { setStatus('等待扫码授权…', 'pending'); await sleep(2000); continue; }
+
+    stopTimers();
+    $('countdown').textContent = '';
+
+    if (st.status === 'failed') {
+      setStatus('登录失败', 'err');
+      note('err', [st.message || '请重新生成二维码再试一次']);
+      return;
+    }
+
+    setQr('<span class="tick">✓</span>');
+    setStatus('✓ 登录成功', 'done');
+    const [text, kind] = renderUpload(st.upload);
+    note(kind, [text]);
+    const detail = renderUploadDetail(st.upload);
+    if (detail) note('info', [detail]);
+    return;
+  }
+}
+
+/* ---------- 交互 ---------- */
+
+function switchMode(next) {
+  if (mode === next) return;
+  mode = next;
+  stopTimers();
+  sid = null;
+  for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t.dataset.mode === next);
+  start();
+}
+
+function start() {
+  if (mode === 'yyb') startYyb();
+  else startMeituan();
+}
+
+for (const t of document.querySelectorAll('.tab')) {
+  t.addEventListener('click', () => switchMode(t.dataset.mode));
+}
+$('restartBtn').addEventListener('click', () => { stopTimers(); start(); });
+
+(async () => {
+  try {
+    const h = await api('GET', '/api/health');
+    if (h.needsSetup) {
+      note('warn', ['管理员还没有设置密码，请先打开 /admin 完成初始化，否则扫码结果无法写入青龙。']);
+    }
+    if (!h.qinglongConfigured) {
+      note('warn', ['还没配置青龙面板（host / Client ID / Client Secret），扫码成功后无法自动上传，请先到 /admin 配置。']);
+    }
+  } catch (_) { /* 健康检查失败不阻断扫码 */ }
+  start();
+})();
+
+window.addEventListener('beforeunload', stopTimers);
+</script>
+</body>
+</html>

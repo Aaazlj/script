@@ -7,23 +7,45 @@
  * 零第三方依赖，只用 Node 内置模块；所有敏感数据只在本机流转，
  * 服务只监听 127.0.0.1。
  *
+ * 登录能力依赖官方专家包 meituan-living-assistant 的 scripts/run.js：
+ * 默认按当前用户主目录自动探测，可用环境变量 MT_RUN_JS 指定绝对路径覆盖。
+ *
  * 启动：node server.js   →   http://127.0.0.1:5178
  */
 
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const RUN_JS =
-  'C:/Users/Administrator/.workbuddy/plugins/marketplaces/experts/plugins/meituan-living-assistant/scripts/run.js';
+// 自动定位官方专家包里的 run.js（登录能力由它提供）。
+// 不再写死某个机器的绝对路径：先用 MT_RUN_JS 覆盖，再按当前用户主目录探测。
+function resolveRunJs() {
+  const candidates = [
+    process.env.MT_RUN_JS,
+    path.join(os.homedir(), '.workbuddy', 'plugins', 'marketplaces', 'experts', 'plugins',
+              'meituan-living-assistant', 'scripts', 'run.js'),
+    path.join(os.homedir(), '.codebuddy', 'plugins', 'marketplaces', 'experts', 'plugins',
+              'meituan-living-assistant', 'scripts', 'run.js'),
+    path.join(os.homedir(), '.workbuddy', 'plugins', 'marketplaces', 'experts', 'plugins',
+              'meituan-living-deals-assistant', 'scripts', 'run.js'),
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch (_) { /* 继续探测 */ }
+  }
+  return null;
+}
+
+const RUN_JS = resolveRunJs();
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DATA_DIR = path.join(__dirname, 'data');
 const PORT = Number(process.env.PORT || 5178);
 const HOST = '127.0.0.1';
 
 const COUPON_API = 'https://media.meituan.com/fulishemini/couponActivity/sendCouponWork';
+const AI_SCENE = (process.env.MT_AI_SCENE || '').trim();
 
 /* ------------------------------------------------------------------ *
  * run.js 子进程调用（登录相关）
@@ -31,6 +53,13 @@ const COUPON_API = 'https://media.meituan.com/fulishemini/couponActivity/sendCou
 
 function runCli(args, timeoutMs = 60000) {
   return new Promise((resolve) => {
+    if (!RUN_JS) {
+      return resolve({
+        ok: false,
+        error: 'RUN_JS_NOT_FOUND',
+        message: '未找到美团专家包的 run.js，请安装「领券下单找我」专家，或用 MT_RUN_JS 指定其绝对路径',
+      });
+    }
     let child;
     try {
       child = spawn(process.execPath, [RUN_JS, ...args], {
@@ -102,7 +131,7 @@ function startTask(cmd, argv) {
 
 function verifyToken(token) {
   return new Promise((resolve) => {
-    const body = Buffer.from(JSON.stringify({ token, aiScene: '', version: 2 }), 'utf8');
+    const body = Buffer.from(JSON.stringify({ token, aiScene: AI_SCENE, version: 2 }), 'utf8');
     const parsed = new URL(COUPON_API);
     const req = https.request(
       {
