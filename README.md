@@ -25,7 +25,7 @@ git clone https://github.com/Aaazlj/script.git /root/script && cd /root/script
 mkdir -p meituan-expert && tar xzf meituan-expert.tgz -C meituan-expert --strip-components=1
 
 # 3) 起服务
-mkdir -p data/panel data/yyb/db data/yyb/avatars
+mkdir -p data/panel data/yyb/db data/yyb/avatars data/meituan-auth
 docker compose up -d --build
 ```
 

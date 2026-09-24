@@ -38,6 +38,7 @@ docker compose up -d --build
 3. **美团**：run.js 路径默认 `/opt/meituan-expert/scripts/run.js`，点「环境自检」。
 
 配置项保存在 `data/panel/config.json`（0600），密码用 scrypt 加盐哈希。
+美团的登录态落在 `data/meituan-auth/`，容器重建也不用重新扫码。
 
 ### 网络是怎么打通的
 
