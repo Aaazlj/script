@@ -83,7 +83,7 @@ function isLoggedIn(req) {
   return isValidSession(parseCookie(req.headers.cookie, COOKIE_NAME));
 }
 
-function sessionCookie(token) {
+function sessionCookie(token, secure) {
   const attrs = [
     `${COOKIE_NAME}=${encodeURIComponent(token)}`,
     'Path=/',
@@ -91,7 +91,15 @@ function sessionCookie(token) {
     'SameSite=Lax',
     `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
   ];
+  // 走 HTTPS（Cloudflare / 反代）时才加 Secure，否则本地 http 调试会拿不到 cookie
+  if (secure) attrs.push('Secure');
   return attrs.join('; ');
+}
+
+/** 判断请求是否来自 https（Cloudflare 会带上 x-forwarded-proto） */
+function isSecureRequest(req) {
+  const proto = String((req.headers && req.headers['x-forwarded-proto']) || '').split(',')[0].trim();
+  return proto === 'https';
 }
 
 function clearCookie() {
@@ -134,6 +142,7 @@ module.exports = {
   issueSession,
   isLoggedIn,
   sessionCookie,
+  isSecureRequest,
   clearCookie,
   tooManyAttempts,
   recordFailure,
