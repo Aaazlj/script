@@ -6,17 +6,19 @@
 cron: 0 10 * * *
 ------------------------------------------
 环境变量：
-MT_TOKEN        必填，美团登录 Token，多账号使用 # 或换行分隔
+MT_TOKEN        必填，美团登录 Token，多账号使用换行分隔
+                 （单行时兼容旧的 # 分隔写法；换行分隔时 token 内的 # 不再被截断）
 MT_TOKEN_FILE   可选，Token 文件路径
                  默认依次尝试 mt_token.txt / data/mt_token.txt / token-web/data/mt_token.txt
-MT_PUSH_URL     可选，自定义推送地址（POST {title, content}）
+MT_AI_SCENE     可选，接口 aiScene 渠道标识，默认空
+MT_PUSH_URL     可选，自定义推送地址（POST {title, content}，http / https 均可）
 MT_MAX_COUPONS  可选，通知最多展示几张券，默认 8
 MT_CACHE_FILE   可选，当日券缓存路径，默认 data/mt_coupons_cache.json
 ------------------------------------------
 重要：
   每天限领一次。当天已领过时，接口只返回 code 1014，couponList 为空，
   不会带任何券数据。所以脚本在【真正领到券】的那次把明细写入本地缓存，
-  之后再跑（1014）就从缓存回放，跨天自动失效。
+  之后再跑（当天）直接命中缓存回放，不再重复打领券接口，跨天自动失效。
 ------------------------------------------
 获取 Token：仓库内 token-web/ 目录提供扫码登录服务
            node token-web/server.js → http://127.0.0.1:5178
@@ -31,6 +33,7 @@ const crypto = require('crypto');
 const API_URL = 'https://media.meituan.com/fulishemini/couponActivity/sendCouponWork';
 const TIMEOUT_MS = 20000;
 const MAX_COUPONS = Number(process.env.MT_MAX_COUPONS || 8) || 8;
+const AI_SCENE = (process.env.MT_AI_SCENE || '').trim();
 
 /* ============ 运行环境：青龙 Env + 本地兜底 ============ */
 
@@ -55,6 +58,15 @@ const $ = (() => {
 
 /* ============ Token 获取 ============ */
 
+// 多账号分隔：优先按换行切分（这样 token 自带的 # 不会被截断）；
+// 只有整段不含换行时才退回按 # 切分，兼容旧的单行写法。
+function splitTokens(text) {
+  const raw = String(text || '').replace(/\r/g, '').trim();
+  if (!raw) return [];
+  const parts = raw.includes('\n') ? raw.split(/\n+/) : raw.split(/#+/);
+  return parts.map((s) => s.trim()).filter(Boolean);
+}
+
 function readTokenFile() {
   const candidates = [
     process.env.MT_TOKEN_FILE,
@@ -67,8 +79,13 @@ function readTokenFile() {
     try {
       if (fs.existsSync(file)) {
         const text = fs.readFileSync(file, 'utf8').replace(/\r/g, '');
-        // 兼容纯 token、MT_TOKEN=xxx、export MT_TOKEN=xxx 三种写法
-        const matched = text.match(/(?:^|\n)(?:export\s+)?MT_TOKEN\s*=\s*(.+)/);
+        // 兼容纯 token、MT_TOKEN=xxx、export MT_TOKEN=xxx 三种写法；
+        // 只在非注释行里找赋值，避免把 "#MT_TOKEN=xxx" 这类注释当有效 token
+        const matched = text
+          .split('\n')
+          .filter((line) => !/^\s*#/.test(line))
+          .join('\n')
+          .match(/(?:^|\n)\s*(?:export\s+)?MT_TOKEN\s*=\s*(.+)/);
         const value = (matched ? matched[1] : text).trim();
         if (value) return { token: value, from: file };
       }
@@ -80,12 +97,12 @@ function readTokenFile() {
 function getTokens() {
   const fromEnv = (process.env.MT_TOKEN || '').trim();
   if (fromEnv) {
-    return fromEnv.split(/[\n#]+/).map((s) => s.trim()).filter(Boolean);
+    return splitTokens(fromEnv);
   }
   const file = readTokenFile();
   if (file) {
     $.log(`[提示] 从文件读取 token：${file.from}`);
-    return file.token.split(/[\n#]+/).map((s) => s.trim()).filter(Boolean);
+    return splitTokens(file.token);
   }
   return [];
 }
@@ -125,11 +142,64 @@ function saveCache(token, data) {
   }
 }
 
+/* ============ CLIGuard 签名（机会式：本机装了就用，没装就裸请求） ============ */
+
+let _cliguard;
+
+function loadCliguard() {
+  if (_cliguard !== undefined) return _cliguard;
+  _cliguard = null;
+  try {
+    const os = require('os');
+    const candidates = [
+      path.join(__dirname, 'vendor', 'cliguard', 'js', 'cliguard.js'),
+      path.join(os.homedir(), '.cliguard', 'cliguard-updates', 'core', 'cliguard.js'),
+    ];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) { _cliguard = require(p); break; }
+    }
+    if (_cliguard && typeof _cliguard.addCommonParams !== 'function' && typeof _cliguard.signRequest !== 'function') {
+      _cliguard = null;
+    }
+  } catch (e) {
+    $.log(`[提示] cliguard 加载失败，本次使用裸请求：${e.message}`);
+    _cliguard = null;
+  }
+  return _cliguard;
+}
+
+function addCommonParams(urlStr) {
+  try {
+    const cg = loadCliguard();
+    if (!cg || typeof cg.addCommonParams !== 'function') return urlStr;
+    const result = cg.addCommonParams(urlStr);
+    return (result && result.url) ? result.url : urlStr;
+  } catch (e) {
+    $.log(`[提示] cliguard 加签参数失败，已忽略：${e.message}`);
+    return urlStr;
+  }
+}
+
+function makeSignHeaders(method, urlStr, bodyHash) {
+  try {
+    const cg = loadCliguard();
+    if (!cg || typeof cg.signRequest !== 'function') return {};
+    return cg.signRequest(method.toUpperCase(), urlStr, bodyHash || '') || {};
+  } catch (e) {
+    $.log(`[提示] cliguard 签名失败，已忽略：${e.message}`);
+    return {};
+  }
+}
+
 /* ============ 网络请求 ============ */
 
 function sendCoupon(token) {
-  const body = Buffer.from(JSON.stringify({ token, aiScene: '', version: 2 }), 'utf8');
-  const parsed = new URL(API_URL);
+  const body = Buffer.from(JSON.stringify({ token, aiScene: AI_SCENE, version: 2 }), 'utf8');
+  // 与官方一致：签名前先补公共参数，bodyHash 取前 16200 字节的 md5
+  const bodyHash = crypto.createHash('md5').update(body.slice(0, 16200)).digest('hex');
+  const signedUrl = addCommonParams(API_URL);
+  const signHeaders = makeSignHeaders('POST', signedUrl, bodyHash);
+  const parsed = new URL(signedUrl);
 
   return new Promise((resolve) => {
     const req = https.request(
@@ -138,11 +208,11 @@ function sendCoupon(token) {
         port: parsed.port || 443,
         path: parsed.pathname + parsed.search,
         method: 'POST',
-        headers: {
+        headers: Object.assign({
           'Content-Type': 'application/json',
           'Content-Length': body.length,
           'X-Requested-With': 'XMLHttpRequest',
-        },
+        }, signHeaders),
       },
       (res) => {
         const chunks = [];
@@ -271,11 +341,21 @@ async function pushByWebhook(title, content) {
   const body = Buffer.from(JSON.stringify({ title, content }), 'utf8');
   try {
     await new Promise((resolve, reject) => {
-      const u = new URL(url);
-      const req = https.request(
+      let u;
+      try {
+        u = new URL(url);
+      } catch (_) {
+        return reject(new Error(`MT_PUSH_URL 不是合法 URL：${url}`));
+      }
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        return reject(new Error(`MT_PUSH_URL 仅支持 http/https，当前是 ${u.protocol}`));
+      }
+      const isHttp = u.protocol === 'http:';
+      const lib = isHttp ? require('http') : https;
+      const req = lib.request(
         {
           hostname: u.hostname,
-          port: u.port || 443,
+          port: u.port || (isHttp ? 80 : 443),
           path: u.pathname + u.search,
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
@@ -328,12 +408,29 @@ async function push(title, content) {
   }
 
   const sections = [];
-  let anySuccess = false;
+  let anyOk = false;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     const title = `账号 ${i + 1} 领券结果`;
     $.log(`\n账号 ${i + 1}/${tokens.length} (${maskToken(token)}) 开始领券…`);
+
+    // 先看当日缓存：命中就不再打领券接口。
+    // 每天只能领一次，重复请求只会拿到 code 1014，白挨一次风控。
+    const cached = loadCache(token);
+    if (cached) {
+      anyOk = true;
+      const parts = [title];
+      parts.push(`  ℹ️ 今天已领取过（每天限领一次），今日已领 ${cached.count} 张`);
+      if (cached.count_str) parts.push(`  包括${cached.count_str}`);
+      if (cached.activity_link) parts.push(`  活动链接：${cached.activity_link}`);
+      parts.push('', renderList(cached.coupons || []));
+      $.log('  ℹ️ 今天已领取过，直接回放本地缓存（未重复请求接口）：');
+      $.log(renderList(cached.coupons || []));
+      sections.push(parts.join('\n'));
+      if (i < tokens.length - 1) await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
 
     const resp = await sendCoupon(token);
 
@@ -346,29 +443,37 @@ async function push(title, content) {
 
       if (code === 200) {
         const list = ((data && data.couponList) || []).map(formatCoupon);
-        anySuccess = true;
-        const summary = buildCountStr(list);
-        saveCache(token, { count: list.length, count_str: summary, coupons: list });
+        if (list.length > 0) {
+          anyOk = true;
+          const summary = buildCountStr(list);
+          saveCache(token, {
+            count: list.length,
+            count_str: summary,
+            coupons: list,
+            activity_name: (data && data.activityName) || '',
+            activity_link: (data && data.activityLink) || '',
+          });
 
-        $.log(`  ✅ 领取成功，本次共领取 ${list.length} 张美团优惠券，包括${summary}！`);
-        $.log(renderList(list));
-        sections.push(`✅ 领取成功，共 ${list.length} 张\n  包括${summary}\n\n${renderList(list)}`);
-      } else if (code === 1014) {
-        // 接口在已领状态下不返回券数据，优先用本地当日缓存回放
-        const cached = loadCache(token);
-        if (cached) {
-          $.log(`  ℹ️ 今天已领取过，以下是今日已领券明细（本地缓存）：`);
-          $.log(renderList(cached.coupons || []));
-          sections.push(`ℹ️ 今天已领取过（每天限领一次），今日已领 ${cached.count} 张\n  包括${cached.count_str}\n\n${renderList(cached.coupons || [])}`);
+          $.log(`  ✅ 领取成功，本次共领取 ${list.length} 张美团优惠券，包括${summary}！`);
+          $.log(renderList(list));
+          sections.push(`${title}\n  ✅ 领取成功，共 ${list.length} 张\n  包括${summary}\n\n${renderList(list)}`);
         } else {
-          const tip = '今天已领取过，但本地没有今天的券明细（可能是在美团 App 或其它工具领的）。'
-            + '下次真正领到券时脚本会自动记录，之后即可回放。';
+          // 接口返回成功但没券：既不算领取成功，也不写缓存，
+          // 否则会把"共 0 张"当成今日已领明细回放出来
+          const tip = '接口没有返回任何优惠券，今天可能没有可领的券。';
           $.log(`  ℹ️ ${tip}`);
-          sections.push(`${title}\n  ${tip}`);
+          sections.push(`${title}\n  ℹ️ ${tip}`);
         }
+      } else if (code === 1014) {
+        // 走到这里说明本地缓存没命中，券是在 App 或其它工具里领的
+        const tip = '今天已领取过，但本地没有今天的券明细（可能是在美团 App 或其它工具领的）。'
+          + '下次真正领到券时脚本会自动记录，之后即可回放。';
+        $.log(`  ℹ️ ${tip}`);
+        sections.push(`${title}\n  ℹ️ ${tip}`);
       } else if (code === 401) {
-        $.log('  🔑 token 已失效，请用 token-web 重新扫码登录');
-        sections.push(`${title}\n  🔑 token 已失效，请用 token-web 重新扫码登录`);
+        const tip = '🔑 token 已失效：请用 token-web 重新扫码，并把新的 MT_TOKEN 更新到环境变量或 mt_token.txt';
+        $.log(`  ${tip}`);
+        sections.push(`${title}\n  ${tip}`);
       } else if (code === 509 || code === 50200) {
         $.log(`  ⏳ 请求过于频繁（code ${code}），请稍后重试`);
         sections.push(`${title}\n  ⏳ 请求过于频繁（code ${code}）`);
@@ -382,6 +487,6 @@ async function push(title, content) {
     if (i < tokens.length - 1) await new Promise((r) => setTimeout(r, 3000));
   }
 
-  await push(anySuccess ? '🎉 美团优惠券领取完成' : '美团优惠券领取结果', sections.join('\n\n'));
+  await push(anyOk ? '🎉 美团优惠券领取完成' : '美团优惠券领取结果', sections.join('\n\n'));
   $.done();
 })();

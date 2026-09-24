@@ -1,0 +1,59 @@
+# 扫码登录面板 · 应用宝 + 美团 → 青龙
+#
+# 启动：docker compose up -d --build
+# 入口：http://<服务器IP>:5180       管理后台 /admin
+#
+# 网络：panel 服务同时加入自建网络 panel 与青龙已有的 qinglong_default，
+#       因此既能在面板里用 http://qinglong-web-1:5700 访问青龙，
+#       也能让青龙容器内的脚本用 http://yyb-go:8000 访问应用宝网关。
+
+services:
+  yyb-go:
+    build:
+      context: ./yyb_go
+    image: script-yyb-go:latest
+    container_name: scan-yyb-go
+    restart: unless-stopped
+    volumes:
+      # 只持久化账号库与头像；二维码/模板留在容器层即可
+      - ./data/yyb/db:/app/resource/db
+      - ./data/yyb/avatars:/app/resource/avatars
+    networks:
+      - panel
+      - qinglong
+
+  panel:
+    build:
+      context: ./panel
+    image: script-scan-panel:latest
+    container_name: scan-panel
+    restart: unless-stopped
+    depends_on:
+      - yyb-go
+    ports:
+      - "5180:5180"
+    environment:
+      PORT: "5180"
+      TZ: Asia/Shanghai
+      # 面板后台「青龙面板地址」的初始默认值
+      PANEL_QINGLONG_HOST: http://qinglong-web-1:5700
+      # 面板服务端到应用宝网关的地址（走 compose 内网）
+      PANEL_YYB_BASE_URL: http://yyb-go:8000
+      # 扫码成功后写进青龙 yyb_server 的值：青龙容器里能解析的地址
+      PANEL_YYB_PUBLIC_BASE_URL: http://yyb-go:8000
+      # 美团扫码复用的官方专家包入口（挂载见下）
+      MT_RUN_JS: /opt/meituan-expert/scripts/run.js
+    volumes:
+      - ./data/panel:/app/data
+      # 美团专家包「领券下单找我」的完整目录；缺失时仅美团通道不可用
+      - ./meituan-expert:/opt/meituan-expert
+    networks:
+      - panel
+      - qinglong
+
+networks:
+  panel:
+    name: script_panel
+  qinglong:
+    external: true
+    name: qinglong_default
