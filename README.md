@@ -1,3 +1,37 @@
+## 扫码登录面板（应用宝 + 美团 → 青龙）
+
+`panel/` 是一个把「应用宝扫码」和「美团扫码」合在一起的网页面板：
+普通用户选平台扫码，登录成功后凭据自动写进青龙；管理员在 `/admin` 里配置青龙凭据。
+
+```bash
+docker compose up -d --build     # 面板 http://<服务器IP>:5180 ，后台 /admin
+```
+
+- 应用宝扫码 → 写入 `yyb_server`
+- 美团扫码 → 写入 `MT_TOKEN`（多账号按行追加）
+- compose 里 `panel` / `yyb-go` 同时接入青龙已有的 `qinglong_default` 网络，
+  **不需要改动青龙自己的 compose**：面板用 `http://qinglong-web-1:5700` 调青龙，
+  青龙容器内的脚本用 `http://yyb-go:8000` 调应用宝网关
+
+细节见 [`panel/README.md`](panel/README.md)。
+
+### 部署到 /root/script（阿里云）
+
+```bash
+# 1) 拉代码
+git clone https://github.com/Aaazlj/script.git /root/script && cd /root/script
+
+# 2) 放美团专家包（美团扫码通道需要，缺失时只有应用宝可用）
+mkdir -p meituan-expert && tar xzf meituan-expert.tgz -C meituan-expert --strip-components=1
+
+# 3) 起服务
+mkdir -p data/panel data/yyb/db data/yyb/avatars
+docker compose up -d --build
+```
+
+首次打开 `http://<IP>:5180/admin` 会引导设置管理员密码，然后填青龙的
+host / Client ID / Client Secret 即可。
+
 ## 拉库命令
 
 ```bash
@@ -71,10 +105,23 @@ http://127.0.0.1:8000@*      # 同上
 
 | 脚本 | 说明 | 环境变量 |
 |------|------|----------|
-| `meituan_coupon.js` | 美团优惠券自动领取（`cron: 0 10 * * *`） | `MT_TOKEN`、`MT_TOKEN_FILE`、`MT_PUSH_URL`、`MT_MAX_COUPONS` |
+| `meituan_coupon.js` | 美团优惠券自动领取（`cron: 0 10 * * *`） | `MT_TOKEN`、`MT_TOKEN_FILE`、`MT_AI_SCENE`、`MT_PUSH_URL`、`MT_MAX_COUPONS`、`MT_CACHE_FILE` |
 | `ppcs.js` | 朴朴超市 | — |
 | `ppcs_code.js` | 朴朴超市签到（YYB-Go-Enhanced 网关取 code 版，`cron: 20 8,12,20 * * *`） | `yyb_server`、`wx_server_url`+`ppcs_openid`、`ppcs_appid`、`ppcs_lng`/`ppcs_lat` |
 | `sfsy.py` | 顺丰速运 | — |
+
+`meituan_coupon.js` 环境变量明细：
+
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| `MT_TOKEN` | 是 | 美团登录 Token，**多账号用换行分隔**（单行时兼容旧的 `#` 分隔；换行分隔时 token 内的 `#` 不会被截断） |
+| `MT_TOKEN_FILE` | 否 | Token 文件路径，默认依次尝试 `mt_token.txt` / `data/mt_token.txt` / `token-web/data/mt_token.txt`；文件里的 `#` 注释行会被忽略 |
+| `MT_AI_SCENE` | 否 | 接口 `aiScene` 渠道标识，默认空 |
+| `MT_PUSH_URL` | 否 | 自定义推送地址（POST `{title, content}`），**http / https 均可** |
+| `MT_MAX_COUPONS` | 否 | 通知最多展示几张券，默认 8 |
+| `MT_CACHE_FILE` | 否 | 当日券缓存路径，默认 `data/mt_coupons_cache.json` |
+
+> 每天限领一次。当天首次真正领到券时脚本会把明细写进缓存，之后再跑（含定时任务）直接命中缓存回放，**不再重复请求领券接口**，跨天自动失效。
 
 ## 美团领券 · 获取 Token
 
@@ -85,3 +132,10 @@ cd token-web
 node server.js
 # 打开 http://127.0.0.1:5178 → 扫码 → 复制 MT_TOKEN=xxx 填进青龙环境变量
 ```
+
+> `token-web` 的登录能力依赖官方专家包 **meituan-living-assistant**（「领券下单找我」）的 `scripts/run.js`。
+> 脚本会按当前用户主目录自动探测它的位置；探测不到时用环境变量指定，例如：
+>
+> ```bash
+> MT_RUN_JS=/Users/you/.workbuddy/plugins/marketplaces/experts/plugins/meituan-living-assistant/scripts/run.js node server.js
+> ```

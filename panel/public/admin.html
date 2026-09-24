@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理后台 · 扫码登录面板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap wide">
+  <h1 class="page-title">管理后台</h1>
+  <p class="page-sub">配置青龙面板凭据与两个扫码通道，普通用户扫码后即可自动写入。</p>
+
+  <div id="view"></div>
+
+  <div class="footer"><a href="/">← 返回扫码页</a></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const view = $('view');
+
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok || !data || data.ok !== true) {
+    const err = new Error((data && data.error) || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return data.data;
+}
+
+function node(tag, props, children) {
+  const n = document.createElement(tag);
+  if (props) for (const k of Object.keys(props)) {
+    if (k === 'class') n.className = props[k];
+    else if (k === 'text') n.textContent = props[k];
+    else if (k === 'html') n.innerHTML = props[k];
+    else if (k.startsWith('on')) n.addEventListener(k.slice(2), props[k]);
+    else n.setAttribute(k, props[k]);
+  }
+  for (const c of (children || [])) if (c) n.appendChild(c);
+  return n;
+}
+
+function field(label, input, desc) {
+  const box = node('div', { class: 'field' });
+  box.appendChild(node('label', { text: label }));
+  box.appendChild(input);
+  if (desc) box.appendChild(node('div', { class: 'desc', text: desc }));
+  return box;
+}
+
+function input(id, opts = {}) {
+  const i = node('input', Object.assign({ type: 'text', id, autocomplete: 'off' }, opts.attrs || {}));
+  if (opts.value) i.value = opts.value;
+  return i;
+}
+
+function alertBox(kind, lines) {
+  const box = node('div', { class: 'note ' + kind });
+  for (const line of lines) box.appendChild(typeof line === 'string' ? node('div', { text: line }) : line);
+  return box;
+}
+
+function show(container, kind, lines) {
+  container.innerHTML = '';
+  container.appendChild(alertBox(kind, lines));
+}
+
+/* ---------------- 首次设置密码 ---------------- */
+
+function renderSetup() {
+  view.innerHTML = '';
+  const pw = input('pw', { attrs: { type: 'password' } });
+  const pw2 = input('pw2', { attrs: { type: 'password' } });
+  const box = node('div', { class: 'field' });
+
+  const card = node('div', { class: 'card' }, [
+    node('h2', { text: '首次使用：设置管理员密码' }),
+    node('div', { class: 'hint', text: '这个密码用来保护下面的青龙凭据配置，请妥善保存。' }),
+    field('管理员密码', pw, '至少 8 位'),
+    field('确认密码', pw2),
+    node('div', { class: 'row' }, [
+      node('button', {
+        class: 'btn', text: '设置并进入后台', onclick: async (ev) => {
+          ev.target.disabled = true;
+          try {
+            await api('POST', '/api/admin/setup', { password: pw.value, confirm: pw2.value });
+            await boot();
+          } catch (e) {
+            show(box, 'err', [e.message]);
+            ev.target.disabled = false;
+          }
+        },
+      }),
+    ]),
+    box,
+  ]);
+  view.appendChild(card);
+}
+
+/* ---------------- 登录 ---------------- */
+
+function renderLogin() {
+  view.innerHTML = '';
+  const pw = input('pw', { attrs: { type: 'password' } });
+  const box = node('div', { class: 'field' });
+
+  const card = node('div', { class: 'card' }, [
+    node('h2', { text: '管理员登录' }),
+    node('div', { class: 'hint', text: '输入初始化时设置的管理员密码。' }),
+    field('密码', pw),
+    node('div', { class: 'row' }, [
+      node('button', {
+        class: 'btn', text: '登录', onclick: async (ev) => {
+          ev.target.disabled = true;
+          try {
+            await api('POST', '/api/admin/login', { password: pw.value });
+            await boot();
+          } catch (e) {
+            show(box, 'err', [e.message]);
+            ev.target.disabled = false;
+          }
+        },
+      }),
+    ]),
+    box,
+  ]);
+  view.appendChild(card);
+  pw.addEventListener('keydown', (e) => { if (e.key === 'Enter') card.querySelector('button.btn').click(); });
+  pw.focus();
+}
+
+/* ---------------- 配置 ---------------- */
+
+async function renderConfig() {
+  let cfg;
+  try {
+    cfg = await api('GET', '/api/admin/config');
+  } catch (e) {
+    return renderLogin();
+  }
+
+  view.innerHTML = '';
+
+  /* 青龙面板 */
+  const qlHost = input('qlHost', { value: cfg.qinglong.host, attrs: { placeholder: 'http://192.168.1.10:5700' } });
+  const qlId = input('qlId', { value: cfg.qinglong.clientId, attrs: { placeholder: '例如 AbC123...' } });
+  const qlSecret = input('qlSecret', { attrs: { type: 'password', placeholder: cfg.qinglong.clientSecretSet ? '已保存，留空表示不修改' : '请输入 Client Secret' } });
+  const qlOut = node('div');
+
+  const qlCard = node('div', { class: 'card' }, [
+    node('h2', { text: '① 青龙面板' }),
+    node('div', { class: 'hint', text: '青龙后台：系统设置 → 应用设置 → 新建应用，拿到 Client ID 与 Client Secret。' }),
+    field('面板地址 host', qlHost, '可以是 http://ip:5700，也可以只写 ip:5700'),
+    field('Client ID', qlId),
+    field('Client Secret', qlSecret, cfg.qinglong.clientSecretSet ? '已配置，留空则不修改' : ''),
+    node('div', { class: 'row' }, [
+      node('button', {
+        class: 'btn ghost small', text: '测试连接', onclick: async (ev) => {
+          ev.target.disabled = true;
+          show(qlOut, 'info', ['正在连接…']);
+          await save(true);
+          try {
+            const r = await api('POST', '/api/admin/test/qinglong');
+            show(qlOut, 'ok', [
+              `连接成功：${r.host}`,
+              `鉴权接口：${r.endpoint}`,
+              `面板版本：${r.version || '未知'}${r.branch ? `（${r.branch}）` : ''}`,
+              `已有环境变量：${r.envCount >= 0 ? r.envCount + ' 条' : '读取失败'}`,
+              r.envError ? `环境变量读取告警：${r.envError}` : null,
+            ].filter(Boolean));
+          } catch (e) {
+            show(qlOut, 'err', [e.message]);
+          }
+          ev.target.disabled = false;
+        },
+      }),
+      cfg.qinglong.clientSecretSet ? node('button', {
+        class: 'btn ghost small', text: '清除已保存的 Secret', onclick: async () => {
+          await api('POST', '/api/admin/config/clear-secret');
+          await boot();
+        },
+      }) : null,
+    ]),
+    qlOut,
+  ]);
+
+  /* 应用宝网关 */
+  const yybBase = input('yybBase', { value: cfg.yyb.baseUrl, attrs: { placeholder: 'http://127.0.0.1:8000' } });
+  const yybPub = input('yybPub', { value: cfg.yyb.publicBaseUrl, attrs: { placeholder: '留空则自动推断' } });
+  const yybOut = node('div');
+
+  const yybCard = node('div', { class: 'card' }, [
+    node('h2', { text: '② 应用宝网关（yyb_go）' }),
+    node('div', { class: 'hint', text: '面板服务端通过上面这个地址去取二维码；写进青龙的地址用下面那个。' }),
+    field('网关地址', yybBase, '面板所在机器能访问到的 yyb_go 地址'),
+    field('写入青龙的地址', yybPub, '扫码成功后写进 yyb_server 的值；留空则用网关地址（本机回环时自动替换成面板访问地址）'),
+    node('div', { class: 'row' }, [
+      node('button', {
+        class: 'btn ghost small', text: '测试连通', onclick: async (ev) => {
+          ev.target.disabled = true;
+          show(yybOut, 'info', ['正在连接…']);
+          await save(true);
+          try {
+            const r = await api('POST', '/api/admin/test/yyb');
+            show(yybOut, 'ok', [`网关可用：${r.url}`, `HTTP ${r.status}`]);
+          } catch (e) {
+            show(yybOut, 'err', [e.message]);
+          }
+          ev.target.disabled = false;
+        },
+      }),
+    ]),
+    yybOut,
+  ]);
+
+  /* 美团 */
+  const mtRunJs = input('mtRunJs', { value: cfg.meituan.runJs, attrs: { placeholder: '留空则自动探测' } });
+  const mtScene = input('mtScene', { value: cfg.meituan.aiScene, attrs: { placeholder: '可留空' } });
+  const mtOut = node('div');
+
+  const mtCard = node('div', { class: 'card' }, [
+    node('h2', { text: '③ 美团扫码' }),
+    node('div', { class: 'hint', text: '复用官方专家包「领券下单找我」里的 scripts/run.js 完成扫码登录。' }),
+    field('run.js 路径', mtRunJs, cfg.meituan.detectedRunJs
+      ? `当前实际使用：${cfg.meituan.detectedRunJs}`
+      : '未探测到，请填写绝对路径'),
+    field('aiScene（可选）', mtScene, '接口渠道标识，留空即可'),
+    node('div', { class: 'row' }, [
+      node('button', {
+        class: 'btn ghost small', text: '环境自检', onclick: async (ev) => {
+          ev.target.disabled = true;
+          show(mtOut, 'info', ['正在执行 run.js init（首次可能较慢）…']);
+          await save(true);
+          try {
+            const r = await api('POST', '/api/admin/test/meituan');
+            show(mtOut, 'ok', [
+              '环境就绪',
+              `run.js：${r.runJs}`,
+              `脚本目录：${r.scripts_dir || '-'}`,
+              `客户端类型：${r.clientType || '-'}`,
+            ]);
+          } catch (e) {
+            show(mtOut, 'err', [e.message]);
+          }
+          ev.target.disabled = false;
+        },
+      }),
+    ]),
+    mtOut,
+  ]);
+
+  /* 保存 / 改密码 / 退出 */
+  const saveOut = node('div');
+  const oldPw = input('oldPw', { attrs: { type: 'password' } });
+  const newPw = input('newPw', { attrs: { type: 'password' } });
+  const newPw2 = input('newPw2', { attrs: { type: 'password' } });
+  const pwOut = node('div');
+
+  async function save(silent) {
+    try {
+      await api('PUT', '/api/admin/config', {
+        qinglong: { host: qlHost.value, clientId: qlId.value, clientSecret: qlSecret.value },
+        yyb: { baseUrl: yybBase.value, publicBaseUrl: yybPub.value },
+        meituan: { runJs: mtRunJs.value, aiScene: mtScene.value },
+      });
+      qlSecret.value = '';
+      if (!silent) show(saveOut, 'ok', ['配置已保存']);
+      return true;
+    } catch (e) {
+      if (!silent) show(saveOut, 'err', [e.message]);
+      return false;
+    }
+  }
+
+  const actionsCard = node('div', { class: 'card' }, [
+    node('h2', { text: '④ 保存与账号' }),
+    node('div', { class: 'hint', text: '上面三项配置改完后点下面按钮统一保存。' }),
+    node('div', { class: 'row', style: 'margin-bottom:14px' }, [
+      node('button', { class: 'btn', text: '保存配置', onclick: (ev) => save(false) }),
+      node('button', {
+        class: 'btn ghost small', text: '退出登录', onclick: async () => {
+          await api('POST', '/api/admin/logout');
+          await boot();
+        },
+      }),
+    ]),
+    saveOut,
+    node('hr', { style: 'border:none;border-top:1px solid var(--line);margin:20px 0' }),
+    node('div', { class: 'hint', text: '修改管理员密码' }),
+    field('原密码', oldPw),
+    field('新密码', newPw, '至少 8 位'),
+    field('确认新密码', newPw2),
+    node('div', { class: 'row' }, [
+      node('button', {
+        class: 'btn ghost small', text: '修改密码', onclick: async (ev) => {
+          ev.target.disabled = true;
+          try {
+            await api('POST', '/api/admin/password', {
+              oldPassword: oldPw.value, newPassword: newPw.value, confirm: newPw2.value,
+            });
+            show(pwOut, 'ok', ['密码已更新']);
+            oldPw.value = newPw.value = newPw2.value = '';
+          } catch (e) {
+            show(pwOut, 'err', [e.message]);
+          }
+          ev.target.disabled = false;
+        },
+      }),
+    ]),
+    pwOut,
+  ]);
+
+  view.append(qlCard, yybCard, mtCard, actionsCard);
+}
+
+/* ---------------- 引导 ---------------- */
+
+async function boot() {
+  let h;
+  try {
+    h = await api('GET', '/api/admin/health');
+  } catch (e) {
+    view.innerHTML = '';
+    view.appendChild(alertBox('err', ['无法连接面板服务：' + e.message]));
+    return;
+  }
+  if (h.needsSetup) return renderSetup();
+  if (!h.loggedIn) return renderLogin();
+  return renderConfig();
+}
+
+boot();
+</script>
+</body>
+</html>
