@@ -57,7 +57,90 @@ docker compose up -d --build
 
 ---
 
-## 通过 Cloudflare Tunnel 暴露到自定义域名
+## 部署到自定义域名（宿主机 nginx，推荐）
+
+服务器上已经跑着 nginx（80/443），其他子域都是「A 记录 → 服务器 IP（Cloudflare 代理）→ nginx 反代本机端口」。
+照这个约定接最省事，也不用额外维护 cloudflared。
+
+1. 面板端口只绑回环（compose 里已是 `127.0.0.1:5180:5180`），nginx 成为唯一入口。
+2. 建站点 `/etc/nginx/sites-available/scan.leozai.com`：
+
+   ```nginx
+   server {
+       server_name scan.leozai.com;
+
+       # Let's Encrypt HTTP-01 校验走本地目录，不转发给面板
+       location ^~ /.well-known/acme-challenge/ {
+           root /var/www/letsencrypt;
+           default_type "text/plain";
+           try_files $uri =404;
+       }
+
+       # 扫码轮询与 run.js 调用都比较慢，超时给足避免 504
+       proxy_read_timeout 180s;
+       proxy_send_timeout 180s;
+       client_max_body_size 8m;
+
+       location / {
+           proxy_pass http://127.0.0.1:5180;
+           proxy_http_version 1.1;
+           proxy_set_header Host $host;
+           proxy_set_header X-Real-IP $remote_addr;
+           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+           proxy_set_header X-Forwarded-Proto $scheme;
+           proxy_set_header Upgrade $http_upgrade;
+           proxy_set_header Connection "upgrade";
+       }
+
+       listen 443 ssl;
+       listen [::]:443 ssl;
+       ssl_certificate     /etc/letsencrypt/live/scan.leozai.com/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/scan.leozai.com/privkey.pem;
+       include /etc/letsencrypt/options-ssl-nginx.conf;
+       ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+   }
+
+   server {
+       server_name scan.leozai.com;
+
+       # 续期走 webroot，80 上保留校验目录
+       location ^~ /.well-known/acme-challenge/ {
+           root /var/www/letsencrypt;
+           default_type "text/plain";
+           try_files $uri =404;
+       }
+
+       location / { return 301 https://$host$request_uri; }
+
+       listen 80;
+       listen [::]:80;
+   }
+   ```
+
+3. `ln -s` 到 `sites-enabled/`，`nginx -t` 通过后 `systemctl reload nginx`。
+4. 先建 **DNS-only（灰云）** 的 A 记录，再签证书，最后改回代理（橙云）：
+
+   ```bash
+   mkdir -p /var/www/letsencrypt/.well-known/acme-challenge
+   certbot certonly --webroot -w /var/www/letsencrypt -d scan.leozai.com \
+     --non-interactive --agree-tos
+   certbot renew --cert-name scan.leozai.com --dry-run   # 续期演练
+   ```
+
+   > ⚠️ 两个坑：
+   > 1. 站点里有 `location / { proxy_pass ... }` 时，**必须显式加 `^~ /.well-known/acme-challenge/`**，
+   >    否则校验请求会被转发给面板、返回 404，签发失败。
+   > 2. 直接开着 Cloudflare 代理（橙云）签 HTTP-01 容易失败，**先切灰云签完再切回橙云**。
+
+验证（注意服务器本机可能缓存旧 DNS 解析，要强制指到 Cloudflare 边缘）：
+
+```bash
+CF_IP=$(dig +short scan.leozai.com @1.1.1.1 | head -1)
+curl -sI --resolve scan.leozai.com:443:$CF_IP https://scan.leozai.com/api/health | grep -i 'cf-ray\|^server'
+# 期望看到 cf-ray: ... / server: cloudflare
+```
+
+## 备选：用 Cloudflare Tunnel 暴露（不开任何入站端口）
 
 服务器不需要开放任何入站端口（5180 可以只在安全组里放行给内网或干脆关掉），
 Cloudflare 会自动签发证书并把 `https://<域名>` 反代到面板。

@@ -15,19 +15,24 @@ docker compose up -d --build     # 面板 http://<服务器IP>:5180 ，后台 /a
 
 细节见 [`panel/README.md`](panel/README.md)。
 
-### 用 Cloudflare Tunnel 挂到自定义域名
+### 挂到自定义域名（scan.leozai.com）
 
-不用在服务器上开放任何入站端口，Cloudflare 自动签证书并反代。
+按服务器既有约定走宿主机 nginx（其他子域都是这个套路）：
 
-```bash
-# 1) 建隧道 + 配 ingress（hostname → http://scan-panel:5180），拿到 tunnel_id 和 token
-# 2) 在 leozai.com 区域加 CNAME：scan → <tunnel_id>.cfargotunnel.com（必须开代理）
-# 3) 服务器上写 token 并启动连接器
-echo "CF_TUNNEL_TOKEN=<token>" > /root/script/.env && chmod 600 /root/script/.env
-docker compose up -d
+```
+A scan.leozai.com → 47.89.253.12（Cloudflare 代理）
+      ↓
+宿主机 nginx :443  →  proxy_pass http://127.0.0.1:5180
+      ↓
+Let's Encrypt 证书（certbot 管理）
 ```
 
-隧道配置与排错见 [`panel/README.md`](panel/README.md#通过-cloudflare-tunnel-暴露到自定义域名)。
+配置模板与签证书步骤（含两个必踩的坑：ACME 校验目录被 `location /` 吞掉、
+必须先灰云签证书再切橙云）见 [`panel/README.md`](panel/README.md#部署到自定义域名宿主机-nginx推荐)。
+
+> 面板端口只绑 `127.0.0.1:5180`，nginx 是唯一入口；`docker compose up -d` 不会再暴露公网。
+> 备用方案（Cloudflare Tunnel）已在 compose 里放到 `profiles: ["tunnel"]` 下，
+> 需要时 `docker compose --profile tunnel up -d` 才会启用。
 
 ### 部署到 /root/script（阿里云）
 
