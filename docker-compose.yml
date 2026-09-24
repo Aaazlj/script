@@ -54,13 +54,19 @@ services:
       - panel
       - qinglong
 
-  # 把面板通过 Cloudflare Tunnel 暴露到自定义域名，无需在服务器上开任何入站端口。
+  # 可选：用 Cloudflare Tunnel 把面板挂到自定义域名（不开任何入站端口）。
+  # 默认不启动 —— 需要时显式带上 profile：
+  #   docker compose --profile tunnel up -d
+  #
   # 连接器 token 放在同目录 .env（已被 .gitignore 忽略，勿提交）：
   #   CF_TUNNEL_TOKEN=<cloudflared 隧道 token>
+  #
+  # 注意：宿主机已有 nginx 反代（scan.leozai.com → 127.0.0.1:5180）时不需要它。
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: scan-cloudflared
     restart: unless-stopped
+    profiles: ["tunnel"]
     depends_on:
       - panel
     environment:
