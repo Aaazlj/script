@@ -45,6 +45,8 @@ services:
       MT_RUN_JS: /opt/meituan-expert/scripts/run.js
     volumes:
       - ./data/panel:/app/data
+      # 美团登录态（pt-passport token），不挂载的话容器重建就要重新扫码
+      - ./data/meituan-auth:/root/.workbuddy/credentials
       # 美团专家包「领券下单找我」的完整目录；缺失时仅美团通道不可用
       - ./meituan-expert:/opt/meituan-expert
     networks:
