@@ -207,9 +207,49 @@ func serversFor(parsed map[string]dnsDomain, domain, proto string) []Target {
 func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([]Target, error) {
 	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false)
 	if err != nil {
+		// 微信 HTTPDNS 入口（aedns.weixin.qq.com）只在大陆可达，
+		// 海外机器会超时。此时退回系统 DNS 解析长连接域名。
+		if fallback := systemDNSLonglinkTargets(ctx); len(fallback) > 0 {
+			return fallback, nil
+		}
 		return nil, err
 	}
-	return serversFor(parsed, longlinkDomain, protoMMTLS), nil
+	targets := serversFor(parsed, longlinkDomain, protoMMTLS)
+	if len(targets) == 0 {
+		if fallback := systemDNSLonglinkTargets(ctx); len(fallback) > 0 {
+			return fallback, nil
+		}
+	}
+	return targets, nil
+}
+
+// systemDNSLonglinkTargets 是 HTTPDNS 不可达时的兜底：
+// 用系统 DNS 解析 longlinkDomain，按常见 mmtls 端口展开候选。
+//
+// 只取前两个 IP（系统 DNS 已按地理位置给出就近节点），并且每个 IP 都展开
+// 8080/80/443 三个端口——因为 orderLonglinkTargets 是"按端口优先"排序后截断的，
+// 若给出太多 IP，后面的端口会被截掉，反而试不到。
+func systemDNSLonglinkTargets(ctx context.Context) []Target {
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(lookupCtx, longlinkDomain)
+	if err != nil || len(addrs) == 0 {
+		return nil
+	}
+	const maxIPs = 2
+	var out []Target
+	for _, ip := range addrs {
+		if len(out) >= maxIPs*3 {
+			break
+		}
+		if net.ParseIP(ip) == nil {
+			continue
+		}
+		for _, port := range []int{8080, 80, 443} {
+			out = append(out, Target{IP: ip, Port: port})
+		}
+	}
+	return out
 }
 
 func getShortlinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) []Target {
