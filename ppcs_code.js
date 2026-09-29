@@ -40,6 +40,11 @@ new Env('朴朴超市Code版')
 3. 可选变量：
    ppcs_appid           小程序 appid，默认 wx122ef876a7132eb4
    ppcs_lng / ppcs_lat  定位经纬度前缀，默认福州 119.31 / 26.06
+   ppcs_proxy           出站代理，形如 http://user:pass@host:port（也可用 script_proxy）
+                        **服务器在海外时必填**：朴朴接口（cauth.pupuapi.com 等）在国内，
+                        直连会 20s 超时导致 silent_login 失败。只对 https 请求生效，
+                        内网 http 网关（yyb-go）仍走直连。
+                        零依赖实现（自建 CONNECT 隧道），不需要额外 npm 包。
    yyb_auto_refresh     默认 1。账号状态非 alive 时自动 /accounts/refresh 续期
    yyb_skip_expired     默认 1。续期后仍为 expired 的账号直接跳过
    ppcs_version_check   默认 0。设为 1 时启用远端版本检查（联网慢的环境别开）
@@ -114,6 +119,101 @@ try {
   got = null;
 }
 
+// ==================== 出站代理（可选，零依赖） ====================
+// 用途：服务器部署在海外时，朴朴的接口（cauth.pupuapi.com 等）在国内，直连会超时。
+// 配法：环境变量 ppcs_proxy / PPCS_PROXY / script_proxy，值形如 http://user:pass@host:port
+// 规则：**只对 https 请求走代理**——内网网关是 http，会自动直连，不会被绕到外部代理上去
+//      （否则代理根本解析不了 yyb-go 这种容器内网域名）。
+const OUTBOUND_PROXY = (process.env.ppcs_proxy || process.env.PPCS_PROXY
+  || process.env.script_proxy || process.env.SCRIPT_PROXY || "").trim();
+
+let proxyAgentsCache = null;
+
+function getProxyAgents() {
+  if (proxyAgentsCache !== null) return proxyAgentsCache;
+  proxyAgentsCache = { http: null, https: null };
+  if (!OUTBOUND_PROXY) return proxyAgentsCache;
+  try {
+    const net = require("net");
+    const tls = require("tls");
+    const httpMod = require("http");
+    const httpsMod = require("https");
+    const u = new URL(OUTBOUND_PROXY);
+    const proxyHost = u.hostname;
+    const proxyPort = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+    const authHeader = (u.username || u.password)
+      ? "Proxy-Authorization: Basic " + Buffer.from(
+          decodeURIComponent(u.username) + ":" + decodeURIComponent(u.password)).toString("base64") + "\r\n"
+      : "";
+
+    function makeAgent(secure) {
+      const BaseAgent = secure ? httpsMod.Agent : httpMod.Agent;
+      class ProxyTunnelAgent extends BaseAgent {
+        createConnection(options, cb) {
+          let settled = false;
+          const done = (err, sock) => { if (!settled) { settled = true; cb(err, sock); } };
+          const host = options.host || options.hostname;
+          const port = options.port || (secure ? 443 : 80);
+          const target = host + ":" + port;
+          const raw = net.connect(proxyPort, proxyHost);
+          let buf = "";
+          const onData = chunk => {
+            buf += chunk.toString("latin1");
+            const idx = buf.indexOf("\r\n\r\n");
+            if (idx < 0) return;
+            raw.removeListener("data", onData);
+            const status = parseInt(String(buf).split(" ")[1], 10);
+            if (status !== 200) {
+              raw.destroy();
+              return done(new Error("代理 CONNECT 失败：" + buf.split("\r\n")[0]));
+            }
+            const rest = Buffer.from(buf.slice(idx + 4), "latin1");
+            if (rest.length) raw.unshift(rest);   // CONNECT 响应后可能已经跟了数据
+            if (!secure) return done(null, raw);
+            const tlsSock = tls.connect({ socket: raw, servername: host });
+            tlsSock.once("secureConnect", () => done(null, tlsSock));
+            tlsSock.once("error", e => done(e));
+          };
+          raw.on("data", onData);
+          raw.once("error", e => done(e));
+          raw.setTimeout(15000, () => { raw.destroy(); done(new Error("代理连接超时")); });
+          raw.once("connect", () => {
+            raw.write("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n" + authHeader + "\r\n");
+          });
+        }
+      }
+      return new ProxyTunnelAgent({ keepAlive: false });
+    }
+
+    proxyAgentsCache.http = makeAgent(false);
+    proxyAgentsCache.https = makeAgent(true);
+  } catch (e) {
+    proxyAgentsCache = { http: null, https: null };
+  }
+  return proxyAgentsCache;
+}
+
+/** 目标是不是 https；只有 https 才走代理 */
+function targetIsHttps(urlOrTarget) {
+  if (!urlOrTarget) return false;
+  if (typeof urlOrTarget === "string") return urlOrTarget.indexOf("https:") === 0;
+  return urlOrTarget.protocol === "https:";
+}
+
+/** Node http/https 用的单个 agent */
+function proxyAgentFor(urlOrTarget) {
+  if (!OUTBOUND_PROXY || !targetIsHttps(urlOrTarget)) return undefined;
+  return getProxyAgents().https || undefined;
+}
+
+/** got 用的 { http, https } agent 组合 */
+function proxyAgentOption(urlOrTarget) {
+  if (!OUTBOUND_PROXY || !targetIsHttps(urlOrTarget)) return undefined;
+  const a = getProxyAgents();
+  if (!a.http && !a.https) return undefined;
+  return { http: a.http, https: a.https };
+}
+
 // 降级实现：覆盖脚本用到的 request 选项子集
 function nodeRequest(options) {
   return new Promise(resolve => {
@@ -148,7 +248,8 @@ function nodeRequest(options) {
       }
 
       const timeout = Number(options?.timeout?.request || options?.timeout || REQUEST_TIMEOUT);
-      const req = lib.request(target, { method, headers, timeout }, res => {
+      const agent = proxyAgentFor(target);
+      const req = lib.request(target, { method, headers, timeout, agent }, res => {
         const chunks = [];
         res.on("data", chunk => chunks.push(chunk));
         res.on("end", () => {
@@ -307,6 +408,8 @@ class BaseRequest {
           if (this.isOldGot) {
             // 旧版got
             let gotClient = options.got_client || this.got;
+            const agentOpt = proxyAgentOption(options.url);
+            if (agentOpt) options.agent = agentOpt;
             requestPromise = gotClient(options);
           } else {
             // 新版got - 需要构建完整的请求选项
@@ -334,6 +437,10 @@ class BaseRequest {
             if (options.searchParams) {
               requestOpts.searchParams = options.searchParams;
             }
+
+            // https 目标走外部代理（内网 http 网关保持直连）
+            const agentOpt = proxyAgentOption(requestUrl);
+            if (agentOpt) requestOpts.agent = agentOpt;
 
             // 新版got使用方法调用
             let gotInstance = this.got;
