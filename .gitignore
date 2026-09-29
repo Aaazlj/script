@@ -9,6 +9,10 @@ mt_token.txt
 data/
 mt_coupons_cache.json
 
+# Python 字节码缓存
+__pycache__/
+*.pyc
+
 # 扫码面板运行产物（含管理员密码哈希与青龙凭据，禁止入库）
 panel/data/
 

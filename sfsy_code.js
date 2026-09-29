@@ -428,12 +428,17 @@ function rawRequest(opts) {
 /**
  * 应用宝网关取微信 code：POST {gateway}/wxapp/getCode
  * 返回 { code:0, data:{ openid, result:{ code, errMsg } } }
- * gateway 支持 "@ref" 写法（与 ppcs 脚本一致），不带 @ 时用传入的 ref
+ * gateway 支持 "@ref" 写法（与朴朴脚本 ppcs_code.js 一致），不带 @ 时用传入的 ref
+ * 地址可省略协议头（面板里常写 yyb-go:8000@1），缺协议时自动补 http://
  */
 function parseGateway(raw) {
   const i = raw.lastIndexOf('@');
-  if (i > 0) return { url: raw.slice(0, i).replace(/\/+$/, ''), ref: raw.slice(i + 1) };
-  return { url: raw.replace(/\/+$/, ''), ref: '' };
+  let url, ref;
+  if (i > 0) { url = raw.slice(0, i); ref = raw.slice(i + 1); }
+  else { url = raw; ref = ''; }
+  url = url.replace(/\/+$/, '');
+  if (url && !/^https?:\/\//i.test(url)) url = 'http://' + url;
+  return { url, ref };
 }
 
 async function fetchWxCode(account, proxyPool) {
