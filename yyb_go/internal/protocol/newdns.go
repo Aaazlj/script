@@ -206,7 +206,16 @@ func serversFor(parsed map[string]dnsDomain, domain, proto string) []Target {
 }
 
 func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([]Target, error) {
-	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false)
+	// HTTPDNS 探测必须限时：内地可达时 6s 足够；
+	// 海外不可达时若按 LoginTimeout(30s) 等两次，就把上游请求的预算耗光了，
+	// 后面的 dial 会拿着已过期的 ctx 秒失败（表现为 dial tcp ...: i/o timeout）。
+	const dnsProbeTimeout = 6 * time.Second
+	probeTimeout := dnsProbeTimeout
+	if timeout > 0 && timeout < probeTimeout {
+		probeTimeout = timeout
+	}
+
+	parsed, err := getDNSParsed(ctx, probeTimeout, cacheTTL, false)
 	if err != nil {
 		// 微信 HTTPDNS 入口（aedns.weixin.qq.com）只在大陆可达，
 		// 海外机器会超时。此时退回系统 DNS 解析长连接域名。
