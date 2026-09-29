@@ -46,6 +46,33 @@ var dnsCache = struct {
 	entries map[string]dnsCacheEntry
 }{entries: map[string]dnsCacheEntry{}}
 
+// HTTPDNS 最近一次失败时间：失败后短时间内不再重试，
+// 直接走系统 DNS 兜底。否则每次请求都要白等两次探测（约 12s）。
+const dnsFailureTTL = 5 * time.Minute
+
+var dnsFailure = struct {
+	sync.Mutex
+	until time.Time
+}{}
+
+func dnsRecentlyFailed() bool {
+	dnsFailure.Lock()
+	defer dnsFailure.Unlock()
+	return time.Now().Before(dnsFailure.until)
+}
+
+func markDNSFailure() {
+	dnsFailure.Lock()
+	dnsFailure.until = time.Now().Add(dnsFailureTTL)
+	dnsFailure.Unlock()
+}
+
+func clearDNSFailure() {
+	dnsFailure.Lock()
+	dnsFailure.until = time.Time{}
+	dnsFailure.Unlock()
+}
+
 func buildDNSQuery(clientVersion int, deviceType string, uin int) string {
 	v := url.Values{}
 	v.Set("clientversion", strconv.Itoa(clientVersion))
@@ -102,6 +129,10 @@ func getDNSParsed(ctx context.Context, timeout, cacheTTL time.Duration, force bo
 		}
 		dnsCache.Unlock()
 	}
+	// 最近刚失败过就不重试（除非显式 force），交给调用方走系统 DNS 兜底
+	if !force && dnsRecentlyFailed() {
+		return nil, fmt.Errorf("newdns skipped: recently failed")
+	}
 	var last error
 	for _, connectTo := range []string{"", newdnsBackupIP} {
 		status, obj, text, err := requestNewDNS(ctx, connectTo, timeout)
@@ -123,11 +154,13 @@ func getDNSParsed(ctx context.Context, timeout, cacheTTL time.Duration, force bo
 			dnsCache.entries[key] = dnsCacheEntry{ExpiresAt: now.Add(cacheTTL), Parsed: parsed}
 			dnsCache.Unlock()
 		}
+		clearDNSFailure()
 		return parsed, nil
 	}
 	if last == nil {
 		last = fmt.Errorf("newdns request failed")
 	}
+	markDNSFailure()
 	return nil, last
 }
 
@@ -233,17 +266,22 @@ func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([
 	return targets, nil
 }
 
-// systemDNSLonglinkTargets 是 HTTPDNS 不可达时的兜底：
-// 用系统 DNS 解析 longlinkDomain，按常见 mmtls 端口展开候选。
+// systemDNSLonglinkTargets / systemDNSTargets 是 HTTPDNS 不可达时的兜底：
+// 用系统 DNS 解析微信域名，按给定端口展开候选。
 //
-// 只取前两个 IP（系统 DNS 已按地理位置给出就近节点），并且每个 IP 都展开
-// 8080/80/443 三个端口——因为 orderLonglinkTargets 是"按端口优先"排序后截断的，
+// 只取前 maxIPs 个 IP（系统 DNS 已按地理位置给出就近节点），并且每个 IP 都展开
+// 全部端口——因为 orderLonglinkTargets 是"按端口优先"排序后截断的，
 // 若给出太多 IP，后面的端口会被截掉，反而试不到。
+func systemDNSLonglinkTargets(ctx context.Context) []Target {
+	return systemDNSTargets(ctx, longlinkDomain, []int{8080, 80, 443}, 2)
+}
+
+// systemDNSTargets 见上。
 //
 // 注意：容器里的 DNS 常常只返回 AAAA（IPv6），而容器多半没有 IPv6 出网，
 // 所以**显式只查 IPv4**；查不到再退回普通 LookupHost 并过滤掉 IPv6。
-func systemDNSLonglinkTargets(ctx context.Context) []Target {
-	// 关键：不能直接用上游 ctx —— 走到这里时前面的 HTTPDNS 两次 dial
+func systemDNSTargets(ctx context.Context, domain string, ports []int, maxIPs int) []Target {
+	// 关键：不能直接用上游 ctx —— 走到这里时前面的 HTTPDNS 探测
 	// 已经耗掉十几秒，上游 deadline 往往已经到期，查询会立刻被取消。
 	// 用 WithoutCancel 脱离上游取消，再套一个自己的超时。
 	base := context.WithoutCancel(ctx)
@@ -251,63 +289,75 @@ func systemDNSLonglinkTargets(ctx context.Context) []Target {
 	defer cancel()
 
 	var ips []string
-	if addrs, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip4", longlinkDomain); err == nil {
+	if addrs, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip4", domain); err == nil {
 		for _, a := range addrs {
 			if a.Is4() {
 				ips = append(ips, a.String())
 			}
 		}
 	} else {
-		log.Printf("[newdns] system dns ip4 lookup failed: %v", err)
+		log.Printf("[newdns] system dns ip4 lookup failed for %s: %v", domain, err)
 	}
 	if len(ips) == 0 {
-		if addrs, err := net.DefaultResolver.LookupHost(lookupCtx, longlinkDomain); err == nil {
+		if addrs, err := net.DefaultResolver.LookupHost(lookupCtx, domain); err == nil {
 			for _, ip := range addrs {
 				if p := net.ParseIP(ip); p != nil && p.To4() != nil {
 					ips = append(ips, ip)
 				}
 			}
 		} else {
-			log.Printf("[newdns] system dns lookup failed: %v", err)
+			log.Printf("[newdns] system dns lookup failed for %s: %v", domain, err)
 		}
 	}
 	if len(ips) == 0 {
-		log.Printf("[newdns] no IPv4 for %s, fallback unavailable", longlinkDomain)
+		log.Printf("[newdns] no IPv4 for %s, fallback unavailable", domain)
 		return nil
 	}
 
-	const maxIPs = 2
 	var out []Target
 	for _, ip := range ips {
-		if len(out) >= maxIPs*3 {
+		if len(out) >= maxIPs*len(ports) {
 			break
 		}
-		for _, port := range []int{8080, 80, 443} {
+		for _, port := range ports {
 			out = append(out, Target{IP: ip, Port: port})
 		}
 	}
-	log.Printf("[newdns] HTTPDNS unavailable, using system dns targets: %v", out)
+	log.Printf("[newdns] HTTPDNS unavailable, using system dns targets for %s: %v", domain, out)
 	return out
 }
 
 func getShortlinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) []Target {
-	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false)
-	if err != nil {
-		return []Target{{IP: "120.241.131.173", Port: 80}}
+	// 与长连接同理：探测限时，避免把上游预算耗光
+	const dnsProbeTimeout = 6 * time.Second
+	probeTimeout := dnsProbeTimeout
+	if timeout > 0 && timeout < probeTimeout {
+		probeTimeout = timeout
 	}
-	targets := serversFor(parsed, shortlinkDomain, "http")
-	seen := map[string]bool{}
-	var out []Target
-	for _, t := range targets {
-		if t.Port == 80 && !seen[t.IP] {
-			seen[t.IP] = true
-			out = append(out, t)
+
+	parsed, err := getDNSParsed(ctx, probeTimeout, cacheTTL, false)
+	if err == nil {
+		targets := serversFor(parsed, shortlinkDomain, "http")
+		seen := map[string]bool{}
+		var out []Target
+		for _, t := range targets {
+			if t.Port == 80 && !seen[t.IP] {
+				seen[t.IP] = true
+				out = append(out, t)
+			}
+		}
+		if len(out) > 0 {
+			return out
 		}
 	}
-	if len(out) == 0 {
-		return []Target{{IP: "120.241.131.173", Port: 80}}
+
+	// HTTPDNS 不可达（或没给短连接目标）时的兜底
+	if fallback := systemDNSTargets(ctx, shortlinkDomain, []int{80, 443}, 2); len(fallback) > 0 {
+		return fallback
 	}
-	return out
+
+	// 最后的硬编码兜底，仅在大陆可达
+	return []Target{{IP: "120.241.131.173", Port: 80}}
 }
 
 func orderLonglinkTargets(targets []Target, max int) []Target {
