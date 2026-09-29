@@ -335,6 +335,12 @@ class BaseRequest {
     if (!got) {
       let options = CommonUtils.copy(requestOptions);
       options.method = options?.method?.toUpperCase() || "GET";
+      // 关键：把全局默认头并进来。
+      // 登录后设置的 Authorization / pp-userid / open-id / pp-suid / pp-version /
+      // User-Agent 全都存在 this.defaultHeaders 里，而降级实现原先只看
+      // options.headers，导致所有需要鉴权的接口都返回 403「签名不存在」
+      //（pupuapi 的"签名"指的就是 Authorization 令牌）。
+      options.headers = Object.assign({}, this.defaultHeaders, options.headers || {});
       let last = { statusCode: -1, headers: null, result: null };
       for (let i = 0; i < MAX_RETRY_COUNT; i++) {
         if (i > 0) await CommonUtils.wait(RETRY_WAIT_TIME * i);
