@@ -1233,6 +1233,7 @@ module.exports = {
   sfLogin,
   loadAccounts,
   signHeaders,
+  withRetry,
   AUTUMN_START,
   AUTUMN_END,
   autumnInWindow,
