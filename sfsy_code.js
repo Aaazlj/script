@@ -18,9 +18,11 @@ new Env('顺丰速运')
 
   代理（可选，海外服务器访问国内接口必配）：
   sf_proxy          静态代理地址，形如 http://user:pass@host:port（也可用 script_proxy，与朴朴脚本共用）
-                    —— 树脂（resin）就是这种写法：http://:管理token@主机:2260（用户名留空！）
-  sf_proxy_api_url  代理提取 API（品赞等），每次提取一个，支持 JSON / 纯文本两种返回
-                    —— 品赞：https://service.ipzan.com/core-extract?num=1&...&format=json&mode=auth
+                    —— 树脂（resin）就是这种写法：http://:管理token@主机:2260（用户名注意留空！）
+                    —— 只用这一个就够了，推荐
+  sf_proxy_api_url  可选：代理提取 API（每次提取一个，支持 JSON / 纯文本返回）。
+                    注意提取接口本身多半也在国内，海外机器需要先用 sf_proxy 引导才能访问它；
+                    且不少供应商需要把调用方出口 IP 加白名单，不适合配动态出口。国内环境再考虑用。
                     —— 只在 https 请求上走代理；内网 http 网关自动直连（外部代理解析不了容器内网域名）
   sf_proxy_mode     置为 api 时优先用提取 API（此时会用 sf_proxy 当引导去访问提取接口）；
                     默认静态代理优先
