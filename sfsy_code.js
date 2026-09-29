@@ -450,56 +450,77 @@ async function fetchWxCode(account, proxyPool) {
 
 /* ==================== 顺丰登录：code → UCMP → 业务 Cookie ==================== */
 
-async function sfLogin(account, proxyPool) {
-  const jar = new CookieJar();
+/** 通用的「失败就重试」包装：代理池类出口偶发连不通，必须靠重试兜住 */
+async function withRetry(label, fn, tries, proxyPool) {
+  const max = tries || 4;
+  let last = '未知错误';
+  for (let i = 0; i < max; i++) {
+    const r = await fn();
+    if (r && r.ok) return r;
+    last = (r && r.error) || '未知错误';
+    if (i < max - 1) {
+      VLOG(`   ${label} 第${i + 1}次失败：${last}`);
+      if (/TIMEOUT|ECONN|socket|TLS|EPROTO|ETIMEDOUT|reset|disconnected|代理/i.test(last)) {
+        if (proxyPool) await proxyPool.refresh('连接失败');
+      }
+      await sleep(1200 * (i + 1));
+    }
+  }
+  return { ok: false, error: last };
+}
 
-  // 已直接给了 cookie 串
+async function sfLogin(account, proxyPool) {
+  // 已直接给了 cookie 串：不需要网关
   if (/sessionId=|_login_mobile_=/.test(account.raw)) {
     return { ok: true, jar: jarFromCookieString(account.raw), via: 'cookie' };
   }
 
-  const codeRes = await fetchWxCode(account, proxyPool);
-  if (!codeRes.ok) return { ok: false, error: codeRes.error };
+  return withRetry('登录', async () => {
+    const jar = new CookieJar();
 
-  const agent = proxyFor(proxyPool.current, UCMP_BASE);
-  const onLogin = await rawRequest({
-    url: `${UCMP_BASE}/wxaccess/weixin/appOnLogin?code=${encodeURIComponent(codeRes.code)}&publicId=${encodeURIComponent(PUBLIC_ID)}`,
-    headers: {
-      'User-Agent': UA_MP,
-      Accept: 'application/json, text/plain, */*',
-      Referer: `https://servicewechat.com/${APPID}/${PAGE_VERSION}/page-frame.html`,
-    },
-    timeout: 30000,
-    agent,
-    jar,
-  });
-  const j = onLogin.json || {};
-  const sessionId = j.sessionId || j.sessionID || (j.obj && j.obj.sessionId) || jar.get('sessionId');
-  if (!sessionId) {
-    return {
-      ok: false,
-      error: `appOnLogin 未返回 sessionId（HTTP ${onLogin.status}${onLogin.error ? ` ${onLogin.error}` : ''}）`
-        + ` raw=${crop(onLogin.text, 300)}`,
-    };
-  }
-  jar.merge({ sessionId, suuid: sessionId });
+    const codeRes = await fetchWxCode(account, proxyPool);
+    if (!codeRes.ok) return { ok: false, error: codeRes.error };
 
-  // 换绑补全 _login_mobile_ / _login_user_id_
-  const bizCode = JSON.stringify({
-    path: '/up-member/newPoints', linkCode: 'SFAC20230803190840424',
-    supportShare: 'YES', subCategoryCode: '1', from: 'mypoint', categoryCode: '1',
-  });
-  const sfnewUrl = `${UCMP_BASE}/wechat-act/weixin/activity/sfnewactivity?bizCode=${encodeURIComponent(bizCode)}`
-    + `&regSource=mypoint&citycode=025&cityname=${encodeURIComponent('广州')}`
-    + `&wxapp-version=V17.49&suuid=${sessionId}`;
-  await rawRequest({ url: sfnewUrl, headers: { 'User-Agent': UA_H5, Accept: 'text/html,*/*' }, timeout: 30000, agent, jar, follow: 10 });
-  if (!jar.get('_login_mobile_')) {
-    await rawRequest({ url: `${MCS_BASE}/mcs-mimp/app/index.html`, headers: { 'User-Agent': UA_H5 }, timeout: 20000, agent, jar, follow: 5 });
-  }
-  if (!jar.get('_login_mobile_')) {
-    return { ok: false, error: '未拿到绑定手机号（该微信号可能未注册/未绑定顺丰会员）' };
-  }
-  return { ok: true, jar, via: 'gateway' };
+    const agent = proxyFor(proxyPool.current, UCMP_BASE);
+    const onLogin = await rawRequest({
+      url: `${UCMP_BASE}/wxaccess/weixin/appOnLogin?code=${encodeURIComponent(codeRes.code)}&publicId=${encodeURIComponent(PUBLIC_ID)}`,
+      headers: {
+        'User-Agent': UA_MP,
+        Accept: 'application/json, text/plain, */*',
+        Referer: `https://servicewechat.com/${APPID}/${PAGE_VERSION}/page-frame.html`,
+      },
+      timeout: 30000,
+      agent,
+      jar,
+    });
+    const j = onLogin.json || {};
+    const sessionId = j.sessionId || j.sessionID || (j.obj && j.obj.sessionId) || jar.get('sessionId');
+    if (!sessionId) {
+      return {
+        ok: false,
+        error: `appOnLogin 未返回 sessionId（HTTP ${onLogin.status}${onLogin.error ? ` ${onLogin.error}` : ''}）`
+          + ` raw=${crop(onLogin.text, 200)}`,
+      };
+    }
+    jar.merge({ sessionId, suuid: sessionId });
+
+    // 换绑补全 _login_mobile_ / _login_user_id_
+    const bizCode = JSON.stringify({
+      path: '/up-member/newPoints', linkCode: 'SFAC20230803190840424',
+      supportShare: 'YES', subCategoryCode: '1', from: 'mypoint', categoryCode: '1',
+    });
+    const sfnewUrl = `${UCMP_BASE}/wechat-act/weixin/activity/sfnewactivity?bizCode=${encodeURIComponent(bizCode)}`
+      + `&regSource=mypoint&citycode=025&cityname=${encodeURIComponent('广州')}`
+      + `&wxapp-version=V17.49&suuid=${sessionId}`;
+    await rawRequest({ url: sfnewUrl, headers: { 'User-Agent': UA_H5, Accept: 'text/html,*/*' }, timeout: 30000, agent, jar, follow: 10 });
+    if (!jar.get('_login_mobile_')) {
+      await rawRequest({ url: `${MCS_BASE}/mcs-mimp/app/index.html`, headers: { 'User-Agent': UA_H5 }, timeout: 20000, agent, jar, follow: 5 });
+    }
+    if (!jar.get('_login_mobile_')) {
+      return { ok: false, error: '未拿到绑定手机号（该微信号可能未注册/未绑定顺丰会员）' };
+    }
+    return { ok: true, jar, via: 'gateway' };
+  }, 4, proxyPool);
 }
 
 /* ==================== 顺丰业务请求 ==================== */
