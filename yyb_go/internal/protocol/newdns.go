@@ -234,7 +234,11 @@ func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([
 // 注意：容器里的 DNS 常常只返回 AAAA（IPv6），而容器多半没有 IPv6 出网，
 // 所以**显式只查 IPv4**；查不到再退回普通 LookupHost 并过滤掉 IPv6。
 func systemDNSLonglinkTargets(ctx context.Context) []Target {
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// 关键：不能直接用上游 ctx —— 走到这里时前面的 HTTPDNS 两次 dial
+	// 已经耗掉十几秒，上游 deadline 往往已经到期，查询会立刻被取消。
+	// 用 WithoutCancel 脱离上游取消，再套一个自己的超时。
+	base := context.WithoutCancel(ctx)
+	lookupCtx, cancel := context.WithTimeout(base, 5*time.Second)
 	defer cancel()
 
 	var ips []string
