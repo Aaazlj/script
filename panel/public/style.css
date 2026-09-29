@@ -64,9 +64,9 @@ body {
 .pick-icon svg { width: 26px; height: 26px; display: block; }
 .pick-icon.yyb { background: #eaf7ef; color: #1f9d55; }
 .pick-icon.mt { background: #fff3e8; color: #f0821e; }
-.pick-body { flex: 1; min-width: 0; }
-.pick-title { font-size: 15px; font-weight: 600; }
-.pick-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.pick-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.pick-title { display: block; font-size: 15px; font-weight: 600; }
+.pick-desc { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
 .pick-arrow { color: #c3c9d4; font-size: 18px; }
 
 .back-link {
