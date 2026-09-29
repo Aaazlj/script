@@ -170,6 +170,50 @@ route('GET', '/api/meituan/status', async (req, res, url) => {
   httpx.ok(res, { status: 'done', upload: up });
 });
 
+/* 应用宝账号管理（管理后台，需登录） */
+
+route('GET', '/api/yyb/accounts', async (req, res) => {
+  const cfg = config.load();
+  const out = await yyb.listAccounts(cfg.yyb);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, { accounts: out.accounts, gateway: cfg.yyb.baseUrl });
+}, { admin: true });
+
+route('POST', '/api/yyb/accounts/refresh', async (req, res) => {
+  const body = await httpx.readJSON(req);
+  const cfg = config.load();
+  const out = await yyb.refreshAccounts(cfg.yyb, body.ref || '');
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  const list = await yyb.listAccounts(cfg.yyb);
+  httpx.ok(res, { refreshed: out.result, accounts: list.ok ? list.accounts : [] });
+}, { admin: true });
+
+route('POST', '/api/yyb/accounts/resync', async (req, res) => {
+  const body = await httpx.readJSON(req);
+  const cfg = config.load();
+  const out = await yyb.resyncAccounts(cfg.yyb, body.ref || '');
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  const list = await yyb.listAccounts(cfg.yyb);
+  httpx.ok(res, { accounts: list.ok ? list.accounts : [] });
+}, { admin: true });
+
+route('DELETE', '/api/yyb/accounts', async (req, res, url) => {
+  const ref = url.searchParams.get('ref') || '';
+  if (!ref) return httpx.fail(res, 400, '缺少账号 ref');
+  const cfg = config.load();
+  const out = await yyb.deleteAccount(cfg.yyb, ref);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, out.result);
+}, { admin: true });
+
+route('GET', '/api/yyb/avatar', async (req, res, url) => {
+  const ref = url.searchParams.get('ref') || '';
+  const cfg = config.load();
+  const target = yyb.avatarUrl(cfg.yyb, ref);
+  if (!target) return httpx.fail(res, 400, '未配置 yyb_go 网关地址');
+  httpx.pipeThrough(target, res);
+}, { admin: true });
+
 /* 管理后台 */
 
 route('GET', '/api/admin/health', async (req, res) => {
