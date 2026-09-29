@@ -19,10 +19,12 @@ const ICONS = {
   box: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 12 4l9 4.5-9 4.5-9-4.5Z"/><path d="M3 8.5v7L12 20l9-4.5v-7"/></svg>',
   bag: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8h14l-1 12H6L5 8Z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg>',
   shield: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v6c0 4 3 7.4 7 9 4-1.6 7-5 7-9V6l-7-3Z"/></svg>',
+  users: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 6.2a3 3 0 0 1 0 5.6"/><path d="M17.5 20a5.5 5.5 0 0 0-2.2-4.4"/></svg>',
 };
 
 const PANELS = [
   { id: 'overview', name: '概览', sub: '各通道状态一览', icon: ICONS.grid, save: false },
+  { id: 'accounts', name: '应用宝账号', sub: '管理已扫码入库的微信账号', icon: ICONS.users, save: false },
   { id: 'qinglong', name: '青龙面板', sub: 'OpenAPI 凭据配置', icon: ICONS.plug, save: true },
   { id: 'yyb', name: '应用宝网关', sub: 'yyb_go 地址与写入值', icon: ICONS.box, save: true },
   { id: 'meituan', name: '美团扫码', sub: '官方专家包 run.js', icon: ICONS.bag, save: true },
@@ -212,6 +214,7 @@ function renderShell() {
 
   const body = $('panels');
   body.appendChild(buildOverview());
+  body.appendChild(buildAccounts());
   body.appendChild(buildQinglong());
   body.appendChild(buildYyb());
   body.appendChild(buildMeituan());
@@ -237,6 +240,7 @@ function activate(id, push) {
   // 用 hash 记录当前位置，刷新后仍停在同一个面板
   if (push !== false) history.replaceState({ panel: id }, '', '#' + id);
   if (id === 'overview') refreshOverview();
+  if (id === 'accounts') loadAccounts();
 }
 
 function activateFromHash() {
@@ -443,6 +447,125 @@ async function doSave(silent) {
     if (!silent) alert('保存失败：' + e.message);
     return false;
   }
+}
+
+/* ---------- 应用宝账号 ---------- */
+
+let acctListEl, acctOut;
+
+function buildAccounts() {
+  acctOut = node('div');
+  acctListEl = node('div');
+
+  const card = node('div', { class: 'card' }, [
+    node('h2', { text: '已入库的应用宝账号' }),
+    node('div', { class: 'hint', text: '这里显示扫码登录后存进 yyb_go 网关的微信账号。青龙脚本通过 yyb_server 调它取 code，删掉某个账号即可让脚本不再用它。' }),
+    node('div', { class: 'row', style: 'margin-bottom:14px' }, [
+      node('button', { class: 'btn small ghost', text: '刷新列表', onclick: (e) => loadAccounts(e.target) }),
+      node('button', {
+        class: 'btn small ghost', text: '刷新全部登录态',
+        onclick: (e) => doAccountAction(e.target, '/api/yyb/accounts/refresh', '', '正在逐个探测登录态，多账号会比较慢…'),
+      }),
+      node('button', {
+        class: 'btn small ghost', text: '同步全部资料',
+        onclick: (e) => doAccountAction(e.target, '/api/yyb/accounts/resync', '', '正在同步昵称与头像…'),
+      }),
+    ]),
+    acctListEl,
+    acctOut,
+  ]);
+
+  return node('section', { class: 'panel hidden', 'data-panel': 'accounts' }, [card]);
+}
+
+function statusBadge(status) {
+  const s = String(status || '').toLowerCase();
+  const kind = s === 'alive' ? 'ok' : (s === 'expired' ? 'err' : (s === 'unknown' ? 'warn' : 'warn'));
+  const text = s === 'alive' ? '正常' : (s === 'expired' ? '已失效' : (s === 'unknown' ? '未知' : (status || '未知')));
+  return node('span', { class: 'stat-label', style: 'gap:5px' }, [
+    node('span', { class: 'dot ' + kind }),
+    node('span', { text: text }),
+  ]);
+}
+
+function accountRow(a) {
+  const name = a.nickname || a.alias || a.openid || ('#' + a.ref);
+  const avatar = a.hasAvatar
+    ? node('img', { src: '/api/yyb/avatar?ref=' + encodeURIComponent(a.ref), alt: '', style: 'width:38px;height:38px;border-radius:50%;object-fit:cover;background:#f1efea;flex:0 0 38px' })
+    : node('div', { style: 'width:38px;height:38px;border-radius:50%;background:#eef0f4;flex:0 0 38px' });
+
+  const meta = node('div', { style: 'flex:1;min-width:0' }, [
+    node('div', { text: name, style: 'font-weight:500' }),
+    node('div', { text: 'openid ' + (a.openid || '-') + (a.uin ? ' · uin ' + a.uin : ''), style: 'font-size:12px;color:var(--muted);word-break:break-all' }),
+  ]);
+
+  const btn = (text, fn, cls) => node('button', {
+    class: 'btn small ' + (cls || 'ghost'), text,
+    style: 'font-size:12px;padding:5px 10px', onclick: fn,
+  });
+
+  const ops = node('div', { class: 'row', style: 'flex:0 0 auto;gap:6px' }, [
+    btn('刷新登录态', (e) => doAccountAction(e.target, '/api/yyb/accounts/refresh', a.ref)),
+    btn('同步资料', (e) => doAccountAction(e.target, '/api/yyb/accounts/resync', a.ref)),
+    btn('删除', (e) => removeAccount(e.target, a), ''),
+  ]);
+
+  return node('div', { style: 'display:flex;gap:12px;align-items:center;padding:12px 0;border-top:1px solid var(--line)' }, [
+    avatar, meta, statusBadge(a.status), ops,
+  ]);
+}
+
+function renderAccounts(accounts) {
+  acctListEl.innerHTML = '';
+  if (!accounts || !accounts.length) {
+    acctListEl.appendChild(node('div', { class: 'note info', text: '还没有账号。去扫码页用「应用宝扫码」扫一次就会出现在这里。' }));
+    return;
+  }
+  acctListEl.appendChild(node('div', { class: 'stat-label', style: 'margin-bottom:4px' }, [
+    node('span', { text: '共 ' + accounts.length + ' 个账号' }),
+  ]));
+  for (const a of accounts) acctListEl.appendChild(accountRow(a));
+}
+
+async function loadAccounts(btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('GET', '/api/yyb/accounts');
+    renderAccounts(r.accounts);
+    acctOut.innerHTML = '';
+  } catch (e) {
+    acctListEl.innerHTML = '';
+    show(acctOut, 'err', [e.message]);
+  }
+  if (btn) btn.disabled = false;
+}
+
+async function doAccountAction(btn, url, ref, busyText) {
+  btn.disabled = true;
+  show(acctOut, 'info', [busyText || '正在处理…']);
+  try {
+    const r = await api('POST', url, { ref: ref || '' });
+    show(acctOut, 'ok', ['已完成']);
+    if (r.accounts) renderAccounts(r.accounts);
+  } catch (e) {
+    show(acctOut, 'err', [e.message]);
+  }
+  btn.disabled = false;
+}
+
+async function removeAccount(btn, a) {
+  const name = a.nickname || a.alias || a.openid || ('#' + a.ref);
+  if (!confirm('确定删除账号「' + name + '」？删除后青龙脚本将不再使用它，需要重新扫码才能恢复。')) return;
+  btn.disabled = true;
+  show(acctOut, 'info', ['正在删除…']);
+  try {
+    await api('DELETE', '/api/yyb/accounts?ref=' + encodeURIComponent(a.ref));
+    show(acctOut, 'ok', ['已删除：' + name]);
+    await loadAccounts();
+  } catch (e) {
+    show(acctOut, 'err', [e.message]);
+  }
+  btn.disabled = false;
 }
 
 /* ---------- 引导 ---------- */

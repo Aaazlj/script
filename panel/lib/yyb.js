@@ -90,4 +90,89 @@ async function confirmQR(cfg, sessionId) {
   };
 }
 
-module.exports = { health, createQR, pollQR, confirmQR };
+/* ---------------- 账号管理（对应 yyb_go 的 /accounts 系列） ---------------- */
+
+function normalizeAccount(a) {
+  const id = a && a.id != null ? a.id : '';
+  return {
+    ref: String(id || (a && a.openid) || ''),
+    id: a && a.id,
+    openid: (a && a.openid) || '',
+    uin: a && a.uin,
+    nickname: (a && (a.nickname || a.alias)) || '',
+    alias: (a && a.alias) || '',
+    status: (a && a.status) || '',
+    hasAvatar: !!(a && a.avatar),
+  };
+}
+
+/** 列出网关里已入库的微信（应用宝）账号 */
+async function listAccounts(cfg) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/accounts`, { timeout: TIMEOUT });
+  const out = unwrap(res, '读取账号列表');
+  if (!out.ok) return out;
+  const list = Array.isArray(out.data) ? out.data : [];
+  return { ok: true, accounts: list.map(normalizeAccount) };
+}
+
+/** 刷新账号登录态；ref 为空表示全部 */
+async function refreshAccounts(cfg, ref) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/accounts/refresh`, {
+    method: 'POST',
+    body: { ref: ref || '' },
+    timeout: 180000, // 逐账号探测，多账号会比较慢
+  });
+  const out = unwrap(res, '刷新账号');
+  if (!out.ok) return out;
+  return { ok: true, result: out.data };
+}
+
+/** 重新拉取账号资料（昵称/头像） */
+async function resyncAccounts(cfg, ref) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/accounts/resync`, {
+    method: 'POST',
+    body: { ref: ref || '' },
+    timeout: TIMEOUT,
+  });
+  const out = unwrap(res, '同步账号资料');
+  if (!out.ok) return out;
+  return { ok: true, result: out.data };
+}
+
+/** 删除账号 */
+async function deleteAccount(cfg, ref) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/accounts?ref=${encodeURIComponent(ref)}`, {
+    method: 'DELETE',
+    timeout: TIMEOUT,
+  });
+  const out = unwrap(res, '删除账号');
+  if (!out.ok) return out;
+  return { ok: true, result: out.data };
+}
+
+/** 头像的原始 URL（供面板透传） */
+function avatarUrl(cfg, ref) {
+  const b = base(cfg);
+  if (!b) return '';
+  return `${b}/accounts/avatar?ref=${encodeURIComponent(ref)}`;
+}
+
+module.exports = {
+  health,
+  createQR,
+  pollQR,
+  confirmQR,
+  listAccounts,
+  refreshAccounts,
+  resyncAccounts,
+  deleteAccount,
+  avatarUrl,
+};

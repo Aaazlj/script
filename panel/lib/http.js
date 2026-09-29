@@ -78,6 +78,47 @@ function requestRaw(urlStr, opts = {}) {
   });
 }
 
+/**
+ * 把上游响应原样透传给客户端（用于头像等二进制内容，不经 JSON 解析）
+ */
+function pipeThrough(urlStr, res, opts = {}) {
+  let u;
+  try {
+    u = new URL(urlStr);
+  } catch (_) {
+    res.writeHead(502);
+    return res.end('bad upstream url');
+  }
+  const isHttp = u.protocol === 'http:';
+  const lib = isHttp ? http : https;
+  const req = lib.request(
+    {
+      hostname: u.hostname,
+      port: u.port || (isHttp ? 80 : 443),
+      path: u.pathname + u.search,
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+    },
+    (up) => {
+      if (up.statusCode < 200 || up.statusCode >= 300) {
+        up.resume();
+        res.writeHead(up.statusCode >= 400 && up.statusCode < 500 ? 404 : 502);
+        return res.end('upstream error');
+      }
+      res.writeHead(200, {
+        'Content-Type': up.headers['content-type'] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+      });
+      up.pipe(res);
+    }
+  );
+  req.on('error', () => {
+    try { res.writeHead(502); res.end('upstream error'); } catch (_) { /* 已响应 */ }
+  });
+  req.setTimeout(opts.timeout || 15000, () => req.destroy());
+  req.end();
+}
+
 /* ---------------- 服务端工具 ---------------- */
 
 function sendJSON(res, status, payload) {
@@ -160,6 +201,7 @@ function clientIP(req) {
 
 module.exports = {
   requestRaw,
+  pipeThrough,
   sendJSON,
   ok,
   fail,
