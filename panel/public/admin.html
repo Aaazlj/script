@@ -69,7 +69,14 @@ function node(tag, props, children) {
 
 function noteBox(kind, lines) {
   const box = node('div', { class: 'note ' + kind, style: 'margin-top:14px' });
-  for (const line of lines) box.appendChild(typeof line === 'string' ? node('div', { text: line }) : line);
+  for (const line of (lines || [])) {
+    // 允许调用方用 `cond ? '文案' : null` 这种写法，空值直接跳过，
+    // 否则 appendChild(null) 会抛 "parameter 1 is not of type 'Node'"
+    if (line === null || line === undefined || line === false || line === '') continue;
+    box.appendChild(typeof line === 'string' || typeof line === 'number'
+      ? node('div', { text: String(line) })
+      : line);
+  }
   return box;
 }
 

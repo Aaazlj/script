@@ -114,9 +114,11 @@ function clearResult() { $('result').innerHTML = ''; }
 function note(kind, lines) {
   const box = document.createElement('div');
   box.className = 'note ' + kind;
-  for (const line of lines) {
+  for (const line of (lines || [])) {
+    // 允许传 null/undefined（例如 `cond ? '文案' : null`），直接跳过
+    if (line === null || line === undefined || line === false || line === '') continue;
     const div = document.createElement('div');
-    if (typeof line === 'string') div.textContent = line;
+    if (typeof line === 'string' || typeof line === 'number') div.textContent = String(line);
     else div.appendChild(line);
     box.appendChild(div);
   }
