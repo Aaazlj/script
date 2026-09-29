@@ -1202,7 +1202,7 @@ async function main() {
     LOG('🔌 代理：未配置（海外服务器访问国内接口会超时，建议配 sf_proxy 或 sf_proxy_api_url）');
   }
 
-  if (DRY_RUN) LOG('🧪 自检模式：只查询不消耗');
+  if (DRY_RUN) LOG('🧪 自检模式：中秋活动只查询不消耗（签到/红包等日常动作仍会执行）');
   LOG(`🎉 顺丰速运任务启动，共 ${accounts.length} 个账号`);
 
   let ok = 0;
