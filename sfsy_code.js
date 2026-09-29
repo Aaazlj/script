@@ -17,7 +17,7 @@ new Env('顺丰速运')
   sfsyUrl / sf     兼容变量：直接给 Cookie 串或登录 URL（不经过网关）
 
   代理（可选，海外服务器访问国内接口必配）：
-  sf_proxy          静态代理地址，形如 http://user:pass@host:port
+  sf_proxy          静态代理地址，形如 http://user:pass@host:port（也可用 script_proxy，与朴朴脚本共用）
                     —— 树脂（resin）就是这种写法：http://:管理token@主机:2260（用户名留空！）
   sf_proxy_api_url  代理提取 API（品赞等），每次提取一个，支持 JSON / 纯文本两种返回
                     —— 品赞：https://service.ipzan.com/core-extract?num=1&...&format=json&mode=auth
@@ -118,8 +118,8 @@ const ENV = (k) => String(process.env[k] || '').trim();
 const SF_OPENID = ENV('sf_openid');
 const YYB_SERVER = (ENV('yyb_server') || ENV('wx_server_url')).replace(/\/+$/, '');
 const RAW_COOKIE_ENV = ENV('sfsyUrl') || ENV('sf');
-const STATIC_PROXY = ENV('sf_proxy');
-const PROXY_API_URL = ENV('sf_proxy_api_url');
+const STATIC_PROXY = ENV('sf_proxy') || ENV('script_proxy');
+const PROXY_API_URL = ENV('sf_proxy_api_url') || ENV('script_proxy_api_url');
 const DRY_RUN = ENV('sf_dry_run') === '1';
 const VERBOSE = ENV('sf_verbose') === '1';
 const AUTUMN_ENABLED = ENV('sf_autumn') !== '0';
@@ -1240,5 +1240,8 @@ module.exports = {
 };
 
 if (require.main === module) {
-  main().catch((e) => LOG(`脚本异常：${e && e.message ? e.message : e}`));
+  main()
+    .catch((e) => LOG(`脚本异常：${e && e.message ? e.message : e}`))
+    // 显式退出：代理 Agent/长连接句柄会吊住事件循环，否则青龙里任务永远不结束
+    .finally(() => setTimeout(() => process.exit(0), 300));
 }
