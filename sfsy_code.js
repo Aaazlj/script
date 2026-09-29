@@ -22,6 +22,8 @@ new Env('顺丰速运')
   sf_proxy_api_url  代理提取 API（品赞等），每次提取一个，支持 JSON / 纯文本两种返回
                     —— 品赞：https://service.ipzan.com/core-extract?num=1&...&format=json&mode=auth
                     —— 只在 https 请求上走代理；内网 http 网关自动直连（外部代理解析不了容器内网域名）
+  sf_proxy_mode     置为 api 时优先用提取 API（此时会用 sf_proxy 当引导去访问提取接口）；
+                    默认静态代理优先
 
   sf_autumn        中秋活动开关，默认 1（活动时间窗内才执行）
   sf_dry_run       自检模式，默认 0；设为 1 则只查询不消耗（首次验证账号用）
@@ -120,6 +122,8 @@ const YYB_SERVER = (ENV('yyb_server') || ENV('wx_server_url')).replace(/\/+$/, '
 const RAW_COOKIE_ENV = ENV('sfsyUrl') || ENV('sf');
 const STATIC_PROXY = ENV('sf_proxy') || ENV('script_proxy');
 const PROXY_API_URL = ENV('sf_proxy_api_url') || ENV('script_proxy_api_url');
+// sf_proxy_mode=api：优先用提取 API（可用静态代理引导）；默认静态代理优先
+const PROXY_MODE_API = ENV('sf_proxy_mode') === 'api';
 const DRY_RUN = ENV('sf_dry_run') === '1';
 const VERBOSE = ENV('sf_verbose') === '1';
 const AUTUMN_ENABLED = ENV('sf_autumn') !== '0';
@@ -211,14 +215,14 @@ function agentFor(proxyUrl, secure) {
   return agentCache.get(key);
 }
 
-/** 极简 HTTP 请求（返回文本），用于访问代理提取 API */
-function plainGet(url, timeout = 10000) {
+/** 极简 HTTP 请求（返回文本），用于访问代理提取 API；agent 可选 */
+function plainGet(url, timeout = 10000, agent) {
   return new Promise((resolve) => {
     let u;
     try { u = new URL(url); } catch (_) { return resolve({ ok: false, error: '非法 URL' }); }
     const lib = u.protocol === 'http:' ? http : https;
     const req = lib.get(
-      { hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname + u.search, timeout },
+      { hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname + u.search, timeout, agent },
       (res) => {
         const c = [];
         res.on('data', (d) => c.push(d));
@@ -230,31 +234,46 @@ function plainGet(url, timeout = 10000) {
   });
 }
 
-/** 代理池：静态代理优先；否则用提取 API 现取，取到后缓存，失败自动换 */
+/** 代理池：默认静态代理优先；sf_proxy_mode=api 则用提取 API（可用静态代理引导） */
 class ProxyPool {
   constructor() {
-    this.current = STATIC_PROXY || '';
-    this.staticMode = Boolean(STATIC_PROXY);
+    this.useApi = PROXY_MODE_API || !STATIC_PROXY;
+    this.current = this.useApi ? '' : STATIC_PROXY;
   }
 
   async refresh(reason) {
-    if (this.staticMode) return this.current;
+    if (!this.useApi) return this.current;
     if (!PROXY_API_URL) return '';
-    try {
-      const r = await plainGet(PROXY_API_URL);
-      if (!r.ok) {
-        LOG(`⚠️ 代理提取失败：${r.error}`);
-        return this.current;
+    // 提取 API 本身多半也在国内（品赞 service.ipzan.com 就是），海外机器直连不通，
+    // 所以直连失败后再经静态代理试一次 —— 用树脂引导品赞。
+    const attempts = [
+      { label: '直连', agent: undefined },
+      { label: '经静态代理', agent: STATIC_PROXY ? agentFor(STATIC_PROXY, true) : undefined },
+    ];
+    for (const a of attempts) {
+      if (!a.agent && a.label !== '直连') continue;
+      let r;
+      try {
+        r = await plainGet(PROXY_API_URL, 12000, a.agent);
+      } catch (e) {
+        r = { ok: false, error: e.message };
       }
+      if (!r.ok) { VLOG(`   提取代理(${a.label})失败：${r.error}`); continue; }
+
       const picked = ProxyPool.parseExtract(r.text);
       if (picked) {
         if (picked !== this.current) LOG(`🔄 切换代理${reason ? `（${reason}）` : ''}：${ProxyPool.display(picked)}`);
         this.current = picked;
         return picked;
       }
-      LOG(`⚠️ 代理提取未返回可用 IP：${crop(r.text, 120)}`);
-    } catch (e) {
-      LOG(`⚠️ 代理提取异常：${e.message}`);
+      // 拿不到 IP：把服务端的 message 透出来（余额不足 / 白名单 / 频率过快 等）
+      let hint = crop(r.text, 160);
+      try {
+        const j = JSON.parse(r.text);
+        if (j && j.message) hint = j.message;
+      } catch (_) { /* 非 JSON */ }
+      LOG(`⚠️ 提取代理(${a.label})未拿到可用 IP：${hint}`);
+      break;
     }
     return this.current;
   }
