@@ -475,7 +475,13 @@ async function sfLogin(account, proxyPool) {
   });
   const j = onLogin.json || {};
   const sessionId = j.sessionId || j.sessionID || (j.obj && j.obj.sessionId) || jar.get('sessionId');
-  if (!sessionId) return { ok: false, error: `appOnLogin 未返回 sessionId：${crop(j || onLogin.text, 160)}` };
+  if (!sessionId) {
+    return {
+      ok: false,
+      error: `appOnLogin 未返回 sessionId（HTTP ${onLogin.status}${onLogin.error ? ` ${onLogin.error}` : ''}）`
+        + ` raw=${crop(onLogin.text, 300)}`,
+    };
+  }
   jar.merge({ sessionId, suuid: sessionId });
 
   // 换绑补全 _login_mobile_ / _login_user_id_
@@ -1158,7 +1164,7 @@ function loadAccounts() {
 
 /* ==================== 主流程 ==================== */
 
-(async () => {
+async function main() {
   const accounts = loadAccounts();
   if (!accounts.length) {
     LOG('未找到顺丰账号：请配置 sf_openid（推荐，配合 yyb_server）或 sfsyUrl / sf');
@@ -1196,4 +1202,21 @@ function loadAccounts() {
 
   LOG(`\n======🎉 完成 ${ok} / 共 ${accounts.length} 账号======`);
   $.done();
-})();
+}
+
+module.exports = {
+  rawRequest,
+  makeTunnelAgent,
+  CookieJar,
+  ProxyPool,
+  sfLogin,
+  loadAccounts,
+  signHeaders,
+  AUTUMN_START,
+  AUTUMN_END,
+  autumnInWindow,
+};
+
+if (require.main === module) {
+  main().catch((e) => LOG(`脚本异常：${e && e.message ? e.message : e}`));
+}
