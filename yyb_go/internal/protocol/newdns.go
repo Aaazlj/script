@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"sort"
@@ -229,26 +230,50 @@ func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([
 // 只取前两个 IP（系统 DNS 已按地理位置给出就近节点），并且每个 IP 都展开
 // 8080/80/443 三个端口——因为 orderLonglinkTargets 是"按端口优先"排序后截断的，
 // 若给出太多 IP，后面的端口会被截掉，反而试不到。
+//
+// 注意：容器里的 DNS 常常只返回 AAAA（IPv6），而容器多半没有 IPv6 出网，
+// 所以**显式只查 IPv4**；查不到再退回普通 LookupHost 并过滤掉 IPv6。
 func systemDNSLonglinkTargets(ctx context.Context) []Target {
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	addrs, err := net.DefaultResolver.LookupHost(lookupCtx, longlinkDomain)
-	if err != nil || len(addrs) == 0 {
+
+	var ips []string
+	if addrs, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip4", longlinkDomain); err == nil {
+		for _, a := range addrs {
+			if a.Is4() {
+				ips = append(ips, a.String())
+			}
+		}
+	} else {
+		log.Printf("[newdns] system dns ip4 lookup failed: %v", err)
+	}
+	if len(ips) == 0 {
+		if addrs, err := net.DefaultResolver.LookupHost(lookupCtx, longlinkDomain); err == nil {
+			for _, ip := range addrs {
+				if p := net.ParseIP(ip); p != nil && p.To4() != nil {
+					ips = append(ips, ip)
+				}
+			}
+		} else {
+			log.Printf("[newdns] system dns lookup failed: %v", err)
+		}
+	}
+	if len(ips) == 0 {
+		log.Printf("[newdns] no IPv4 for %s, fallback unavailable", longlinkDomain)
 		return nil
 	}
+
 	const maxIPs = 2
 	var out []Target
-	for _, ip := range addrs {
+	for _, ip := range ips {
 		if len(out) >= maxIPs*3 {
 			break
-		}
-		if net.ParseIP(ip) == nil {
-			continue
 		}
 		for _, port := range []int{8080, 80, 443} {
 			out = append(out, Target{IP: ip, Port: port})
 		}
 	}
+	log.Printf("[newdns] HTTPDNS unavailable, using system dns targets: %v", out)
 	return out
 }
 
