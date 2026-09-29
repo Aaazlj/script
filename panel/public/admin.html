@@ -560,8 +560,10 @@ async function removeAccount(btn, a) {
   show(acctOut, 'info', ['正在删除…']);
   try {
     await api('DELETE', '/api/yyb/accounts?ref=' + encodeURIComponent(a.ref));
-    show(acctOut, 'ok', ['已删除：' + name]);
+    // 先刷新列表（loadAccounts 成功时会清空 acctOut），再显示结果，
+    // 否则「已删除」会被随后的刷新清掉，看起来像没生效
     await loadAccounts();
+    show(acctOut, 'ok', ['已删除：' + name]);
   } catch (e) {
     show(acctOut, 'err', [e.message]);
   }
