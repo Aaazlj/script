@@ -813,7 +813,7 @@ def run_account(index: int, total: int, ref: str, label: str = "") -> Dict[str, 
     )
 
     list_resp = wall_post(
-        server,
+        label,
         LIST_PATH,
         proxies,
         token=token,
@@ -924,7 +924,7 @@ def run_account(index: int, total: int, ref: str, label: str = "") -> Dict[str, 
     )
 
     grant_resp = wall_post(
-        server,
+        label,
         GRANT_PATH,
         proxies,
         token=token,
