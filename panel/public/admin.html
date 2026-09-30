@@ -475,6 +475,7 @@ function buildAccounts() {
         class: 'btn small ghost', text: '同步全部资料',
         onclick: (e) => doAccountAction(e.target, '/api/yyb/accounts/resync', '', '正在同步昵称与头像…'),
       }),
+      node('button', { class: 'btn small ghost', text: '导出全部', onclick: (e) => exportAccounts('', e.target) }),
     ]),
     acctListEl,
     acctOut,
@@ -512,6 +513,7 @@ function accountRow(a) {
   const ops = node('div', { class: 'row', style: 'flex:0 0 auto;gap:6px' }, [
     btn('刷新登录态', (e) => doAccountAction(e.target, '/api/yyb/accounts/refresh', a.ref)),
     btn('同步资料', (e) => doAccountAction(e.target, '/api/yyb/accounts/resync', a.ref)),
+    btn('导出', (e) => exportAccounts(a.ref, e.target)),
     btn('删除', (e) => removeAccount(e.target, a), ''),
   ]);
 
@@ -556,6 +558,35 @@ async function doAccountAction(btn, url, ref, busyText) {
     show(acctOut, 'err', [e.message]);
   }
   btn.disabled = false;
+}
+
+/* 导出账号：ref 为空导出全部。接口返回 JSON 文件（attachment），用 blob 触发浏览器下载 */
+async function exportAccounts(ref, btn) {
+  if (btn) btn.disabled = true;
+  show(acctOut, 'info', [ref ? '正在导出该账号…' : '正在导出全部账号…']);
+  try {
+    const qs = ref ? '?ref=' + encodeURIComponent(ref) : '';
+    const res = await fetch('/api/yyb/accounts/export' + qs, { credentials: 'same-origin' });
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); msg = j.error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const dispo = res.headers.get('Content-Disposition') || '';
+    const m = dispo.match(/filename="?([^";]+)"?/);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : 'yyb-accounts.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+    show(acctOut, 'ok', [ref ? '已导出该账号（见浏览器下载）' : '已导出全部账号（见浏览器下载）']);
+  } catch (e) {
+    show(acctOut, 'err', ['导出失败：' + e.message]);
+  }
+  if (btn) btn.disabled = false;
 }
 
 async function removeAccount(btn, a) {
