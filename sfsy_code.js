@@ -123,6 +123,11 @@ const SF_OPENID = ENV('sf_openid');
 const YYB_SERVER = (ENV('yyb_server') || ENV('wx_server_url')).replace(/\/+$/, '');
 const RAW_COOKIE_ENV = ENV('sfsyUrl') || ENV('sf');
 const STATIC_PROXY = ENV('sf_proxy') || ENV('script_proxy');
+// 粘性出口（树脂 Resin 的 Account 特性）：sf_proxy_sticky=1 时给每个账号绑一个固定出口，
+// 代理用户名写成 <平台>.<前缀>_<账号>，而不是「每次连接随机挑节点」——实测成功率与速度都明显更好。
+// 绑到坏节点时由 ProxyPool 自动换出口（见 noteFailure）。
+const STICKY = /^(1|true|yes|on|account)$/i.test(ENV('sf_proxy_sticky'));
+const STICKY_PREFIX = ENV('sf_proxy_account_prefix') || 'sf';
 const PROXY_API_URL = ENV('sf_proxy_api_url') || ENV('script_proxy_api_url');
 // sf_proxy_mode=api：优先用提取 API（可用静态代理引导）；默认静态代理优先
 const PROXY_MODE_API = ENV('sf_proxy_mode') === 'api';
@@ -258,6 +263,29 @@ function agentFor(proxyUrl, secure) {
   return agentCache.get(key);
 }
 
+/* ---------- 粘性出口（树脂 Account） ---------- */
+
+/** 从代理 URL 里取平台名（用户名 "Default.xxx" 里的 Default），留空则用 Default */
+function stickyPlatform(proxyUrl) {
+  try {
+    const u = new URL(proxyUrl);
+    const user = decodeURIComponent(u.username || '');
+    if (!user) return 'Default';
+    const dot = user.indexOf('.');
+    return (dot >= 0 ? user.slice(0, dot) : user).trim() || 'Default';
+  } catch (_) {
+    return 'Default';
+  }
+}
+
+/** 生成「某账号（某轮）」的粘性代理 URL，round>0 表示换过出口 */
+function stickyUrl(proxyUrl, ref, round) {
+  const u = new URL(proxyUrl);
+  const safe = String(ref).replace(/[^0-9a-zA-Z_-]/g, '_').slice(-24) || 'acct';
+  u.username = `${stickyPlatform(proxyUrl)}.${STICKY_PREFIX}_${safe}${round > 0 ? `r${round}` : ''}`;
+  return u.toString();
+}
+
 /** 极简 HTTP 请求（返回文本），用于访问代理提取 API；agent 可选 */
 function plainGet(url, timeout = 10000, agent) {
   return new Promise((resolve) => {
@@ -279,13 +307,50 @@ function plainGet(url, timeout = 10000, agent) {
 
 /** 代理池：默认静态代理优先；sf_proxy_mode=api 则用提取 API（可用静态代理引导） */
 class ProxyPool {
-  constructor() {
+  constructor(opts = {}) {
     this.useApi = PROXY_MODE_API || !STATIC_PROXY;
     this.current = this.useApi ? '' : STATIC_PROXY;
+    // 粘性出口：每个账号（stickyRef）一个固定出口，失败轮换
+    this.stickyRef = opts.stickyRef || '';
+    this.stickyRound = 0;
+    this.stickyFails = 0;
+    if (STICKY && STATIC_PROXY && this.stickyRef) {
+      this.current = stickyUrl(STATIC_PROXY, this.stickyRef, 0);
+    }
+  }
+
+  /** 给某个账号返回「专属出口」的池（未开粘性时就是共享池） */
+  forAccount(account, index) {
+    if (!STICKY || !STATIC_PROXY || this.useApi) return this;
+    const ref = account.openid || account.raw || `acct${index + 1}`;
+    const pool = new ProxyPool({ stickyRef: ref });
+    LOG(`🔌 [${index + 1}] 粘性出口：${ProxyPool.display(pool.current)}`);
+    return pool;
+  }
+
+  /** 换一个出口（同一账号的下一轮 Account） */
+  rotate(reason) {
+    if (!STICKY || !STATIC_PROXY || !this.stickyRef || this.useApi) return;
+    if (this.stickyRound >= 6) return;
+    this.stickyRound += 1;
+    this.stickyFails = 0;
+    this.current = stickyUrl(STATIC_PROXY, this.stickyRef, this.stickyRound);
+    LOG(`🔁 连续失败，切换出口 → ${ProxyPool.display(this.current)}${reason ? `（${reason}）` : ''}`);
+  }
+
+  /** 出口失败计数：同一个出口连续失败 2 次就换（换太快会白白浪费轮次） */
+  noteFailure(reason) {
+    if (!STICKY || this.useApi) return;
+    this.stickyFails += 1;
+    if (this.stickyFails >= 2) this.rotate(reason);
+    else VLOG(`   出口失败 ${this.stickyFails} 次，再失败一次就换出口`);
   }
 
   async refresh(reason) {
-    if (!this.useApi) return this.current;
+    if (!this.useApi) {
+      this.noteFailure(reason);
+      return this.current;
+    }
     if (!PROXY_API_URL) return '';
     // 提取 API 本身多半也在国内（品赞 service.ipzan.com 就是），海外机器直连不通，
     // 所以直连失败后再经静态代理试一次 —— 用树脂引导品赞。
@@ -1188,7 +1253,17 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
   SUMMARY.push(row);
 
   LOG(`\n${prefix} 开始处理（${mask(account.openid || account.raw)}）`);
-  const login = await sfLogin(account, proxyPool);
+
+  // 每个账号一个粘性出口（未开 sf_proxy_sticky 时就是原来的共享池）
+  const accountPool = proxyPool.forAccount(account, index);
+  let login = await sfLogin(account, accountPool);
+  // 登录被目标重置（TLS 断连 / 出口被 WAF 拉黑）时，换个出口重试——这是最常见的失败原因
+  for (let attempt = 0; !login.ok && STICKY && attempt < 2; attempt++) {
+    accountPool.rotate('登录失败');
+    LOG(`${prefix} 🔄 换出口重试登录（第 ${attempt + 1} 次）`);
+    await sleep(1200);
+    login = await sfLogin(account, accountPool);
+  }
   if (!login.ok) {
     LOG(`${prefix} ❌ 登录失败：${login.error}`);
     row.name = row.name || mask(account.openid || account.raw);
@@ -1201,7 +1276,7 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
   account._uid = task.jar.get('_login_user_id_') || '';
   LOG(`${prefix} ✅ 登录成功（${login.via === 'gateway' ? '应用宝网关' : '直接 Cookie'}）➔ ${mask(task.jar.get('_login_mobile_'))}`);
 
-  const sfPost = sfClient(task, proxyPool);
+  const sfPost = sfClient(task, accountPool);
   const daily = new DailyTask(task, sfPost);
 
   try {
