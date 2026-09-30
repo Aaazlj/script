@@ -154,8 +154,8 @@ const PROXY_PARTS = (() => {
   }
 })();
 
-/** 按账号 ref 生成粘性用户名；未开启时返回原用户名 */
-function stickyProxyUser(ref) {
+/** 按账号 ref 生成粘性用户名；未开启时返回原用户名。round>0 用于"坏节点换出口" */
+function stickyProxyUser(ref, round) {
   const base = PROXY_PARTS ? PROXY_PARTS.username : "";
   if (!PROXY_STICKY) return base;
   let platform = "Default";
@@ -163,7 +163,8 @@ function stickyProxyUser(ref) {
     const dot = base.indexOf(".");
     platform = (dot >= 0 ? base.slice(0, dot) : base).trim() || "Default";
   }
-  const account = (STICKY_PREFIX + "_" + String(ref).replace(/[^0-9a-zA-Z_-]/g, "_")).slice(0, 60);
+  const safeRef = String(ref).replace(/[^0-9a-zA-Z_-]/g, "_");
+  const account = (STICKY_PREFIX + "_" + safeRef + (round > 0 ? "r" + round : "")).slice(0, 60);
   return platform + "." + account;
 }
 
@@ -556,10 +557,11 @@ class BaseRequest {
               errorInfo += ")";
             }
             this.log("⏳ [" + functionName + "]请求超时" + errorInfo + "(" + duration + "ms)，重试第" + retryCount + "次");
+            this._rotateStickyProxy(retryCount);
           } else if (REQUEST_ERROR_TYPES.includes(error?.name)) {
             this.log("⚠️ [" + functionName + "]请求错误(" + error.code + ")(" + duration + "ms)，重试第" + retryCount + "次");
-          } else {
-            if (statusCode) {
+            this._rotateStickyProxy(retryCount);
+          } else {            if (statusCode) {
               if (error && !validStatusCodes.includes(statusCode)) {
                 this.log("⚠️ 请求[" + functionName + "]返回[" + statusCode + "]");
               }
@@ -816,6 +818,21 @@ class PupuUser extends BaseRequest {
     this.extendGot({
       headers: { "User-Agent": USER_AGENT }
     });
+  }
+
+  /**
+   * 连不上时给这个账号换一个粘性出口。
+   * 粘性出口平时很稳（实测成功率高、快 2~3 倍），但万一绑到的节点是坏的，
+   * 所有重试都会卡在同一个坏节点上——所以连续失败 2 次就轮换到新出口。
+   */
+  _rotateStickyProxy(retryCount) {
+    if (!PROXY_STICKY || !PROXY_PARTS || !this.proxyRef) return;
+    if (retryCount < 2) return;
+    const round = (this._proxyRound || 0) + 1;
+    if (round > 6) return;                 // 轮换 6 次还不行，就认命（避免无限换）
+    this._proxyRound = round;
+    this.proxyUser = stickyProxyUser(this.proxyRef, round);
+    this.log("🔁 连续失败，切换出口 → " + this.proxyUser);
   }
 
   // 登录（直接走网关 silent_login）
@@ -1308,7 +1325,8 @@ async function loadAccounts() {
     seen.add(key);
     let user = new PupuUser("", e.ref, e.wxServerUrl, e.remark);
     // 每账号一个粘性出口（未开启 sticky 时就是原用户名，不影响其它代理）
-    user.proxyUser = stickyProxyUser(e.ref);
+    user.proxyRef = e.ref;
+    user.proxyUser = stickyProxyUser(e.ref, 0);
     CommonUtils.userList.push(user);
   }
 
