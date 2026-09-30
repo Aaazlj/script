@@ -146,6 +146,47 @@ const splitAccounts = (raw) => String(raw || '')
   .replace(/，/g, ',').replace(/,/g, '&').replace(/\r?\n/g, '&')
   .split('&').map((s) => s.trim()).filter(Boolean);
 
+/* ---------- 表格对齐（中文/全角算两格） ---------- */
+
+const dispWidth = (s) => String(s == null ? '' : s)
+  .split('')
+  .reduce((w, ch) => w + (/[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2 : 1), 0);
+const padRight = (s, w) => String(s) + ' '.repeat(Math.max(0, w - dispWidth(s)));
+const padLeft = (s, w) => ' '.repeat(Math.max(0, w - dispWidth(s))) + String(s);
+
+/** 每个账号的积分变动记录，跑完在末尾统一打印 */
+const SUMMARY = [];
+
+/** 打印「所有账号积分变动汇总」 */
+function printPointsSummary(rows) {
+  if (!rows.length) return;
+  const nameW = Math.max(8, ...rows.map((r) => dispWidth(`${r.index}. ${r.name}`)));
+
+  LOG('\n================ 积分变动汇总 ================');
+  LOG(padRight('账号', nameW + 2) + padLeft('积分前', 8) + padLeft('积分后', 8) + padLeft('变动', 7) + '   备注');
+
+  let gained = 0;
+  let counted = 0;
+  for (const r of rows) {
+    const delta = (r.before != null && r.after != null) ? r.after - r.before : null;
+    if (delta != null) {
+      gained += delta;
+      counted++;
+    }
+    LOG(
+      padRight(`${r.index}. ${r.name}`, nameW + 2)
+      + padLeft(r.before != null ? r.before : '-', 8)
+      + padLeft(r.after != null ? r.after : '-', 8)
+      + padLeft(delta != null ? (delta > 0 ? `+${delta}` : String(delta)) : '-', 7)
+      + (r.note ? `   ${r.note}` : '')
+    );
+  }
+
+  const okCount = rows.filter((r) => r.ok).length;
+  LOG(`合计：${gained >= 0 ? '+' : ''}${gained} 积分（${okCount} 个账号正常 / 共 ${rows.length} 个；${counted} 个账号有积分数据）`);
+  LOG('==============================================');
+}
+
 /** 顺丰业务签名：signature = md5(token&timestamp&sysCode) */
 function signHeaders() {
   const timestamp = String(Date.now());
@@ -722,6 +763,8 @@ class DailyTask {
   async run() {
     this.task.log('🎯 开始执行日常积分任务');
     await this.refreshPoints();
+    // 给末尾的「积分变动汇总」留基线
+    this.task.pointsBefore = this.points || 0;
     this.task.log(`💰 当前积分：【${this.points || 0}】`);
 
     await this.signIn();
@@ -734,6 +777,7 @@ class DailyTask {
     if (!tasks.length) {
       this.task.log('⚠️ 任务列表为空');
       await this.refreshPoints();
+      this.task.pointsAfter = this.points || 0;
       this.task.log(`💰 执行后积分：【${this.points || 0}】（${(this.points || 0) - before >= 0 ? '+' : ''}${(this.points || 0) - before}）`);
       return;
     }
@@ -792,6 +836,8 @@ class DailyTask {
 
     await this.refreshPoints();
     const after = this.points || 0;
+    this.task.pointsAfter = after;
+    this.task.dailyStat = { done: this.stat.done, rewarded: this.stat.rewarded, welfare: this.stat.welfare };
     this.task.log(`🎯 日常任务：提交 ${this.stat.done} / 领奖 ${this.stat.rewarded} / 生活特权 ${this.stat.welfare}`);
     this.task.log(`💰 执行后积分：【${after}】（${after - before >= 0 ? '+' : ''}${after - before}）`);
   }
@@ -1131,22 +1177,35 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
     jar: new CookieJar(),
     log: (m) => LOG(`${prefix} ${m}`),
   };
+  const row = {
+    index: index + 1,
+    name: account.remark || '',
+    before: null,
+    after: null,
+    ok: false,
+    note: '',
+  };
+  SUMMARY.push(row);
 
   LOG(`\n${prefix} 开始处理（${mask(account.openid || account.raw)}）`);
   const login = await sfLogin(account, proxyPool);
   if (!login.ok) {
     LOG(`${prefix} ❌ 登录失败：${login.error}`);
+    row.name = row.name || mask(account.openid || account.raw);
+    row.note = `登录失败：${crop(login.error, 40)}`;
     return false;
   }
   task.jar = login.jar;
+  row.name = row.name || mask(task.jar.get('_login_mobile_')) || mask(account.openid || account.raw);
   // 记下本账号的 _login_user_id_，供下一个账号做"邀请访问"互刷
   account._uid = task.jar.get('_login_user_id_') || '';
   LOG(`${prefix} ✅ 登录成功（${login.via === 'gateway' ? '应用宝网关' : '直接 Cookie'}）➔ ${mask(task.jar.get('_login_mobile_'))}`);
 
   const sfPost = sfClient(task, proxyPool);
+  const daily = new DailyTask(task, sfPost);
 
   try {
-    await new DailyTask(task, sfPost).run();
+    await daily.run();
   } catch (e) {
     LOG(`${prefix} ❌ 日常任务异常：${e.message}`);
   }
@@ -1172,6 +1231,21 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
       const now = Date.now();
       task.log(`⏭️ 中秋活动不在时间窗内（2026-09-11 10:00 ~ 2026-10-08 19:00，${now < AUTUMN_START ? '未开始' : '已结束'}），跳过`);
     }
+  }
+
+  // 所有子任务跑完后再刷一次积分，作为汇总里的最终值
+  // （会员日 / 红包 / 中秋这些也可能加积分，不能只看日常任务那一次）
+  try {
+    await daily.refreshPoints();
+  } catch (e) { VLOG(`   汇总前刷新积分失败：${e.message}`); }
+
+  row.before = task.pointsBefore != null ? task.pointsBefore : null;
+  row.after = daily.points != null ? daily.points : (task.pointsAfter != null ? task.pointsAfter : null);
+  row.ok = true;
+  if (row.before == null || row.after == null) {
+    row.note = '积分读取失败';
+  } else if (daily.stat) {
+    row.note = `任务提交 ${daily.stat.done} / 领奖 ${daily.stat.rewarded}`;
   }
   return true;
 }
@@ -1295,6 +1369,10 @@ async function main() {
   }
 
   LOG(`\n======🎉 完成 ${ok} / 共 ${accounts.length} 账号======`);
+
+  // 所有账号跑完后，统一输出一次积分变动汇总
+  printPointsSummary(SUMMARY);
+
   $.done();
 }
 
