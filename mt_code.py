@@ -37,7 +37,15 @@ Cron: 5 9,12,20 * * *
    - 美团域名（open.meituan.com / media.meituan.com）走腾讯国际节点，
      海外机器直连可用，一般不需要配代理
 
-4. 青龙任务建议：
+4. 签名服务（必需）：
+   media.meituan.com 的领券接口强制校验 mtgsig 签名（缺了直接 403），
+   脚本调用扫码面板暴露的签名接口加签：
+   mt_sign_url                                     默认 http://panel:5180/api/meituan/sign
+   - 面板容器里挂着美团专家包的 vendor/cliguard，负责生成签名
+   - 与网关一样只在容器网络内可达、始终直连，不需要配代理
+   - 面板没运行时脚本会告警并退回裸请求（必然 403）
+
+5. 青龙任务建议：
    文件顶部的 new Env / cron 声明会被青龙拉库时自动识别为任务名与定时：
    名称：美团小程序领券
    命令：task mt_code.py
@@ -108,6 +116,15 @@ PROXY_TYPE = (os.getenv("mt_proxy_type", "") or "http").strip().lower()
 PROXY_VALIDATE = (os.getenv("mt_proxy_validate", "") or "1").strip().lower() not in (
     "0", "false", "no", "off",
 )
+
+# mtgsig 签名服务：media.meituan.com 从 2026-09 起强制校验 mtgsig，
+# 没有签名一律 403（openresty）。签名算法在美团混淆 JS（cliguard）里，
+# 这里借用扫码面板（panel）暴露的签名接口，与网关一样只走容器网络、始终直连。
+SIGN_URL = (
+    os.getenv("mt_sign_url", "")
+    or os.getenv("MT_SIGN_URL", "")
+    or "http://panel:5180/api/meituan/sign"
+).strip().rstrip("/")
 
 PROXY_RETRY_TIMES = 3
 PROXY_VALIDATE_URL = "https://www.baidu.com"
@@ -587,6 +604,38 @@ def wall_headers(
     return headers
 
 
+def sign_request(method: str, url: str, body: bytes | None = None) -> Tuple[str, Dict[str, str]]:
+    """调 panel 的 /api/meituan/sign 生成 mtgsig 签名头。
+
+    签名算法在美团混淆 JS（cliguard）里，Python 复刻不了；
+    扫码面板容器里挂着美团专家包，自带 vendor/cliguard。
+    返回 (签名后的 URL, 签名头字典)；签名服务不可用时原样返回，靠后面的重试兜底。
+    """
+    if not SIGN_URL:
+        return url, {}
+
+    body_hash = hashlib.md5(body[:16200]).hexdigest() if body else ""
+    try:
+        response = direct_session().post(
+            f"{SIGN_URL}",
+            json={"method": method, "url": url, "bodyHash": body_hash},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            print(f"⚠️ [签名] 签名服务返回错误: {data.get('error') or json_preview(data, 200)}")
+            return url, {}
+        inner = data.get("data") or {}
+        return inner.get("url") or url, inner.get("headers") or {}
+    except Exception as exc:
+        print(
+            f"⚠️ [签名] 签名服务不可用（{SIGN_URL}）: {exc}\n"
+            f"   未加签的 media 请求会被美团 403，请确认扫码面板容器在运行"
+        )
+        return url, {}
+
+
 def wall_post(
     server: str,
     path: str,
@@ -598,6 +647,7 @@ def wall_post(
     user_id: int,
     raw_body: str,
 ) -> Dict[str, Any]:
+    body = raw_body.encode("utf-8")
     url = f"{MEDIA_BASE_URL}{path}?{WEB_QUERY}"
     headers = wall_headers(
         token=token,
@@ -605,11 +655,17 @@ def wall_post(
         open_id_cipher=open_id_cipher,
         user_id=user_id,
     )
+
+    # media.meituan.com 强制校验 mtgsig 签名，缺了直接 403 openresty
+    signed_url, sig_headers = sign_request("POST", url, body)
+    if sig_headers:
+        headers.update(sig_headers)
+
     response = request_with_proxy(
         "POST",
-        url,
+        signed_url,
         headers=headers,
-        data=raw_body.encode("utf-8"),
+        data=body,
         proxies=proxies,
         server=server,
     )
