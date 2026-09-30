@@ -128,6 +128,8 @@ const STATIC_PROXY = ENV('sf_proxy') || ENV('script_proxy');
 // 绑到坏节点时由 ProxyPool 自动换出口（见 noteFailure）。
 const STICKY = /^(1|true|yes|on|account)$/i.test(ENV('sf_proxy_sticky'));
 const STICKY_PREFIX = ENV('sf_proxy_account_prefix') || 'sf';
+// 单个账号的处理上限（秒→毫秒），超过就跳过该账号，避免整个脚本挂死
+const ACCOUNT_TIMEOUT = Math.max(30, Number(ENV('sf_account_timeout')) || 240) * 1000;
 const PROXY_API_URL = ENV('sf_proxy_api_url') || ENV('script_proxy_api_url');
 // sf_proxy_mode=api：优先用提取 API（可用静态代理引导）；默认静态代理优先
 const PROXY_MODE_API = ENV('sf_proxy_mode') === 'api';
@@ -161,14 +163,15 @@ const padLeft = (s, w) => ' '.repeat(Math.max(0, w - dispWidth(s))) + String(s);
 
 /** 每个账号的积分变动记录，跑完在末尾统一打印 */
 const SUMMARY = [];
+let summaryPrinted = false;
 
 /** 打印「所有账号积分变动汇总」 */
-function printPointsSummary(rows) {
+function printPointsSummary(rows, write = LOG) {
   if (!rows.length) return;
   const nameW = Math.max(8, ...rows.map((r) => dispWidth(`${r.index}. ${r.name}`)));
 
-  LOG('\n================ 积分变动汇总 ================');
-  LOG(padRight('账号', nameW + 2) + padLeft('积分前', 8) + padLeft('积分后', 8) + padLeft('变动', 7) + '   备注');
+  write('\n================ 积分变动汇总 ================');
+  write(padRight('账号', nameW + 2) + padLeft('积分前', 8) + padLeft('积分后', 8) + padLeft('变动', 7) + '   备注');
 
   let gained = 0;
   let counted = 0;
@@ -178,7 +181,7 @@ function printPointsSummary(rows) {
       gained += delta;
       counted++;
     }
-    LOG(
+    write(
       padRight(`${r.index}. ${r.name}`, nameW + 2)
       + padLeft(r.before != null ? r.before : '-', 8)
       + padLeft(r.after != null ? r.after : '-', 8)
@@ -188,8 +191,17 @@ function printPointsSummary(rows) {
   }
 
   const okCount = rows.filter((r) => r.ok).length;
-  LOG(`合计：${gained >= 0 ? '+' : ''}${gained} 积分（${okCount} 个账号正常 / 共 ${rows.length} 个；${counted} 个账号有积分数据）`);
-  LOG('==============================================');
+  write(`合计：${gained >= 0 ? '+' : ''}${gained} 积分（${okCount} 个账号正常 / 共 ${rows.length} 个；${counted} 个账号有积分数据）`);
+  write('==============================================');
+}
+
+/** 只打印一次汇总（正常结束 / 事件循环被抽空的兜底都走这里） */
+function printPointsSummaryOnce(preface, write) {
+  if (summaryPrinted || !SUMMARY.length) return;
+  summaryPrinted = true;
+  if (preface && write) write(preface);
+  else if (preface) LOG(preface);
+  printPointsSummary(SUMMARY, write);
 }
 
 /** 顺丰业务签名：signature = md5(token&timestamp&sysCode) */
@@ -319,12 +331,19 @@ class ProxyPool {
     }
   }
 
+  /** 出口的可读名字（树脂 Account 名，不含 token） */
+  get stickyName() {
+    if (!STICKY || !STATIC_PROXY || !this.stickyRef) return '';
+    const u = new URL(stickyUrl(STATIC_PROXY, this.stickyRef, this.stickyRound));
+    return `${decodeURIComponent(u.username)}`;
+  }
+
   /** 给某个账号返回「专属出口」的池（未开粘性时就是共享池） */
   forAccount(account, index) {
     if (!STICKY || !STATIC_PROXY || this.useApi) return this;
     const ref = account.openid || account.raw || `acct${index + 1}`;
     const pool = new ProxyPool({ stickyRef: ref });
-    LOG(`🔌 [${index + 1}] 粘性出口：${ProxyPool.display(pool.current)}`);
+    LOG(`🔌 [${index + 1}] 粘性出口：${pool.stickyName}`);
     return pool;
   }
 
@@ -335,7 +354,7 @@ class ProxyPool {
     this.stickyRound += 1;
     this.stickyFails = 0;
     this.current = stickyUrl(STATIC_PROXY, this.stickyRef, this.stickyRound);
-    LOG(`🔁 连续失败，切换出口 → ${ProxyPool.display(this.current)}${reason ? `（${reason}）` : ''}`);
+    LOG(`🔁 换出口 → ${this.stickyName}${reason ? `（${reason}）` : ''}`);
   }
 
   /** 出口失败计数：同一个出口连续失败 2 次就换（换太快会白白浪费轮次） */
@@ -1436,9 +1455,29 @@ async function main() {
       if (prev !== accounts[i]) inviterId = prev._uid || '';
     }
     try {
-      if (await runAccount(accounts[i], i, accounts.length, proxyPool, inviterId)) ok++;
+      // 单个账号设上限：偶发「请求 promise 永不 settle」会把整个脚本挂到事件循环清空，
+      // 表现为日志戛然而止、连汇总都没有。加超时后至少能继续跑后面的账号。
+      let timer = null;
+      const timeout = new Promise((r) => {
+        timer = setTimeout(() => r('__timeout__'), ACCOUNT_TIMEOUT);
+        if (timer.unref) timer.unref();
+      });
+      const result = await Promise.race([
+        runAccount(accounts[i], i, accounts.length, proxyPool, inviterId),
+        timeout,
+      ]);
+      if (timer) clearTimeout(timer);
+      if (result === '__timeout__') {
+        LOG(`[${i + 1}/${accounts.length}] ⏱️ 处理超时（>${Math.round(ACCOUNT_TIMEOUT / 1000)}s），跳过该账号`);
+        const row = SUMMARY[SUMMARY.length - 1];
+        if (row && row.index === i + 1 && !row.ok) row.note = row.note || '处理超时';
+      } else if (result) {
+        ok++;
+      }
     } catch (e) {
       LOG(`[${i + 1}/${accounts.length}] ❌ 异常：${e.message}`);
+      const row = SUMMARY[SUMMARY.length - 1];
+      if (row && row.index === i + 1 && !row.ok) row.note = row.note || `异常：${crop(e.message, 40)}`;
     }
     if (i < accounts.length - 1) await sleep(1500);
   }
@@ -1446,7 +1485,7 @@ async function main() {
   LOG(`\n======🎉 完成 ${ok} / 共 ${accounts.length} 账号======`);
 
   // 所有账号跑完后，统一输出一次积分变动汇总
-  printPointsSummary(SUMMARY);
+  printPointsSummaryOnce();
 
   $.done();
 }
@@ -1463,9 +1502,22 @@ module.exports = {
   AUTUMN_START,
   AUTUMN_END,
   autumnInWindow,
+  SUMMARY,
+  printPointsSummary,
+  printPointsSummaryOnce,
+  stickyUrl,
 };
 
 if (require.main === module) {
+  // 兜底：某个请求的 promise 若不 settle，await 会把事件循环抽空，
+  // Node 会以退出码 0 静默结束（日志戛然而止、连汇总都没有）。
+  // beforeExit 正是这个时机——同步把已有账号的汇总写出去。
+  process.on('beforeExit', () => {
+    if (summaryPrinted || !SUMMARY.length) return;
+    const syncWrite = (m) => { try { require('fs').writeSync(1, `${m}\n`); } catch (_) { /* 忽略 */ } };
+    printPointsSummaryOnce('\n⚠️ 任务提前结束（有请求一直未返回），以下是已完成账号的汇总：', syncWrite);
+  });
+
   main()
     .catch((e) => LOG(`脚本异常：${e && e.message ? e.message : e}`))
     // 显式退出：代理 Agent/长连接句柄会吊住事件循环，否则青龙里任务永远不结束
