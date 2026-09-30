@@ -22,6 +22,7 @@ const qinglong = require('./lib/qinglong');
 const yyb = require('./lib/yyb');
 const meituan = require('./lib/meituan');
 const upload = require('./lib/upload');
+const sign = require('./lib/sign');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_QR_SESSIONS = 200;
@@ -168,6 +169,25 @@ route('GET', '/api/meituan/status', async (req, res, url) => {
   sess.upload = up;
   sessions.delete(sid);
   httpx.ok(res, { status: 'done', upload: up });
+});
+
+/* 美团签名服务（供青龙里的 mt_code.py 调用，只需容器网络可达） */
+
+route('GET', '/api/meituan/sign/health', async (req, res) => {
+  httpx.ok(res, { available: sign.available() });
+});
+
+route('POST', '/api/meituan/sign', async (req, res) => {
+  const ip = httpx.clientIP(req);
+  if (sign.tooMany(ip)) return httpx.fail(res, 429, '签名请求过于频繁，请稍后再试');
+
+  const body = await httpx.readJSON(req);
+  const url = String(body.url || '');
+  if (!/^https?:\/\//i.test(url)) return httpx.fail(res, 400, '缺少合法的 url');
+
+  const out = sign.sign(body.method, url, String(body.bodyHash || ''));
+  if (!out.ok) return httpx.fail(res, 500, out.error);
+  httpx.ok(res, { url: out.url, headers: out.headers });
 });
 
 /* 应用宝账号管理（管理后台，需登录） */
