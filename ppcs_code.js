@@ -902,6 +902,12 @@ class PupuUser extends BaseRequest {
         this.invite_code = invite_code;
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，直接跳过这一步
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.log("⏭️ 查询用户信息失败 无权限或未报名该活动（403），跳过");
+          return;
+        }
         this.log("❌ 查询用户信息失败[" + errorCode + "]: " + errorMessage);
       }
     } catch (exception) {
@@ -943,6 +949,12 @@ class PupuUser extends BaseRequest {
         });
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，直接跳过这一步
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.log("⏭️ 选取随机地点失败 无权限或未报名该活动（403），跳过");
+          return;
+        }
         this.log("❌ 选取随机地点失败[" + errorCode + "]: " + errorMessage);
       }
     } catch (exception) {
@@ -972,6 +984,12 @@ class PupuUser extends BaseRequest {
         }
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，直接跳过这一步
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.log("⏭️ 查询签到信息失败 无权限或未报名该活动（403），跳过");
+          return;
+        }
         this.log("📅 [每日签到] 查询签到信息失败[" + errorCode + "]: " + errorMessage);
       }
     } catch (exception) {
@@ -1007,6 +1025,12 @@ class PupuUser extends BaseRequest {
         this.log("📅 [每日签到] 签到成功: " + rewards.join(", "));
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，直接跳过这一步
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.log("⏭️ 签到失败 无权限或未报名该活动（403），跳过");
+          return;
+        }
         this.log("📅 [每日签到] 签到失败[" + errorCode + "]: " + errorMessage);
       }
     } catch (exception) {
@@ -1040,6 +1064,12 @@ class PupuUser extends BaseRequest {
         await this.check_my_team();
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，直接跳过这一步
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.log("⏭️ 获取组队码失败 无权限或未报名该活动（403），跳过");
+          return;
+        }
         this.log("🤝 [组队状态] 获取组队码失败[" + errorCode + "]: " + errorMessage);
       }
     } catch (exception) {
@@ -1078,6 +1108,12 @@ class PupuUser extends BaseRequest {
         }
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，直接跳过这一步
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.log("⏭️ [组队状态] 无权限或未报名该活动（403），跳过");
+          return;
+        }
         this.log("🤝 [组队状态] 查询组队信息失败[" + errorCode + "]: " + errorMessage);
       }
     } catch (exception) {
@@ -1116,6 +1152,14 @@ class PupuUser extends BaseRequest {
         }
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，
+        // 直接把该账号标记为「无法助力」并跳过，免得在其它队伍上一个个再撞一遍
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.team_can_help = false;
+          this.log("⏭️ [组队助力] 无权限或未报名该活动（403 " + (errorMessage || "签名非法") + "），跳过该账号助力");
+          return;
+        }
 
         let userCountLength = CommonUtils.userCount.toString().length;
         let targetPrefix = "账号[" + CommonUtils.padStr(targetUser.index + 1, userCountLength) + "]";
@@ -1167,6 +1211,12 @@ class PupuUser extends BaseRequest {
         }
       } else {
         let errorMessage = CommonUtils.get(result, "errmsg", "");
+
+        // 403（签名非法 / 未报名该活动等业务拒绝）：重试没有意义，直接跳过这一步
+        if (Number(errorCode) === 403 || Number(statusCode) === 403) {
+          this.log("⏭️ 查询朴分失败 无权限或未报名该活动（403），跳过");
+          return;
+        }
         this.log("❌ 查询朴分失败[" + errorCode + "]: " + errorMessage);
       }
     } catch (exception) {
