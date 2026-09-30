@@ -234,6 +234,36 @@ route('GET', '/api/yyb/avatar', async (req, res, url) => {
   httpx.pipeThrough(target, res);
 }, { admin: true });
 
+/* 账号导出：?ref= 指定单个，不带 ref 导出全部。返回 JSON 文件下载 */
+route('GET', '/api/yyb/accounts/export', async (req, res, url) => {
+  const ref = url.searchParams.get('ref') || '';
+  const cfg = config.load();
+  const out = await yyb.listAccounts(cfg.yyb);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+
+  let accounts = out.accounts;
+  if (ref) {
+    accounts = accounts.filter((a) => String(a.ref) === ref || String(a.openid) === ref);
+    if (!accounts.length) return httpx.fail(res, 404, '未找到该账号：' + ref);
+  }
+
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    gateway: cfg.yyb.baseUrl || '',
+    count: accounts.length,
+    accounts,
+  };
+  const stamp = new Date().toISOString().slice(0, 10);
+  const filename = ref ? `yyb-account-${ref}-${stamp}.json` : `yyb-accounts-${stamp}.json`;
+  const body = JSON.stringify(payload, null, 2);
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}, { admin: true });
+
 /* 管理后台 */
 
 route('GET', '/api/admin/health', async (req, res) => {
