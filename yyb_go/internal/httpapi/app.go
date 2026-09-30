@@ -455,9 +455,24 @@ func (a *App) handleAccountsOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "缺少 refs")
 		return
 	}
+	// 全是空字符串也当没传
+	nonEmpty := 0
+	for _, r := range refs {
+		if strings.TrimSpace(r) != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty == 0 {
+		writeError(w, http.StatusBadRequest, "refs 不能全为空")
+		return
+	}
 	ordered, err := a.db.SetAccountOrder(r.Context(), refs)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ordered == 0 {
+		writeError(w, http.StatusBadRequest, "refs 里没有匹配到任何账号（支持 ID / UIN / openid）")
 		return
 	}
 	out := a.writeAccountList(r.Context(), map[string]any{"ordered": ordered})
