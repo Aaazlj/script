@@ -126,6 +126,9 @@ func (a *App) Handler() http.Handler {
 	router.Any("/qr", gin.WrapF(a.handleQRRoot))
 	router.Any("/qr/*path", gin.WrapF(a.handleQR))
 	router.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
+	router.Any("/accounts/export", gin.WrapF(a.handleAccountsExport))
+	router.Any("/accounts/import", gin.WrapF(a.handleAccountsImport))
+	router.Any("/accounts/order", gin.WrapF(a.handleAccountsOrder))
 	router.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
 	router.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
 	router.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
@@ -319,6 +322,188 @@ func (a *App) handleAccountsRoot(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+/* ---------------- 导出 / 导入 / 排序 ---------------- */
+
+// writeAccountList 把当前账号列表（公共视图）写给调用方，导入/排序后方便一次刷新
+func (a *App) writeAccountList(ctx context.Context, extra map[string]any) map[string]any {
+	accounts, err := a.db.ListAccounts(ctx)
+	if err != nil {
+		return extra
+	}
+	out := make([]store.AccountPublic, 0, len(accounts))
+	for _, acc := range accounts {
+		out = append(out, acc.Public())
+	}
+	extra["accounts"] = out
+	return extra
+}
+
+// GET /accounts/export[?ref=] —— 导出账号（含 login_buffer / credentials / user_info），
+// 返回纯数组，字段与其它工具（taobao-tool 等）的 yyb 账号文件一致，便于互导。
+func (a *App) handleAccountsExport(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/accounts/export" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	accounts, err := a.db.ListAccounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ref := strings.TrimSpace(r.URL.Query().Get("ref"))
+	out := make([]store.ExportAccount, 0, len(accounts))
+	for _, acc := range accounts {
+		if !acc.MatchesRef(ref) {
+			continue
+		}
+		out = append(out, acc.Export())
+	}
+	if ref != "" && len(out) == 0 {
+		writeError(w, http.StatusNotFound, "未找到账号: "+ref)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// POST /accounts/import —— 导入账号。接受纯数组、{"accounts":[...]} 或单个对象；
+// 按 openid upsert（已存在则更新登录态，缺字段保留原值）。
+func (a *App) handleAccountsImport(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/accounts/import" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "读取请求体失败: "+err.Error())
+		return
+	}
+	items, err := decodeAccountPayload(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(items) == 0 {
+		writeError(w, http.StatusBadRequest, "没有可导入的账号")
+		return
+	}
+
+	created, updated := 0, 0
+	skipped := make([]map[string]any, 0)
+	for _, item := range items {
+		acc, err := store.NormalizeImport(item)
+		if err != nil {
+			skipped = append(skipped, map[string]any{
+				"openid": strings.TrimSpace(coerceStringAny(item["openid"])),
+				"reason": err.Error(),
+			})
+			continue
+		}
+		isNew, err := a.db.UpsertFullAccount(r.Context(), acc)
+		if err != nil {
+			skipped = append(skipped, map[string]any{"openid": acc.OpenID, "reason": err.Error()})
+			continue
+		}
+		if isNew {
+			created++
+		} else {
+			updated++
+		}
+	}
+
+	out := a.writeAccountList(r.Context(), map[string]any{
+		"created": created,
+		"updated": updated,
+		"skipped": skipped,
+	})
+	writeJSON(w, http.StatusOK, out)
+}
+
+// POST /accounts/order —— 按 {"refs":[...]}（或 {"order":[...]}）的顺序重排账号，
+// 脚本按 /accounts 返回顺序逐个取 code，所以顺序在这里定。
+func (a *App) handleAccountsOrder(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/accounts/order" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Refs  []string `json:"refs"`
+		Order []string `json:"order"`
+	}
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	refs := body.Refs
+	if len(refs) == 0 {
+		refs = body.Order
+	}
+	if len(refs) == 0 {
+		writeError(w, http.StatusBadRequest, "缺少 refs")
+		return
+	}
+	ordered, err := a.db.SetAccountOrder(r.Context(), refs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := a.writeAccountList(r.Context(), map[string]any{"ordered": ordered})
+	writeJSON(w, http.StatusOK, out)
+}
+
+// decodeAccountPayload 兼容三种入参：数组、{"accounts":[...]}、单个账号对象
+func decodeAccountPayload(raw []byte) ([]map[string]any, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil, errors.New("请求体为空")
+	}
+	switch trimmed[0] {
+	case '[':
+		var list []map[string]any
+		if err := json.Unmarshal(raw, &list); err != nil {
+			return nil, errors.New("账号列表不是合法 JSON 数组: " + err.Error())
+		}
+		return list, nil
+	case '{':
+		var obj map[string]any
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, errors.New("请求体不是合法 JSON: " + err.Error())
+		}
+		for _, key := range []string{"accounts", "data", "list", "items"} {
+			if arr, ok := obj[key].([]any); ok {
+				out := make([]map[string]any, 0, len(arr))
+				for _, v := range arr {
+					if m, ok := v.(map[string]any); ok {
+						out = append(out, m)
+					}
+				}
+				return out, nil
+			}
+		}
+		return []map[string]any{obj}, nil
+	default:
+		return nil, errors.New("请求体应为 JSON 数组或对象")
+	}
+}
+
+func coerceStringAny(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func (a *App) handleAccountAvatar(w http.ResponseWriter, r *http.Request) {

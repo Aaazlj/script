@@ -234,34 +234,56 @@ route('GET', '/api/yyb/avatar', async (req, res, url) => {
   httpx.pipeThrough(target, res);
 }, { admin: true });
 
-/* 账号导出：?ref= 指定单个，不带 ref 导出全部。返回 JSON 文件下载 */
+/* 账号导出 / 导入 / 排序（管理后台） */
+
 route('GET', '/api/yyb/accounts/export', async (req, res, url) => {
   const ref = url.searchParams.get('ref') || '';
   const cfg = config.load();
-  const out = await yyb.listAccounts(cfg.yyb);
-  if (!out.ok) return httpx.fail(res, 502, out.error);
+  const out = await yyb.exportAccounts(cfg.yyb, ref);
+  if (!out.ok) return httpx.fail(res, ref ? 404 : 502, out.error);
 
-  let accounts = out.accounts;
-  if (ref) {
-    accounts = accounts.filter((a) => String(a.ref) === ref || String(a.openid) === ref);
-    if (!accounts.length) return httpx.fail(res, 404, '未找到该账号：' + ref);
-  }
-
-  const payload = {
-    exportedAt: new Date().toISOString(),
-    gateway: cfg.yyb.baseUrl || '',
-    count: accounts.length,
-    accounts,
-  };
+  // 导出格式 = 纯数组，字段与其它工具的 yyb 账号文件一致，可直接互导
+  const body = JSON.stringify(out.accounts, null, 2);
   const stamp = new Date().toISOString().slice(0, 10);
   const filename = ref ? `yyb-account-${ref}-${stamp}.json` : `yyb-accounts-${stamp}.json`;
-  const body = JSON.stringify(payload, null, 2);
   res.writeHead(200, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Disposition': `attachment; filename="${filename}"`,
     'Cache-Control': 'no-store',
   });
   res.end(body);
+}, { admin: true });
+
+route('POST', '/api/yyb/accounts/import', async (req, res) => {
+  const body = await httpx.readJSON(req, 64 * 1024 * 1024);
+  const payload = Array.isArray(body) ? body : body.accounts;
+  if (!Array.isArray(payload) || !payload.length) {
+    return httpx.fail(res, 400, '请求体应为账号数组，或 {"accounts":[...]}');
+  }
+
+  const cfg = config.load();
+  const out = await yyb.importAccounts(cfg.yyb, payload);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  const result = out.result || {};
+  const list = await yyb.listAccounts(cfg.yyb);
+  httpx.ok(res, {
+    created: result.created || 0,
+    updated: result.updated || 0,
+    skipped: result.skipped || [],
+    accounts: list.ok ? list.accounts : [],
+  });
+}, { admin: true });
+
+route('POST', '/api/yyb/accounts/order', async (req, res) => {
+  const body = await httpx.readJSON(req);
+  const refs = Array.isArray(body.refs) ? body.refs.map((r) => String(r)) : [];
+  if (!refs.length) return httpx.fail(res, 400, '缺少 refs');
+
+  const cfg = config.load();
+  const out = await yyb.setAccountOrder(cfg.yyb, refs);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  const list = await yyb.listAccounts(cfg.yyb);
+  httpx.ok(res, { ordered: (out.result && out.result.ordered) || 0, accounts: list.ok ? list.accounts : [] });
 }, { admin: true });
 
 /* 管理后台 */

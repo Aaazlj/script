@@ -165,6 +165,51 @@ function avatarUrl(cfg, ref) {
   return `${b}/accounts/avatar?ref=${encodeURIComponent(ref)}`;
 }
 
+/* ---------------- 导出 / 导入 / 排序 ---------------- */
+
+/**
+ * 导出完整账号（含 login_buffer / credentials / user_info），
+ * 返回网关给的纯数组，字段与其它工具的 yyb 账号文件一致。
+ */
+async function exportAccounts(cfg, ref) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const suffix = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+  const res = await requestRaw(`${b}/accounts/export${suffix}`, { timeout: TIMEOUT });
+  if (res.status === 404) return { ok: false, error: '未找到该账号：' + ref };
+  const out = unwrap(res, '导出账号');
+  if (!out.ok) return out;
+  return { ok: true, accounts: Array.isArray(out.data) ? out.data : [] };
+}
+
+/** 导入账号（数组或 {accounts:[...]}），返回网关的统计与最新列表 */
+async function importAccounts(cfg, payload) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/accounts/import`, {
+    method: 'POST',
+    body: payload,
+    timeout: 120000,
+  });
+  const out = unwrap(res, '导入账号');
+  if (!out.ok) return out;
+  return { ok: true, result: out.data };
+}
+
+/** 按 refs 顺序重排账号（写入网关的 sort_order） */
+async function setAccountOrder(cfg, refs) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/accounts/order`, {
+    method: 'POST',
+    body: { refs },
+    timeout: 30000,
+  });
+  const out = unwrap(res, '保存账号顺序');
+  if (!out.ok) return out;
+  return { ok: true, result: out.data };
+}
+
 module.exports = {
   health,
   createQR,
@@ -175,4 +220,7 @@ module.exports = {
   resyncAccounts,
   deleteAccount,
   avatarUrl,
+  exportAccounts,
+  importAccounts,
+  setAccountOrder,
 };
