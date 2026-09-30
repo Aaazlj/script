@@ -66,12 +66,15 @@ const CommonUtils = createCommonUtils("朴朴超市");
 const PROJECT_NAME = "pupu";
 const REQUEST_TIMEOUT = 20000;
 const GATEWAY_TIMEOUT = 60000;   // getCode 首次调用会触发登录握手，超时给宽一点
-const MAX_RETRY_COUNT = 3;
+// resin 代理每次连接随机挑出口节点，坏节点比例不低（ECONNRESET / TLS 握手失败），
+// 每次重试会新建隧道=换一个出口，3 次经常不够，放到 6 次
+const MAX_RETRY_COUNT = 6;
 const SCRIPT_VERSION = 1.02;
 const SCRIPT_KEY = "pupu";
 const VERSION_CHECK_URL = "https://leafxcy.coding.net/api/user/leafxcy/project/validcode/shared-depot/validCode/git/blob/master/code.json";
 const USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_1_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.46(0x18002e2c) NetType/WIFI Language/zh_CN miniProgram/wx122ef876a7132eb4";
 const RETRY_WAIT_TIME = 2000;
+const RETRY_WAIT_MAX = 4000;   // 退避上限，别让 6 次重试把任务拖太久
 const MAX_VERSION_CHECK_RETRY = 5;
 
 // ==================== YYB-Go-Enhanced 网关登录常量 ====================
@@ -343,7 +346,7 @@ class BaseRequest {
       options.headers = Object.assign({}, this.defaultHeaders, options.headers || {});
       let last = { statusCode: -1, headers: null, result: null };
       for (let i = 0; i < MAX_RETRY_COUNT; i++) {
-        if (i > 0) await CommonUtils.wait(RETRY_WAIT_TIME * i);
+        if (i > 0) await CommonUtils.wait(Math.min(RETRY_WAIT_TIME * i, RETRY_WAIT_MAX));
         options.timeout = Number(options?.timeout?.request || options?.timeout || REQUEST_TIMEOUT);
         last = await nodeRequest(options);
         if (last.statusCode > 0) break;
@@ -392,7 +395,7 @@ class BaseRequest {
       // 重试逻辑
       while (retryCount < MAX_RETRY_COUNT) {
         if (retryCount > 0) {
-          await CommonUtils.wait(RETRY_WAIT_TIME * retryCount);
+          await CommonUtils.wait(Math.min(RETRY_WAIT_TIME * retryCount, RETRY_WAIT_MAX));
 
           let retryer = CommonUtils.get(options, "retryer", null);
           if (retryer) {
