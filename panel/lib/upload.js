@@ -1,7 +1,8 @@
 /**
  * 扫码成功后往青龙写环境变量
  *
- *   应用宝 → yyb_server（网关地址）
+ *   应用宝 → 不写任何东西：账号保存在网关里，脚本运行时自动发现；
+ *            yyb_server 由后台「配置/测试青龙连接」时兜底确保存在（见 ensureYybServerEnv）
  *   美团   → MT_TOKEN（多账号按行追加，已存在则跳过）
  */
 
@@ -23,7 +24,7 @@ function derivePublicBase(cfg, req) {
   if (!raw) return '';
   try {
     const u = new URL(raw);
-    if (LOOPBACK_HOSTS.has(u.hostname)) {
+    if (LOOPBACK_HOSTS.has(u.hostname) && req) {
       const reqHost = String((req && req.headers && req.headers.host) || '').split(':')[0];
       if (reqHost && !LOOPBACK_HOSTS.has(reqHost)) {
         u.hostname = reqHost;
@@ -35,15 +36,30 @@ function derivePublicBase(cfg, req) {
   }
 }
 
-/** 应用宝：把网关地址写进 yyb_server */
-async function uploadYybServer(cfg, req) {
-  const value = derivePublicBase(cfg, req);
+/**
+ * 确保 yyb_server 存在（只在后台「配置/测试青龙连接」时调用，扫码流程不碰青龙）。
+ * 已存在 → 完全不动（尊重手动配置）；缺失 → 按后台配置的网关地址补一次，
+ * 保证全新环境开箱即用。yyb_server 是纯静态的网关地址，配一次就够了。
+ */
+async function ensureYybServerEnv(cfg) {
+  const value = derivePublicBase(cfg, null);
   if (!value) {
     return { ok: false, error: '无法确定 yyb_server 地址，请在后台配置 yyb_go 对外地址' };
   }
-  const res = await qinglong.setEnv(cfg.qinglong, 'yyb_server', value, '朴朴超市签到 · 应用宝网关（由扫码面板写入）');
+
+  const found = await qinglong.findEnvs(cfg.qinglong, 'yyb_server');
+  if (found.ok && found.list.length) {
+    return {
+      ok: true,
+      variable: 'yyb_server',
+      skipped: true,
+      message: 'yyb_server 已存在，保持青龙里的配置不动',
+    };
+  }
+
+  const res = await qinglong.setEnv(cfg.qinglong, 'yyb_server', value, '朴朴/顺丰/美团脚本 · 应用宝网关地址（由扫码面板写入）');
   if (!res.ok) return res;
-  return Object.assign({ variable: 'yyb_server' }, res);
+  return { ok: true, variable: 'yyb_server', action: res.action, value };
 }
 
 /** 美团：token 追加进 MT_TOKEN（多账号一行一个） */
@@ -68,4 +84,4 @@ function mask(token) {
   return s.length > 12 ? `${s.slice(0, 8)}****${s.slice(-4)}` : '****';
 }
 
-module.exports = { derivePublicBase, uploadYybServer, uploadMeituanToken, mask };
+module.exports = { derivePublicBase, ensureYybServerEnv, uploadMeituanToken, mask };

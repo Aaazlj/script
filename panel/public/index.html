@@ -26,7 +26,7 @@
         </span>
         <span class="pick-body">
           <span class="pick-title">应用宝扫码</span>
-          <span class="pick-desc">微信扫码授权 · 写入 yyb_server</span>
+          <span class="pick-desc">微信扫码授权 · 账号保存在网关</span>
         </span>
         <span class="pick-arrow" aria-hidden="true">›</span>
       </button>
@@ -156,6 +156,7 @@ function renderUpload(up) {
   if (!up) return ['ℹ️ 未上传（没有生成可写入的凭据）', 'info'];
   if (!up.ok) return [`❌ 写青龙失败：${up.error || '未知错误'}`, 'err'];
   const name = up.variable || '环境变量';
+  if (up.skipped) return [`ℹ️ 青龙 ${name} 已存在，保持现有配置不动`, 'info'];
   if (up.action === 'created') return [`✅ 已在青龙新建 ${name}`, 'ok'];
   if (up.action === 'updated') return [`✅ 已更新青龙 ${name}`, 'ok'];
   if (up.action === 'appended') return [`✅ 已追加到青龙 ${name}（当前共 ${up.existingLines || 1} 行）`, 'ok'];
@@ -168,12 +169,7 @@ function renderUploadDetail(up) {
   const rows = [];
   if (up.host) rows.push(['青龙', up.host]);
   rows.push(['变量名', up.variable || '-']);
-  if (up.variable === 'yyb_server') {
-    rows.push(['写入值', up.value || '-']);
-    if (up.previous !== undefined && up.previous !== up.value) rows.push(['原值', up.previous || '（空）']);
-  } else {
-    rows.push(['token', up.masked || '****']);
-  }
+  rows.push(['token', up.masked || '****']);
   if (up.duplicates) rows.push(['提示', `青龙里还有 ${up.duplicates} 条同名变量，本次只改了第一条`]);
   return kv(rows);
 }
@@ -287,10 +283,7 @@ async function finishYyb() {
     ['openid', acc.openid || '-'],
     ['状态', acc.status || '-'],
   ])]);
-  const [text, kind] = renderUpload(r.upload);
-  note(kind, [text]);
-  const detail = renderUploadDetail(r.upload);
-  if (detail) note('info', [detail]);
+  note('info', ['账号已保存在网关，脚本会自动发现，无需改青龙配置。']);
 }
 
 /* ---------- 美团 ---------- */
