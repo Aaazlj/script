@@ -103,8 +103,8 @@ route('POST', '/api/yyb/confirm', async (req, res) => {
   if (!conf.ok) return httpx.fail(res, 502, conf.error);
   sessions.delete(sid);
 
-  const up = await upload.uploadYybServer(cfg, req);
-  httpx.ok(res, { account: conf.account, upload: up });
+  // 账号只存在网关里，脚本运行时自动发现，扫码不写青龙
+  httpx.ok(res, { account: conf.account });
 });
 
 route('POST', '/api/meituan/start', async (req, res) => {
@@ -337,10 +337,16 @@ route('PUT', '/api/admin/config', async (req, res) => {
   }
 
   const cfg = config.update(patch);
+  // 保存青龙配置后顺手兜底确保 yyb_server 存在（已存在则完全不动）
+  let yyb_server = null;
+  if (cfg.qinglong.host && cfg.qinglong.clientId && cfg.qinglong.clientSecret) {
+    yyb_server = await upload.ensureYybServerEnv(cfg);
+  }
   httpx.ok(res, {
     qinglong: { host: cfg.qinglong.host, clientId: cfg.qinglong.clientId, clientSecretSet: Boolean(cfg.qinglong.clientSecret) },
     yyb: cfg.yyb,
     meituan: { runJs: cfg.meituan.runJs, detectedRunJs: meituan.normalizeRunJs(cfg) },
+    yyb_server,
   });
 }, { admin: true });
 
@@ -353,7 +359,9 @@ route('POST', '/api/admin/test/qinglong', async (req, res) => {
   const cfg = config.load();
   const out = await qinglong.testConnection(cfg.qinglong);
   if (!out.ok) return httpx.fail(res, 502, out.error);
-  httpx.ok(res, out);
+  // 连接没问题就顺手兜底确保 yyb_server 存在（已存在则完全不动）
+  const yybEnv = await upload.ensureYybServerEnv(cfg);
+  httpx.ok(res, Object.assign({}, out, { yyb_server: yybEnv }));
 }, { admin: true });
 
 route('POST', '/api/admin/test/yyb', async (req, res) => {
