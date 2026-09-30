@@ -68,6 +68,58 @@ func TestSetAccountOrderChangesListOrder(t *testing.T) {
 	_ = c
 }
 
+func TestNewAccountGoesLast(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	a := mustUpsert(t, db, "openid-a", "buf-a", "Aaa")
+	b := mustUpsert(t, db, "openid-b", "buf-b", "Bbb")
+	c := mustUpsert(t, db, "openid-c", "buf-c", "Ccc")
+
+	// 用户手动把 a 拖到最后：c, b, a
+	if _, err := db.SetAccountOrder(ctx, []string{"openid-c", "openid-b", "openid-a"}); err != nil {
+		t.Fatalf("SetAccountOrder() error = %v", err)
+	}
+
+	// 新扫码进来的账号必须排在最后，而不是插到最前面（sort_order 默认 0 会排到 1/2/3 前面）
+	if _, err := db.UpsertAccount(ctx, "openid-new", "buf-new", nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatalf("UpsertAccount(新增) error = %v", err)
+	}
+	got := openIDs(t, db)
+	want := []string{"openid-c", "openid-b", "openid-a", "openid-new"}
+	if len(got) != len(want) {
+		t.Fatalf("账号数 = %d, want %d（%v）", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("新增账号应排在最后，实际顺序 %v, want %v", got, want)
+		}
+	}
+
+	// 老库里遗留的 sort_order=0（历史上扫码的账号）也要排到有序账号之后
+	if _, err := db.sql.ExecContext(ctx,
+		"UPDATE wechat_accounts SET sort_order=0 WHERE openid=?", "openid-new"); err != nil {
+		t.Fatalf("构造遗留数据失败: %v", err)
+	}
+	if err := normalizeSortOrder(ctx, db.sql); err != nil {
+		t.Fatalf("normalizeSortOrder() error = %v", err)
+	}
+	got = openIDs(t, db)
+	if got[len(got)-1] != "openid-new" {
+		t.Fatalf("sort_order=0 的老账号应被归一化到最后，实际 %v", got)
+	}
+	// 幂等：再跑一次结果不变
+	if err := normalizeSortOrder(ctx, db.sql); err != nil {
+		t.Fatalf("normalizeSortOrder() 第二次 error = %v", err)
+	}
+	if again := openIDs(t, db); again[len(again)-1] != "openid-new" {
+		t.Fatalf("归一化应幂等，实际 %v", again)
+	}
+
+	_ = a
+	_ = b
+	_ = c
+}
+
 func TestUpsertFullAccountImport(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)

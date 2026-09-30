@@ -218,10 +218,38 @@ func ensureSortOrderColumn(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if has {
+		return normalizeSortOrder(ctx, db)
+	}
+	if _, err = db.ExecContext(ctx,
+		"ALTER TABLE wechat_accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return normalizeSortOrder(ctx, db)
+}
+
+// normalizeSortOrder 把 sort_order 统一编号成 1..N。
+// 0 表示「从没排过」——历史上扫码新增的账号都是 0，而 0 会排在 1、2、3 前面，
+// 导致新账号插到列表最前面；这里把 0 的账号视作「最后」，按 id 保持它们之间的顺序，
+// 再统一重新编号（幂等：全都 >0 时结果不变）。
+func normalizeSortOrder(ctx context.Context, db *sql.DB) error {
+	var zeroCount, total int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*), COALESCE(SUM(CASE WHEN sort_order=0 THEN 1 ELSE 0 END),0) FROM wechat_accounts",
+	).Scan(&total, &zeroCount); err != nil {
+		return err
+	}
+	if total == 0 || zeroCount == 0 {
 		return nil
 	}
-	_, err = db.ExecContext(ctx,
-		"ALTER TABLE wechat_accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+	_, err := db.ExecContext(ctx, `
+UPDATE wechat_accounts SET sort_order = (
+    SELECT rn FROM (
+        SELECT id, ROW_NUMBER() OVER (
+            ORDER BY CASE WHEN sort_order = 0 THEN 1 ELSE 0 END, sort_order, id
+        ) AS rn
+        FROM wechat_accounts
+    ) t WHERE t.id = wechat_accounts.id
+)`)
 	return err
 }
 
@@ -262,8 +290,8 @@ func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, ali
 	}
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO wechat_accounts
-		(openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		(openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, sort_order, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order), 0) + 1 FROM wechat_accounts),?,?)
 		ON CONFLICT(openid) DO UPDATE SET
 		login_buffer=excluded.login_buffer, alias=excluded.alias, nickname=excluded.nickname,
 		avatar=excluded.avatar, user_info=excluded.user_info, credentials=excluded.credentials,
@@ -589,7 +617,7 @@ func (db *DB) UpsertFullAccount(ctx context.Context, a *ExportAccount) (bool, er
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO wechat_accounts
 		(openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, sort_order, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order), 0) + 1 FROM wechat_accounts),?,?)
 		ON CONFLICT(openid) DO UPDATE SET
 			uin=COALESCE(excluded.uin, wechat_accounts.uin),
 			alias=COALESCE(excluded.alias, wechat_accounts.alias),
@@ -601,7 +629,7 @@ func (db *DB) UpsertFullAccount(ctx context.Context, a *ExportAccount) (bool, er
 			status=wechat_accounts.status,
 			updated_at=excluded.updated_at`,
 		a.OpenID, nullableInt(a.UIN), nullableString(a.Alias), nullableString(a.Nickname),
-		nullableString(a.Avatar), userJSON, a.LoginBuffer, credJSON, nil, 0, now, now,
+		nullableString(a.Avatar), userJSON, a.LoginBuffer, credJSON, nil, now, now,
 	)
 	if err != nil {
 		return false, err
