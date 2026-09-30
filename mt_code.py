@@ -20,11 +20,13 @@ Cron: 5 9,12,20 * * *
    - 请求体：{"app_id": "<小程序appid>", "ref": "账号openid"}
    wx_server_url                                   兼容变量（yyb_server 为空时生效，请求方式相同）
 
-2. 账号变量：
+2. 账号变量（可省略）：
    mt_openid                                       美团专属账号变量（网关 ref）
    - 多账号支持使用 &、英文逗号、中文逗号、空格或换行分隔
    - 示例：openid_a&openid_b 或 openid_a,openid_b
-   - 若在 yyb_server 里已经用 @ref 指定了唯一账号，本变量可以留空
+   - 不配置时脚本自动从 yyb_server 网关拉取全部 alive 账号（与朴朴脚本一致），
+     面板里新扫码的账号下次运行自动生效，无需改青龙配置
+   - 优先级：mt_openid > yyb_server 里的 @ref > 网关自动发现
 
 3. 代理变量（可选）：
    mt_proxy                                        静态代理，形如 http://user:pass@host:port
@@ -104,6 +106,7 @@ MT_OPENIDS = [oid.strip() for oid in re.split(r"[&,，\s\n]", MT_OPENID) if oid.
 if not MT_OPENIDS and YYB_REF:
     # 只配了 yyb_server@ref、没配 mt_openid —— 直接沿用网关里带的 ref
     MT_OPENIDS = [YYB_REF]
+# 都没配也不要紧：main 里会自动从网关拉 /accounts 的全部 alive 账号
 
 # 静态代理（可选）：只作用于访问美团的请求；网关调用始终直连
 MT_PROXY = (
@@ -133,13 +136,6 @@ REQUEST_TIMEOUT = 30
 
 if not YYB_BASE:
     print("❌ [配置] 缺少必填环境变量 yyb_server（应用宝网关地址，兼容旧变量 wx_server_url）")
-    sys.exit(1)
-
-if not MT_OPENIDS:
-    print(
-        "❌ [配置] 缺少账号：请配置 mt_openid（应用宝网关 ref），"
-        "或在 yyb_server 里用 @ref 指定；多账号用 & 、逗号或换行分隔"
-    )
     sys.exit(1)
 
 OPEN_BASE_URL = "https://open.meituan.com"
@@ -215,12 +211,12 @@ def _pad_r(s: str, width: int) -> str:
     return s + " " * max(0, width - _disp_w(s))
 
 
-def log_title() -> None:
+def log_title(count: int) -> None:
     print()
     print("╔" + "═" * 50 + "╗")
     print("║" + _pad_r("🚀 美团优惠券动态 code 版", 50) + "║")
     print("║" + _pad_r(f"🕒 启动时间: {now_text()}", 50) + "║")
-    print("║" + _pad_r(f"🔢 账号数量: {len(MT_OPENIDS)}", 50) + "║")
+    print("║" + _pad_r(f"🔢 账号数量: {count}", 50) + "║")
     print("╚" + "═" * 50 + "╝")
 
 
@@ -231,12 +227,14 @@ def _mask(s: str, head: int = 4, tail: int = 4) -> str:
     return s[:head] + "*" * (len(s) - head - tail) + s[-tail:]
 
 
-def log_account_header(index: int, total: int, server: str) -> None:
+def log_account_header(index: int, total: int, label: str, ref: str) -> None:
     print()
     print("┌" + "─" * 50 + "┐")
     print("│" + _pad_r(f"🧩 账号 {index} / {total}", 50) + "│")
     print("│" + _pad_r(f"🌍 网关 {_mask(YYB_BASE)}", 50) + "│")
-    print("│" + _pad_r(f"🧾 身份 {_mask(server)}", 50) + "│")
+    print("│" + _pad_r(f"🧾 身份 {label}", 50) + "│")
+    if ref and ref != label:
+        print("│" + _pad_r(f"🆔 ref {_mask(ref)}", 50) + "│")
     print("└" + "─" * 50 + "┘")
 
 
@@ -416,6 +414,45 @@ def get_code(ref: str, server: str = "") -> str | None:
 
     print("❌ [授权] code 获取失败，已重试 3 次")
     return None
+
+
+def fetch_gateway_accounts() -> List[Dict[str, Any]]:
+    """拉取应用宝网关的全部账号（GET /accounts）。"""
+    response = direct_session().get(f"{YYB_BASE}/accounts", timeout=20)
+    data = response.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"网关返回异常: {json_preview(data, 200)}")
+    return [a for a in (data.get("data") or []) if isinstance(a, dict)]
+
+
+def resolve_accounts() -> List[Dict[str, Any]]:
+    """解析要执行的账号，返回 [{ref, label}]。
+
+    优先级：mt_openid 显式配置 > yyb_server 里的 @ref > 自动拉网关全部 alive 账号。
+    自动发现一个 alive 都没有时，先给所有账号续期再重拉一次。
+    """
+    if MT_OPENIDS:
+        return [{"ref": ref, "label": ref} for ref in MT_OPENIDS]
+
+    accounts = fetch_gateway_accounts()
+    alive = [a for a in accounts if (a.get("status") or "").lower() == "alive"]
+    if not alive and accounts:
+        print("⚠️ [账号] 网关里没有 alive 的账号，尝试全部续期后重拉")
+        for account in accounts:
+            refresh_gateway_account(str(account.get("openid") or account.get("id") or ""))
+        accounts = fetch_gateway_accounts()
+        alive = [a for a in accounts if (a.get("status") or "").lower() == "alive"]
+
+    result: List[Dict[str, Any]] = []
+    for account in alive:
+        ref = str(account.get("openid") or account.get("id") or "")
+        if not ref:
+            continue
+        label = str(
+            account.get("nickname") or account.get("alias") or account.get("openid") or ref
+        )
+        result.append({"ref": ref, "label": label})
+    return result
 
 
 def common_headers(token: str | None = None) -> Dict[str, str]:
@@ -678,9 +715,10 @@ def wall_post(
         }
 
 
-def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
+def run_account(index: int, total: int, ref: str, label: str = "") -> Dict[str, Any]:
+    label = label or ref
     result = {
-        "server": server,
+        "server": label,
         "success": False,
         "proxyStatus": "未使用代理",
         "proxyIp": "-",
@@ -689,9 +727,9 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
         "error": "",
     }
 
-    log_account_header(index, total, server)
+    log_account_header(index, total, label, ref)
 
-    proxies, proxy_label = get_valid_proxy(server)
+    proxies, proxy_label = get_valid_proxy(label)
     result["proxyStatus"] = "使用静态代理" if proxies else "使用直连"
     result["proxyIp"] = proxy_label or "-"
 
@@ -699,12 +737,12 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
     print(f"⏳ [延迟] 启动延迟 {delay}s")
     sleep(delay)
 
-    code = get_code(server)
+    code = get_code(ref)
     if not code:
         result["error"] = "获取 code 失败"
         return result
 
-    token, raw_login = login_by_code(server, code, proxies)
+    token, raw_login = login_by_code(label, code, proxies)
     if not token:
         result["error"] = f"登录失败: {json_preview(raw_login)}"
         return result
@@ -931,19 +969,37 @@ def run_account(index: int, total: int, server: str) -> Dict[str, Any]:
 
 
 def main() -> None:
-    log_title()
+    # 账号解析失败不直接崩，留在 results 里统一汇报
+    try:
+        accounts = resolve_accounts()
+    except Exception as exc:
+        print(f"❌ [账号] 从网关获取账号失败: {exc}")
+        accounts = []
+
+    if not accounts:
+        print(
+            "❌ [账号] 没有可用账号：请到扫码面板扫码登录，"
+            "或配置 mt_openid / 在 yyb_server 里用 @ref 指定"
+        )
+        sys.exit(1)
+
+    if not MT_OPENIDS:
+        # 自动发现模式：面板里新扫码的账号下次运行会自动带上
+        labels = "、".join(a["label"] for a in accounts)
+        print(f"🌐 [账号] 已自动从网关发现 {len(accounts)} 个账号: {labels}")
+
+    log_title(len(accounts))
 
     results: List[Dict[str, Any]] = []
 
-    servers = MT_OPENIDS
-    for index, server in enumerate(servers, 1):
+    for index, account in enumerate(accounts, 1):
         try:
-            result = run_account(index, len(servers), server)
+            result = run_account(index, len(accounts), account["ref"], account["label"])
             results.append(result)
         except Exception as exc:
-            print(f"❌ [主程序] {server} 执行异常: {exc}")
+            print(f"❌ [主程序] {account['label']} 执行异常: {exc}")
             results.append({
-                "server": server,
+                "server": account["label"],
                 "success": False,
                 "proxyStatus": "-",
                 "proxyIp": "-",
@@ -952,7 +1008,7 @@ def main() -> None:
                 "error": traceback.format_exc().strip(),
             })
 
-        if index < len(servers):
+        if index < len(accounts):
             print("")
             print("⏳ [间隔] 等待 2s 后处理下一个账号")
             sleep(2)

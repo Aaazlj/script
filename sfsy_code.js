@@ -1209,12 +1209,59 @@ function loadAccounts() {
   return out;
 }
 
+/**
+ * 4) 什么都不配：自动拉取网关 /accounts 的全部 alive 账号（与朴朴脚本一致），
+ *    面板里新扫码的账号下次运行自动生效。一个 alive 都没有时先全部续期再重拉。
+ */
+async function discoverGatewayAccounts() {
+  const gw = parseGateway(YYB_SERVER);
+  if (!gw.url || gw.ref) return [];   // 网关带 @ref 说明用户只想跑这一个
+
+  const fetchAlive = async () => {
+    const r = await rawRequest({ url: `${gw.url}/accounts`, method: 'GET', timeout: 20000 });
+    const j = r.json;
+    if (!j || j.code !== 0 || !Array.isArray(j.data)) {
+      LOG(`⚠️ 拉取网关账号列表失败：${r.status === 0 ? r.error : crop(j || r.text, 120)}`);
+      return null;
+    }
+    return j.data.filter((a) => (a.status || '').toLowerCase() === 'alive');
+  };
+
+  let alive = await fetchAlive();
+  if (alive === null) return [];
+
+  if (!alive.length) {
+    LOG('⚠️ 网关里没有 alive 的账号，尝试全部续期后重拉');
+    const all = await rawRequest({ url: `${gw.url}/accounts`, method: 'GET', timeout: 20000 });
+    for (const a of ((all.json && all.json.data) || [])) {
+      const ref = String(a.openid || a.id || '');
+      if (ref) {
+        await rawRequest({ url: `${gw.url}/accounts/refresh`, method: 'POST', body: { ref }, timeout: 120000 });
+      }
+    }
+    alive = (await fetchAlive()) || [];
+  }
+
+  const out = [];
+  for (const a of alive) {
+    const openid = String(a.openid || a.id || '');
+    if (openid) out.push({ openid, remark: String(a.nickname || a.alias || ''), raw: openid });
+  }
+  if (out.length) {
+    LOG(`🌐 已自动从网关发现 ${out.length} 个账号: ${out.map((a) => a.remark || a.openid.slice(0, 8)).join('、')}`);
+  }
+  return out;
+}
+
 /* ==================== 主流程 ==================== */
 
 async function main() {
-  const accounts = loadAccounts();
+  let accounts = loadAccounts();
+  if (!accounts.length && YYB_SERVER) {
+    accounts = await discoverGatewayAccounts();
+  }
   if (!accounts.length) {
-    LOG('未找到顺丰账号：请配置 sf_openid（推荐，配合 yyb_server）或 sfsyUrl / sf');
+    LOG('未找到顺丰账号：请到扫码面板扫码登录（自动发现），或配置 sf_openid / sfsyUrl / sf');
     $.done();
     return;
   }
