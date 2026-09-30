@@ -129,6 +129,42 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			"/accounts/export": map[string]any{
+				"get": openAPIOperation(
+					[]string{"accounts"},
+					"导出账号（含登录态）",
+					[]map[string]any{queryStringParam("ref", "只导出指定账号（ID、UIN 或 openid），留空导出全部。", false)},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("账号数组，字段与其它工具的 yyb 账号文件一致，可直接互导。", arraySchema(refSchema("ExportAccount"))),
+					}),
+				),
+			},
+			"/accounts/import": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"导入账号",
+					nil,
+					jsonRequestBody(oneOfSchema(
+						arraySchema(refSchema("ExportAccount")),
+						refSchema("AccountsImportRequest"),
+					)),
+					defaulted(map[string]any{
+						"200": jsonResponse("导入统计与最新账号列表。", refSchema("AccountsMutationResponse")),
+					}),
+				),
+			},
+			"/accounts/order": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"重排账号顺序",
+					nil,
+					jsonRequestBody(refSchema("AccountsOrderRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("保存顺序后的账号列表。", refSchema("AccountsMutationResponse")),
+					}),
+				),
+			},
 			"/wxapp/getCode": map[string]any{
 				"post": openAPIOperation(
 					[]string{"wxapp"},
@@ -190,6 +226,29 @@ func newOpenAPISpec() map[string]any {
 						"enum": []string{"pending", "scanned", "authorized", "confirmed", "expired", "cancelled", "unknown"},
 					},
 					"errcode": map[string]any{"type": "integer", "nullable": true},
+				}),
+				"ExportAccount": objectSchema([]string{"openid", "login_buffer"}, map[string]any{
+					"openid":       map[string]any{"type": "string"},
+					"uin":          nullableInt64Schema(),
+					"alias":        nullableStringSchema("账号别名。"),
+					"nickname":     nullableStringSchema("账号昵称。"),
+					"avatar":       nullableStringSchema("本地头像路径或远程头像 URL。"),
+					"user_info":    nullableObjectSchema("微信资料（nick_name / head_img_url 等）。"),
+					"login_buffer": map[string]any{"type": "string", "description": "登录态 buffer，导入时必填。"},
+					"credentials":  nullableObjectSchema("access / refresh token 等凭据。"),
+				}),
+				"AccountsImportRequest": objectSchema(nil, map[string]any{
+					"accounts": arraySchema(refSchema("ExportAccount")),
+				}),
+				"AccountsOrderRequest": objectSchema([]string{"refs"}, map[string]any{
+					"refs": arraySchema(map[string]any{"type": "string", "description": "按期望顺序排列的 ref（ID / UIN / openid）。"}),
+				}),
+				"AccountsMutationResponse": objectSchema([]string{"accounts"}, map[string]any{
+					"created":  map[string]any{"type": "integer", "example": 1, "description": "新建数量（仅导入接口返回）。"},
+					"updated":  map[string]any{"type": "integer", "example": 2, "description": "更新数量（仅导入接口返回）。"},
+					"ordered":  map[string]any{"type": "integer", "example": 2, "description": "已排入顺序的账号数（仅排序接口返回）。"},
+					"skipped":  arraySchema(freeFormObjectSchema("被跳过的账号及原因。")),
+					"accounts": arraySchema(refSchema("AccountPublic")),
 				}),
 				"AccountPublic": objectSchema([]string{"id", "openid", "created_at", "updated_at"}, map[string]any{
 					"id":              int64Schema(),

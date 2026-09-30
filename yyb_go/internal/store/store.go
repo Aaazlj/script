@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS wechat_accounts (
     login_buffer    TEXT    NOT NULL,
     credentials     TEXT,
     status          TEXT,
+    sort_order      INTEGER NOT NULL DEFAULT 0,
     last_checked_at INTEGER,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
@@ -141,6 +143,10 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err = ensureSortOrderColumn(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	out := &DB{sql: db}
 	if err = out.EnsureDefaultFeatures(ctx); err != nil {
 		_ = db.Close()
@@ -205,6 +211,45 @@ func sqliteTableExists(ctx context.Context, db *sql.DB, name string) (bool, erro
 	return n > 0, err
 }
 
+// ensureSortOrderColumn 给老库补上 sort_order 列（新库建表时已有）
+func ensureSortOrderColumn(ctx context.Context, db *sql.DB) error {
+	has, err := sqliteColumnExists(ctx, db, "wechat_accounts", "sort_order")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = db.ExecContext(ctx,
+		"ALTER TABLE wechat_accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+	return err
+}
+
+func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, alias, nickname, avatar *string, userInfo map[string]any, credentials map[string]any, status *string) (*WechatAccount, error) {
 	now := time.Now().Unix()
 	userJSON, err := marshalNullable(userInfo)
@@ -261,7 +306,8 @@ func (db *DB) ResolveAccount(ctx context.Context, ref string) (*WechatAccount, e
 }
 
 func (db *DB) ListAccounts(ctx context.Context) ([]*WechatAccount, error) {
-	rows, err := db.sql.QueryContext(ctx, selectAccountSQL+" ORDER BY id")
+	// sort_order 为用户在面板里拖拽出来的顺序；0 表示没排过，退化为按 id
+	rows, err := db.sql.QueryContext(ctx, selectAccountSQL+" ORDER BY sort_order, id")
 	if err != nil {
 		return nil, err
 	}
@@ -429,6 +475,291 @@ func (a *WechatAccount) Public() AccountPublic {
 		CreatedAt:     a.CreatedAt,
 		UpdatedAt:     a.UpdatedAt,
 	}
+}
+
+/* ---------------- 导出 / 导入 / 排序 ---------------- */
+
+// ExportAccount 是导出（以及导入）用的精简结构，字段名与其它工具（taobao-tool 等）
+// 的 yyb 账号文件保持一致，便于互导。
+type ExportAccount struct {
+	OpenID      string         `json:"openid"`
+	UIN         *int64         `json:"uin"`
+	Alias       *string        `json:"alias"`
+	Nickname    *string        `json:"nickname"`
+	Avatar      *string        `json:"avatar"`
+	UserInfo    map[string]any `json:"user_info"`
+	LoginBuffer string         `json:"login_buffer"`
+	Credentials map[string]any `json:"credentials"`
+}
+
+// Export 把账号转成可跨工具导入的结构
+func (a *WechatAccount) Export() ExportAccount {
+	return ExportAccount{
+		OpenID:      a.OpenID,
+		UIN:         a.UIN,
+		Alias:       a.Alias,
+		Nickname:    a.Nickname,
+		Avatar:      a.Avatar,
+		UserInfo:    a.UserInfo,
+		LoginBuffer: a.LoginBuffer,
+		Credentials: a.Credentials,
+	}
+}
+
+// MatchesRef 判断账号是否匹配 ref（支持 openid / id / uin）
+func (a *WechatAccount) MatchesRef(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return true
+	}
+	if ref == a.OpenID {
+		return true
+	}
+	if isDigits(ref) {
+		if n, err := strconv.ParseInt(ref, 10, 64); err == nil {
+			if n == a.ID {
+				return true
+			}
+			if a.UIN != nil && *a.UIN == n {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// NormalizeImport 把一份来路不明的 JSON 对象规整成可入库的账号
+func NormalizeImport(raw map[string]any) (*ExportAccount, error) {
+	openid := strings.TrimSpace(coerceString(raw["openid"]))
+	if openid == "" {
+		// 兼容只给 uin 的情况：用 uin 占位当 openid，至少能存下来
+		if uin := coerceInt(raw["uin"]); uin != nil {
+			openid = "uin_" + strconv.FormatInt(*uin, 10)
+		}
+	}
+	if openid == "" {
+		return nil, errors.New("缺少 openid")
+	}
+	loginBuffer := strings.TrimSpace(coerceString(raw["login_buffer"]))
+	if loginBuffer == "" {
+		return nil, errors.New("缺少 login_buffer（没有登录态，导入后也无法取 code）")
+	}
+
+	out := &ExportAccount{
+		OpenID:      openid,
+		UIN:         coerceInt(raw["uin"]),
+		Alias:       coerceStringPtr(raw["alias"]),
+		Nickname:    coerceStringPtr(raw["nickname"]),
+		Avatar:      coerceStringPtr(raw["avatar"]),
+		LoginBuffer: loginBuffer,
+		UserInfo:    coerceMap(raw["user_info"]),
+		Credentials: coerceMap(raw["credentials"]),
+	}
+	if out.Nickname == nil {
+		if ui := coerceMap(raw["user_info"]); ui != nil {
+			if s := coerceStringPtr(ui["nick_name"]); s != nil {
+				out.Nickname = s
+			}
+		}
+	}
+	return out, nil
+}
+
+// UpsertFullAccount 按 openid 覆盖式写入完整账号；导入数据缺字段时保留库里原值。
+// 返回是否新建。
+func (db *DB) UpsertFullAccount(ctx context.Context, a *ExportAccount) (bool, error) {
+	_, lookupErr := db.GetAccountByOpenID(ctx, a.OpenID)
+	created := false
+	if lookupErr != nil {
+		if !errors.Is(lookupErr, sql.ErrNoRows) {
+			return false, lookupErr
+		}
+		created = true
+	}
+
+	userJSON, err := marshalNullable(a.UserInfo)
+	if err != nil {
+		return false, err
+	}
+	credJSON, err := marshalNullable(a.Credentials)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().Unix()
+	_, err = db.sql.ExecContext(ctx,
+		`INSERT INTO wechat_accounts
+		(openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, sort_order, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(openid) DO UPDATE SET
+			uin=COALESCE(excluded.uin, wechat_accounts.uin),
+			alias=COALESCE(excluded.alias, wechat_accounts.alias),
+			nickname=COALESCE(excluded.nickname, wechat_accounts.nickname),
+			avatar=COALESCE(excluded.avatar, wechat_accounts.avatar),
+			user_info=COALESCE(excluded.user_info, wechat_accounts.user_info),
+			login_buffer=excluded.login_buffer,
+			credentials=COALESCE(excluded.credentials, wechat_accounts.credentials),
+			status=wechat_accounts.status,
+			updated_at=excluded.updated_at`,
+		a.OpenID, nullableInt(a.UIN), nullableString(a.Alias), nullableString(a.Nickname),
+		nullableString(a.Avatar), userJSON, a.LoginBuffer, credJSON, nil, 0, now, now,
+	)
+	if err != nil {
+		return false, err
+	}
+	return created, nil
+}
+
+// SetAccountOrder 按 refs 的顺序重排账号（写入 sort_order）；未列出的账号排到末尾。
+// 返回成功写入顺序的账号数量。
+//
+// 注意：ref → id 的解析必须在事务外完成 —— 连接池 MaxOpenConns=1，
+// 事务里再走 db.sql 会拿不到连接直接死锁。
+func (db *DB) SetAccountOrder(ctx context.Context, refs []string) (int, error) {
+	orderedIDs := make([]int64, 0, len(refs))
+	seen := make(map[int64]bool, len(refs))
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		acc, err := db.ResolveAccount(ctx, ref)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 未知 ref：忽略
+			}
+			return 0, err
+		}
+		if seen[acc.ID] {
+			continue
+		}
+		seen[acc.ID] = true
+		orderedIDs = append(orderedIDs, acc.ID)
+	}
+
+	now := time.Now().Unix()
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	position := 0
+	for _, id := range orderedIDs {
+		position++
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE wechat_accounts SET sort_order=?, updated_at=? WHERE id=?",
+			position, now, id,
+		); err != nil {
+			return 0, err
+		}
+	}
+
+	// 未在 refs 里出现的账号（一般不会）排到最后，保持 id 顺序稳定
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM wechat_accounts ORDER BY id")
+	if err != nil {
+		return 0, err
+	}
+	var rest []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if !seen[id] {
+			rest = append(rest, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	tail := position
+	for _, id := range rest {
+		tail++
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE wechat_accounts SET sort_order=?, updated_at=? WHERE id=?",
+			tail, now, id,
+		); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return position, nil
+}
+
+func coerceString(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case json.Number:
+		return t.String()
+	case float64:
+		if t == float64(int64(t)) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	default:
+		return ""
+	}
+}
+
+func coerceStringPtr(v any) *string {
+	s := strings.TrimSpace(coerceString(v))
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func coerceInt(v any) *int64 {
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case int64:
+		return &t
+	case int:
+		n := int64(t)
+		return &n
+	case float64:
+		n := int64(t)
+		return &n
+	case json.Number:
+		if n, err := t.Int64(); err == nil {
+			return &n
+		}
+		return nil
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" {
+			return nil
+		}
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return &n
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func coerceMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
 }
 
 const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at FROM wechat_accounts`

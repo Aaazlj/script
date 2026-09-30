@@ -456,15 +456,22 @@ async function doSave(silent) {
 
 /* ---------- 应用宝账号 ---------- */
 
-let acctListEl, acctOut;
+let acctListEl, acctOut, acctFileInput;
+let dragRef = null;
 
 function buildAccounts() {
   acctOut = node('div');
   acctListEl = node('div');
+  acctFileInput = node('input', {
+    type: 'file',
+    accept: '.json,application/json',
+    style: 'display:none',
+    onchange: (e) => importAccounts(e.target),
+  });
 
   const card = node('div', { class: 'card' }, [
     node('h2', { text: '已入库的应用宝账号' }),
-    node('div', { class: 'hint', text: '这里显示扫码登录后存进 yyb_go 网关的微信账号。青龙脚本通过 yyb_server 调它取 code，删掉某个账号即可让脚本不再用它。' }),
+    node('div', { class: 'hint', text: '这里显示扫码登录后存进 yyb_go 网关的微信账号。青龙脚本通过 yyb_server 调它取 code，删掉某个账号即可让脚本不再用它。拖动左侧手柄可以调整顺序（脚本按这个顺序依次执行）。' }),
     node('div', { class: 'row', style: 'margin-bottom:14px' }, [
       node('button', { class: 'btn small ghost', text: '刷新列表', onclick: (e) => loadAccounts(e.target) }),
       node('button', {
@@ -475,7 +482,9 @@ function buildAccounts() {
         class: 'btn small ghost', text: '同步全部资料',
         onclick: (e) => doAccountAction(e.target, '/api/yyb/accounts/resync', '', '正在同步昵称与头像…'),
       }),
+      node('button', { class: 'btn small ghost', text: '导入账号', onclick: () => acctFileInput.click() }),
       node('button', { class: 'btn small ghost', text: '导出全部', onclick: (e) => exportAccounts('', e.target) }),
+      acctFileInput,
     ]),
     acctListEl,
     acctOut,
@@ -517,9 +526,86 @@ function accountRow(a) {
     btn('删除', (e) => removeAccount(e.target, a), ''),
   ]);
 
-  return node('div', { style: 'display:flex;gap:12px;align-items:center;padding:12px 0;border-top:1px solid var(--line)' }, [
-    avatar, meta, statusBadge(a.status), ops,
-  ]);
+  const handle = node('span', {
+    text: '⠿',
+    title: '拖动调整顺序',
+    style: 'flex:0 0 auto;cursor:grab;color:var(--muted);font-size:16px;line-height:1;user-select:none;padding:0 2px',
+  });
+
+  const row = node('div', {
+    'data-ref': a.ref,
+    draggable: 'true',
+    style: 'display:flex;gap:12px;align-items:center;padding:12px 0;border-top:1px solid var(--line)',
+    ondragstart: (e) => {
+      dragRef = a.ref;
+      row.style.opacity = '0.4';
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', a.ref); } catch (_) { /* IE */ }
+      }
+    },
+    ondragend: () => {
+      dragRef = null;
+      row.style.opacity = '';
+      clearDropHint();
+    },
+    ondragover: (e) => {
+      if (!dragRef || dragRef === a.ref) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      clearDropHint();
+      const rect = row.getBoundingClientRect();
+      const after = e.clientY > rect.top + rect.height / 2;
+      row.style.boxShadow = after ? 'inset 0 -2px 0 0 #2f6feb' : 'inset 0 2px 0 0 #2f6feb';
+      row.dataset.dropAfter = after ? '1' : '0';
+    },
+    ondragleave: () => {
+      row.style.boxShadow = '';
+      delete row.dataset.dropAfter;
+    },
+    ondrop: async (e) => {
+      e.preventDefault();
+      const after = row.dataset.dropAfter === '1';
+      row.style.boxShadow = '';
+      delete row.dataset.dropAfter;
+      if (!dragRef || dragRef === a.ref) return;
+      reorderRow(dragRef, a.ref, after);
+      dragRef = null;
+      await saveAccountOrder();
+    },
+  }, [handle, avatar, meta, statusBadge(a.status), ops]);
+
+  return row;
+}
+
+/** 把拖动的行插到目标行的前面或后面 */
+function reorderRow(srcRef, targetRef, after) {
+  const rows = Array.from(acctListEl.querySelectorAll('[data-ref]'));
+  const src = rows.find((el) => el.dataset.ref === srcRef);
+  const tgt = rows.find((el) => el.dataset.ref === targetRef);
+  if (!src || !tgt || src === tgt) return;
+  tgt.parentNode.insertBefore(src, after ? tgt.nextSibling : tgt);
+}
+
+function clearDropHint() {
+  acctListEl.querySelectorAll('[data-ref]').forEach((el) => {
+    el.style.boxShadow = '';
+    delete el.dataset.dropAfter;
+  });
+}
+
+/** 拖完后把当前 DOM 顺序写回网关 */
+async function saveAccountOrder() {
+  const refs = Array.from(acctListEl.querySelectorAll('[data-ref]')).map((el) => el.dataset.ref);
+  if (!refs.length) return;
+  show(acctOut, 'info', ['正在保存账号顺序…']);
+  try {
+    const r = await api('POST', '/api/yyb/accounts/order', { refs });
+    show(acctOut, 'ok', ['✅ 已保存账号顺序（共 ' + (r.ordered || refs.length) + ' 个）']);
+    if (r.accounts) renderAccounts(r.accounts);
+  } catch (e) {
+    show(acctOut, 'err', ['保存顺序失败：' + e.message]);
+  }
 }
 
 function renderAccounts(accounts) {
@@ -529,7 +615,7 @@ function renderAccounts(accounts) {
     return;
   }
   acctListEl.appendChild(node('div', { class: 'stat-label', style: 'margin-bottom:4px' }, [
-    node('span', { text: '共 ' + accounts.length + ' 个账号' }),
+    node('span', { text: '共 ' + accounts.length + ' 个账号（拖动 ⠿ 可调整顺序）' }),
   ]));
   for (const a of accounts) acctListEl.appendChild(accountRow(a));
 }
@@ -587,6 +673,40 @@ async function exportAccounts(ref, btn) {
     show(acctOut, 'err', ['导出失败：' + e.message]);
   }
   if (btn) btn.disabled = false;
+}
+
+/* 导入账号：文件格式为账号数组（或 {"accounts":[...]}），与导出的文件一致 */
+async function importAccounts(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  show(acctOut, 'info', ['正在导入 ' + file.name + ' …']);
+  try {
+    const text = await file.text();
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch (_) {
+      throw new Error('文件不是合法 JSON');
+    }
+    const accounts = Array.isArray(payload) ? payload : (payload && payload.accounts);
+    if (!Array.isArray(accounts) || !accounts.length) {
+      throw new Error('文件里没有账号数组');
+    }
+    const r = await api('POST', '/api/yyb/accounts/import', { accounts });
+    const lines = ['✅ 导入完成：新建 ' + (r.created || 0) + ' 个，更新 ' + (r.updated || 0) + ' 个'];
+    if (r.skipped && r.skipped.length) {
+      lines.push('⚠️ 跳过 ' + r.skipped.length + ' 个：' + r.skipped.slice(0, 3).map((s) => {
+        const who = s.openid ? s.openid.slice(0, 12) + '…' : '未知';
+        return who + '（' + (s.reason || '原因未知') + '）';
+      }).join('；'));
+    }
+    show(acctOut, 'ok', lines);
+    if (r.accounts) renderAccounts(r.accounts);
+  } catch (e) {
+    show(acctOut, 'err', ['导入失败：' + e.message]);
+  } finally {
+    input.value = '';   // 允许重复选同一个文件
+  }
 }
 
 async function removeAccount(btn, a) {
