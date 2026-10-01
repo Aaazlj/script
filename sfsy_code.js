@@ -30,6 +30,13 @@ new Env('顺丰速运')
   sf_autumn        中秋活动开关，默认 1（活动时间窗内才执行）
   sf_dry_run       自检模式，默认 0；设为 1 则只查询不消耗（首次验证账号用）
   sf_verbose       详细日志，默认 0
+  sf_account_timeout  单个账号的处理上限（秒，最小 30），默认 240；超过就跳过该账号继续下一个
+
+健壮性（卡死不会拖死整只脚本）：
+  · 每个请求都带「硬超时」定时器（不依赖 socket 是否建立），promise 一定 settle
+  · 单账号上限定时器刻意不 unref，到点必然触发 → 跳过该账号、继续下一个
+  · 运行期间有保活定时器撑着事件循环，不会被"无待办"判定成结束
+  · 另有一道看门狗：accounts×单账号上限+60s 仍未跑完则强制收尾并输出已完成的汇总
 
 中秋活动时间：2026-09-11 10:00 ~ 2026-10-08 19:00（超出窗口自动跳过，不报错）
 ------------------------------------------
@@ -301,19 +308,38 @@ function stickyUrl(proxyUrl, ref, round) {
 /** 极简 HTTP 请求（返回文本），用于访问代理提取 API；agent 可选 */
 function plainGet(url, timeout = 10000, agent) {
   return new Promise((resolve) => {
+    let settled = false;
+    let req = null;
+    let hardTimer = null;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      resolve(v);
+    };
+
     let u;
-    try { u = new URL(url); } catch (_) { return resolve({ ok: false, error: '非法 URL' }); }
+    try { u = new URL(url); } catch (_) { return finish({ ok: false, error: '非法 URL' }); }
     const lib = u.protocol === 'http:' ? http : https;
-    const req = lib.get(
+
+    // 硬超时（刻意不 unref）：不依赖 socket 是否建立，保证 promise 一定 settle，
+    // 否则事件循环被抽空后 Node 会静默退出整只脚本
+    hardTimer = setTimeout(() => {
+      try { if (req) req.destroy(); } catch (_) { /* 忽略 */ }
+      finish({ ok: false, error: 'TIMEOUT' });
+    }, timeout);
+
+    req = lib.get(
       { hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname + u.search, timeout, agent },
       (res) => {
         const c = [];
         res.on('data', (d) => c.push(d));
-        res.on('end', () => resolve({ ok: true, status: res.statusCode, text: Buffer.concat(c).toString('utf8') }));
+        res.on('error', (e) => finish({ ok: false, error: e.message }));
+        res.on('end', () => finish({ ok: true, status: res.statusCode, text: Buffer.concat(c).toString('utf8') }));
       }
     );
-    req.on('error', (e) => resolve({ ok: false, error: e.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'TIMEOUT' }); });
+    req.on('error', (e) => finish({ ok: false, error: e.message }));
+    req.on('timeout', () => { req.destroy(); finish({ ok: false, error: 'TIMEOUT' }); });
   });
 }
 
@@ -498,8 +524,18 @@ function rawRequest(opts) {
   } = opts;
 
   return new Promise((resolve) => {
+    let settled = false;
+    let req = null;
+    let hardTimer = null;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      resolve(v);
+    };
+
     let u;
-    try { u = new URL(url); } catch (_) { return resolve({ status: 0, error: '非法 URL', text: '' }); }
+    try { u = new URL(url); } catch (_) { return finish({ status: 0, error: '非法 URL', text: '' }); }
     const lib = u.protocol === 'http:' ? http : https;
     const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8');
     const finalHeaders = Object.assign({}, headers);
@@ -514,35 +550,52 @@ function rawRequest(opts) {
       if (ck) finalHeaders.Cookie = ck;
     }
 
-    const req = lib.request(
-      {
-        hostname: u.hostname,
-        port: u.port || (u.protocol === 'http:' ? 80 : 443),
-        path: u.pathname + u.search,
-        method,
-        headers: finalHeaders,
-        agent,
-      },
-      (res) => {
-        if (jar) jar.absorb(res.headers['set-cookie']);
-        if (follow > 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          res.resume();
-          const next = new URL(res.headers.location, url).toString();
-          return resolve(rawRequest(Object.assign({}, opts, { url: next, follow: follow - 1, method: 'GET', body: null })));
-        }
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8');
-          let json = null;
-          try { json = text ? JSON.parse(text) : null; } catch (_) { /* 非 JSON */ }
-          resolve({ status: res.statusCode, headers: res.headers, text, json });
-        });
-      }
-    );
+    // 硬超时（刻意不 unref）：不依赖 socket 是否已经建立。
+    // req.setTimeout 只有 socket 就绪后才生效，一旦请求卡在代理 CONNECT / DNS / TLS 握手，
+    // 这个 promise 就永远不 settle，事件循环被抽空后 Node 会「静默」退出整只脚本
+    // （表现就是日志戛然而止 + 只打一句"任务提前结束"的汇总）。这个定时器兜住这一点。
+    hardTimer = setTimeout(() => {
+      try { if (req) req.destroy(); } catch (_) { /* 忽略 */ }
+      finish({ status: 0, error: 'TIMEOUT', text: '' });
+    }, timeout);
 
-    req.on('error', (e) => resolve({ status: 0, error: e.message, text: '' }));
-    req.setTimeout(timeout, () => { req.destroy(); resolve({ status: 0, error: 'TIMEOUT', text: '' }); });
+    try {
+      req = lib.request(
+        {
+          hostname: u.hostname,
+          port: u.port || (u.protocol === 'http:' ? 80 : 443),
+          path: u.pathname + u.search,
+          method,
+          headers: finalHeaders,
+          agent,
+        },
+        (res) => {
+          if (jar) jar.absorb(res.headers['set-cookie']);
+          if (follow > 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            let next = '';
+            try { next = new URL(res.headers.location, url).toString(); } catch (_) { /* 非法 location，按普通响应处理 */ }
+            if (next) {
+              res.resume();
+              return rawRequest(Object.assign({}, opts, { url: next, follow: follow - 1, method: 'GET', body: null })).then(finish);
+            }
+          }
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('error', (e) => finish({ status: 0, error: e.message, text: '' }));
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            let json = null;
+            try { json = text ? JSON.parse(text) : null; } catch (_) { /* 非 JSON */ }
+            finish({ status: res.statusCode, headers: res.headers, text, json });
+          });
+        }
+      );
+    } catch (e) {
+      return finish({ status: 0, error: e.message, text: '' });
+    }
+
+    req.on('error', (e) => finish({ status: 0, error: e.message, text: '' }));
+    req.setTimeout(timeout, () => { req.destroy(); finish({ status: 0, error: 'TIMEOUT', text: '' }); });
     if (payload) req.write(payload);
     req.end();
   });
@@ -1259,7 +1312,8 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
   const prefix = `[${index + 1}/${total}]${account.remark ? `[${account.remark}]` : ''}`;
   const task = {
     jar: new CookieJar(),
-    log: (m) => LOG(`${prefix} ${m}`),
+    // 账号被判超时放弃后，它残留的异步流程不再输出日志，避免和后续账号的日志串在一起
+    log: (m) => { if (!account.__abandoned) LOG(`${prefix} ${m}`); },
   };
   const row = {
     index: index + 1,
@@ -1332,6 +1386,9 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
   try {
     await daily.refreshPoints();
   } catch (e) { VLOG(`   汇总前刷新积分失败：${e.message}`); }
+
+  // 已被判超时放弃的账号：不要再回头改汇总行（那时这一行早就按「超时跳过」记好了）
+  if (account.__abandoned) return false;
 
   row.before = task.pointsBefore != null ? task.pointsBefore : null;
   row.after = daily.points != null ? daily.points : (task.pointsAfter != null ? task.pointsAfter : null);
@@ -1447,45 +1504,70 @@ async function main() {
   LOG(`🎉 顺丰速运任务启动，共 ${accounts.length} 个账号`);
 
   let ok = 0;
-  for (let i = 0; i < accounts.length; i++) {
-    // 多账号互刷邀请：用「上一个已登录账号」的 _login_user_id_ 当邀请人
-    let inviterId = '';
-    if (accounts.length >= 2) {
-      const prev = accounts[(i + accounts.length - 1) % accounts.length];
-      if (prev !== accounts[i]) inviterId = prev._uid || '';
-    }
-    try {
-      // 单个账号设上限：偶发「请求 promise 永不 settle」会把整个脚本挂到事件循环清空，
-      // 表现为日志戛然而止、连汇总都没有。加超时后至少能继续跑后面的账号。
-      let timer = null;
-      const timeout = new Promise((r) => {
-        timer = setTimeout(() => r('__timeout__'), ACCOUNT_TIMEOUT);
-        if (timer.unref) timer.unref();
-      });
-      const result = await Promise.race([
-        runAccount(accounts[i], i, accounts.length, proxyPool, inviterId),
-        timeout,
-      ]);
-      if (timer) clearTimeout(timer);
-      if (result === '__timeout__') {
-        LOG(`[${i + 1}/${accounts.length}] ⏱️ 处理超时（>${Math.round(ACCOUNT_TIMEOUT / 1000)}s），跳过该账号`);
-        const row = SUMMARY[SUMMARY.length - 1];
-        if (row && row.index === i + 1 && !row.ok) row.note = row.note || '处理超时';
-      } else if (result) {
-        ok++;
+
+  // —— 保活 + 兜底看门狗 ——
+  // 保活：脚本还在跑的时候，绝不允许事件循环被抽空。否则 Node 会判定"没有待办"→
+  //      触发 beforeExit → 直接 exit 0，后面的账号一个都不跑（这就是本次的现场）。
+  const keepAlive = setInterval(() => {}, 30000);
+  // 看门狗：万一所有请求都不返回，最多 accounts×单账号上限 + 60s 就强制收尾，
+  //        至少把已完成账号的汇总打出来，且不让青龙任务挂死
+  const watchdogMs = accounts.length * ACCOUNT_TIMEOUT + 60000;
+  const watchdog = setTimeout(() => {
+    accounts.forEach((a) => { a.__abandoned = true; });
+    printPointsSummaryOnce(`\n⏱️ 总耗时超过 ${Math.round(watchdogMs / 1000)}s（疑似多个账号请求不返回），强制结束。以下是已完成账号的汇总：`);
+    try { $.done(); } catch (_) { /* 忽略 */ }
+    process.exit(0);
+  }, watchdogMs);
+
+  try {
+    for (let i = 0; i < accounts.length; i++) {
+      // 多账号互刷邀请：用「上一个已登录账号」的 _login_user_id_ 当邀请人
+      let inviterId = '';
+      if (accounts.length >= 2) {
+        const prev = accounts[(i + accounts.length - 1) % accounts.length];
+        if (prev !== accounts[i]) inviterId = prev._uid || '';
       }
-    } catch (e) {
-      LOG(`[${i + 1}/${accounts.length}] ❌ 异常：${e.message}`);
-      const row = SUMMARY[SUMMARY.length - 1];
-      if (row && row.index === i + 1 && !row.ok) row.note = row.note || `异常：${crop(e.message, 40)}`;
+      try {
+        // 单个账号设上限：偶发「请求 promise 永不 settle」会把整个脚本挂到事件循环清空，
+        // 表现为日志戛然而止、连汇总都没有。加超时后至少能继续跑后面的账号。
+        //
+        // ⚠️ 这个定时器绝对不能 unref()！unref 之后它就不再撑住事件循环，
+        //    一旦某请求卡死且底层没有存活句柄，Node 会立刻触发 beforeExit 退出进程，
+        //    定时器根本没机会 fire —— 于是"跳过该账号、继续下一个"完全失效。
+        let timer = null;
+        const timeout = new Promise((r) => {
+          timer = setTimeout(() => r('__timeout__'), ACCOUNT_TIMEOUT);
+        });
+        const result = await Promise.race([
+          runAccount(accounts[i], i, accounts.length, proxyPool, inviterId),
+          timeout,
+        ]);
+        if (timer) clearTimeout(timer);
+        if (result === '__timeout__') {
+          accounts[i].__abandoned = true;
+          LOG(`[${i + 1}/${accounts.length}] ⏱️ 处理超时（>${Math.round(ACCOUNT_TIMEOUT / 1000)}s），跳过该账号，继续下一个`);
+          const row = SUMMARY[SUMMARY.length - 1];
+          if (row && row.index === i + 1 && !row.ok) row.note = row.note || '处理超时';
+        } else if (result) {
+          ok++;
+        }
+      } catch (e) {
+        accounts[i].__abandoned = true;
+        LOG(`[${i + 1}/${accounts.length}] ❌ 异常：${e.message}，跳过该账号，继续下一个`);
+        const row = SUMMARY[SUMMARY.length - 1];
+        if (row && row.index === i + 1 && !row.ok) row.note = row.note || `异常：${crop(e.message, 40)}`;
+      }
+      if (i < accounts.length - 1) await sleep(1500);
     }
-    if (i < accounts.length - 1) await sleep(1500);
+
+    LOG(`\n======🎉 完成 ${ok} / 共 ${accounts.length} 账号======`);
+
+    // 所有账号跑完后，统一输出一次积分变动汇总
+    printPointsSummaryOnce();
+  } finally {
+    clearInterval(keepAlive);
+    clearTimeout(watchdog);
   }
-
-  LOG(`\n======🎉 完成 ${ok} / 共 ${accounts.length} 账号======`);
-
-  // 所有账号跑完后，统一输出一次积分变动汇总
-  printPointsSummaryOnce();
 
   $.done();
 }
