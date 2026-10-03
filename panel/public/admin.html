@@ -379,6 +379,21 @@ function buildMeituan() {
       const r = await api('POST', '/api/admin/test/meituan');
       return ['环境就绪', 'run.js：' + r.runJs, '脚本目录：' + (r.scripts_dir || '-'), '客户端类型：' + (r.clientType || '-')];
     }),
+    node('div', { class: 'hint', text: '专家包把美团登录态缓存在一个「单槽位」文件里（同一时间只认得一个账号），所以想加账号要回首页点「➕ 扫码添加新账号」。下面两个按钮用于缓存异常时手动查看/清除。' }),
+    testButton('查看本地登录态', async () => {
+      const r = await api('GET', '/api/admin/meituan/session');
+      if (!r.hasToken) {
+        return ['当前没有缓存的登录态，下次扫码会直接出二维码', r.error ? '探测提示：' + r.error : null];
+      }
+      return ['当前缓存着 1 个美团账号', 'token：' + r.masked, '（清掉本地登录态不影响青龙里的 MT_TOKEN，脚本照样能跑）'];
+    }),
+    testButton('清除本地美团登录态', async () => {
+      const r = await api('POST', '/api/admin/meituan/logout');
+      return [
+        r.message || '已处理',
+        r.cleared ? '现在回首页扫「美团扫码」会直接出二维码' : '建议确认 run.js 版本是否支持 logout 命令',
+      ];
+    }),
     mtOut,
   ]);
 

@@ -75,7 +75,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const MODES = {
   yyb: { title: '应用宝扫码', hint: '请用手机微信扫描下方二维码，并在手机上确认登录。' },
-  meituan: { title: '美团扫码', hint: '请用美团 App 扫描下方二维码，并在手机上确认登录。' },
+  meituan: {
+    title: '美团扫码',
+    hint: '请用美团 App 扫描下方二维码，并在手机上确认登录。每个账号扫一次，会自动追加到青龙 MT_TOKEN，可以反复添加。',
+  },
 };
 
 let mode = null;
@@ -201,9 +204,9 @@ function showScan(nextMode, push) {
   startScan();
 }
 
-function startScan() {
+function startScan(forceFresh) {
   if (mode === 'yyb') startYyb();
-  else startMeituan();
+  else startMeituan(forceFresh);
 }
 
 /* ---------- 应用宝 ---------- */
@@ -288,7 +291,47 @@ async function finishYyb() {
 
 /* ---------- 美团 ---------- */
 
-async function startMeituan() {
+/**
+ * 「已有有效登录态 / 扫码成功」之后给出的追加入口。
+ *
+ * 美团 token 在官方专家包里是**单槽位**缓存文件，不清掉的话 auth-get-code 永远命中旧
+ * token，页面只会一遍遍显示「已有有效登录态」，出不来第二个二维码 ——
+ * 这就是「只能扫一个账号」的原因。所以这里必须给一个显式入口。
+ */
+function renderAddAnother() {
+  const box = document.createElement('div');
+  box.className = 'note info';
+
+  const p = document.createElement('div');
+  p.append('想再加一个账号？点下面按钮会清掉专家包里的');
+  const b = document.createElement('b');
+  b.textContent = '本地登录态';
+  p.appendChild(b);
+  p.append('，然后重新出二维码。已经写进青龙 ');
+  const code = document.createElement('code');
+  code.textContent = 'MT_TOKEN';
+  p.appendChild(code);
+  p.append(' 的账号不受影响。');
+  box.appendChild(p);
+
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.style.marginTop = '10px';
+  const btn = document.createElement('button');
+  btn.className = 'btn small';
+  btn.textContent = '➕ 扫码添加新账号';
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.textContent = '正在清除本地登录态…';
+    await startMeituan(true);
+  });
+  row.appendChild(btn);
+  box.appendChild(row);
+
+  $('result').appendChild(box);
+}
+
+async function startMeituan(forceFresh) {
   stopTimers();
   clearResult();
   $('linkBtn').style.display = 'none';
@@ -298,7 +341,7 @@ async function startMeituan() {
 
   let r;
   try {
-    r = await api('POST', '/api/meituan/start');
+    r = await api('POST', '/api/meituan/start', { fresh: !!forceFresh });
   } catch (e) {
     setStatus('获取二维码失败', 'err');
     setQr('<span style="color:#d64545">×</span>');
@@ -315,6 +358,7 @@ async function startMeituan() {
     note(kind, [text]);
     const detail = renderUploadDetail(r.upload);
     if (detail) note('info', [detail]);
+    renderAddAnother();
     return;
   }
 
@@ -361,6 +405,7 @@ async function pollMeituan() {
     note(kind, [text]);
     const detail = renderUploadDetail(st.upload);
     if (detail) note('info', [detail]);
+    renderAddAnother();
     return;
   }
 }
