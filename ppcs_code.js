@@ -47,6 +47,11 @@ new Env('朴朴超市Code版')
                         零依赖实现（自建 CONNECT 隧道），不需要额外 npm 包。
    yyb_auto_refresh     默认 1。账号状态非 alive 时自动 /accounts/refresh 续期
    yyb_skip_expired     默认 1。续期后仍为 expired 的账号直接跳过
+   yyb_script_key       本脚本在网关账号上的标记 key，默认 ppcs。账号的 scripts 标记里
+                        没有它就不跑这个账号（标记为空 = 不限制，所有脚本都跑）。
+                        在扫码面板「应用宝账号」页勾选即可，不用手填。
+   yyb_tag_filter       默认 1（按标记过滤）。设 0 则忽略标记跑全部账号
+                        —— 只影响「自动拉取」写法二/三；显式写了 @ref 时以你写的为准
    ppcs_version_check   默认 0。设为 1 时启用远端版本检查（联网慢的环境别开）
 
 4. 账号 ref 说明：
@@ -85,6 +90,12 @@ const YYB_SERVER = process.env.YYB_SERVER || process.env.yyb_server || "";
 // 方式二（兼容旧版）：wx_server_url + ppcs_openid
 const WX_SERVER_URL = process.env.wx_server_url || process.env.WX_SERVER_URL || "";
 const PPCS_OPENID = process.env.ppcs_openid || process.env.PPCS_OPENID || "";
+
+// 「这个账号要不要跑本脚本」由网关账号上的标记决定（面板「应用宝账号」页勾选）。
+// 标记为空 = 不限制；YYB_SERVER 里显式写了 @ref 时不做过滤（你写谁就跑谁）。
+// 注：名字不能叫 SCRIPT_KEY —— 上面那个 SCRIPT_KEY 是远端版本检查用的 key。
+const YYB_SCRIPT_KEY = String(process.env.yyb_script_key || "ppcs").trim().toLowerCase();
+const YYB_TAG_FILTER = String(process.env.yyb_tag_filter ?? "1") !== "0";
 
 // 可选开关
 const AUTO_REFRESH = (process.env.yyb_auto_refresh ?? "1") !== "0";
@@ -1298,9 +1309,30 @@ function accountLabel(acc) {
   return "#" + acc.id + " " + nick;
 }
 
+/**
+ * 账号上的脚本标记（scripts，逗号分隔）是否允许跑本脚本。
+ *
+ * 语义（三只脚本一致）：
+ *   · 没标记          → 允许（默认行为：所有脚本都跑它）
+ *   · 标记里有本 key  → 允许
+ *   · 标记里没有本 key → 跳过
+ * 关掉过滤：环境变量 yyb_tag_filter=0。
+ */
+function tagAllows(acc) {
+  if (!YYB_TAG_FILTER) return true;
+  const tags = String((acc && acc.scripts) || "")
+    .split(/[,，;；\s]+/)
+    .map(s => s.trim().toLowerCase())
+    .filter(s => s);
+  if (tags.length === 0) return true;
+  return tags.indexOf(YYB_SCRIPT_KEY) !== -1;
+}
+
 async function loadAccounts() {
   let entries = [];   // { wxServerUrl, ref, remark }
   let serverLine = YYB_SERVER.trim();
+  let filtered = 0;   // 被脚本标记过滤掉的账号数
+  let discovered = 0; // 网关里 alive 的账号总数
 
   if (serverLine) {
     for (let item of splitMulti(serverLine)) {
@@ -1332,6 +1364,12 @@ async function loadAccounts() {
           continue;
         }
         for (let acc of accounts) {
+          discovered++;
+          if (!tagAllows(acc)) {
+            filtered++;
+            CommonUtils.log("⏭️ 跳过账号 " + accountLabel(acc) + "：脚本标记 [" + String(acc.scripts || "").trim() + "] 不含本脚本 [" + YYB_SCRIPT_KEY + "]");
+            continue;
+          }
           let status = acc.status || "unknown";
           if (status !== "alive" && AUTO_REFRESH) {
             status = await refreshGatewayAccount(host, acc.id);
@@ -1365,6 +1403,11 @@ async function loadAccounts() {
   if (entries.length === 0) {
     CommonUtils.log("❌ 没有解析到有效的 YYB 网关账号");
     return false;
+  }
+
+  if (filtered) {
+    CommonUtils.log("ℹ️ 按脚本标记过滤掉 " + filtered + " 个账号（本脚本 key=" + YYB_SCRIPT_KEY + "，共 " + discovered + " 个 alive）");
+    CommonUtils.log("   想让它跑：面板「应用宝账号」页把朴朴勾上；或临时设 yyb_tag_filter=0 忽略标记");
   }
 
   // 去重（同网关 + 同 ref 只跑一次）
