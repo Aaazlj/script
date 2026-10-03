@@ -15,6 +15,11 @@ new Env('顺丰速运')
                    —— 脚本用 POST {yyb_server}/wxapp/getCode 取 code
   wx_server_url    兼容变量：网关地址（yyb_server 为空时生效，请求方式相同）
   sfsyUrl / sf     兼容变量：直接给 Cookie 串或登录 URL（不经过网关）
+  yyb_script_key   本脚本在网关账号上的标记 key，默认 sfsy。账号的 scripts 标记里
+                   没有它就不跑这个账号（标记为空 = 不限制，所有脚本都跑）。
+                   在扫码面板「应用宝账号」页勾选即可，不用手填。
+  yyb_tag_filter   默认 1（按标记过滤）。设 0 则忽略标记跑全部账号
+                   —— 只影响「网关自动发现」；显式写了 sf_openid / @ref 时以你写的为准
 
   代理（可选，海外服务器访问国内接口必配）：
   sf_proxy          静态代理地址，形如 http://user:pass@host:port（也可用 script_proxy，与朴朴脚本共用）
@@ -128,6 +133,10 @@ const ENV = (k) => String(process.env[k] || '').trim();
 
 const SF_OPENID = ENV('sf_openid');
 const YYB_SERVER = (ENV('yyb_server') || ENV('wx_server_url')).replace(/\/+$/, '');
+// 「这个账号要不要跑本脚本」由网关账号上的标记决定（面板「应用宝账号」页勾选）。
+// 标记为空 = 不限制；显式写了 sf_openid / @ref 时不做过滤（你写谁就跑谁）。
+const SCRIPT_KEY = (ENV('yyb_script_key') || 'sfsy').toLowerCase();
+const TAG_FILTER = (ENV('yyb_tag_filter') || '1') !== '0';
 const RAW_COOKIE_ENV = ENV('sfsyUrl') || ENV('sf');
 const STATIC_PROXY = ENV('sf_proxy') || ENV('script_proxy');
 // 粘性出口（树脂 Resin 的 Account 特性）：sf_proxy_sticky=1 时给每个账号绑一个固定出口，
@@ -1468,14 +1477,45 @@ async function discoverGatewayAccounts() {
   }
 
   const out = [];
+  let filtered = 0;
   for (const a of alive) {
     const openid = String(a.openid || a.id || '');
-    if (openid) out.push({ openid, remark: String(a.nickname || a.alias || ''), raw: openid });
+    if (!openid) continue;
+    const remark = String(a.nickname || a.alias || '');
+    if (!tagAllows(a)) {
+      filtered++;
+      LOG(`⏭️ 跳过「${remark || openid.slice(0, 8)}」：脚本标记 [${String(a.scripts || '').trim()}] 不含本脚本 [${SCRIPT_KEY}]`);
+      continue;
+    }
+    out.push({ openid, remark, raw: openid });
+  }
+  if (filtered) {
+    LOG(`ℹ️ 按脚本标记过滤掉 ${filtered} 个账号（本脚本 key=${SCRIPT_KEY}，共 ${alive.length} 个 alive）`);
+    LOG('   想让它跑：面板「应用宝账号」页把顺丰勾上；或临时设 yyb_tag_filter=0 忽略标记');
   }
   if (out.length) {
     LOG(`🌐 已自动从网关发现 ${out.length} 个账号: ${out.map((a) => a.remark || a.openid.slice(0, 8)).join('、')}`);
   }
   return out;
+}
+
+/**
+ * 账号上的脚本标记（scripts，逗号分隔）是否允许跑本脚本。
+ *
+ * 语义（三只脚本一致）：
+ *   · 没标记          → 允许（默认行为：所有脚本都跑它）
+ *   · 标记里有本 key  → 允许
+ *   · 标记里没有本 key → 跳过
+ * 关掉过滤：环境变量 yyb_tag_filter=0。
+ */
+function tagAllows(acc) {
+  if (!TAG_FILTER) return true;
+  const tags = String((acc && acc.scripts) || '')
+    .split(/[,，;；\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!tags.length) return true;
+  return tags.includes(SCRIPT_KEY);
 }
 
 /* ==================== 主流程 ==================== */

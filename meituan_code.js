@@ -33,6 +33,12 @@ cron: 0 10 * * *
                                                    多个用 &、英文/中文逗号、空格或换行分隔
      - 不配置时自动从网关拉全部 alive 账号（面板里新扫码的账号下次运行自动生效）
      - 优先级：mt_openid > yyb_server 里的 @ref > 网关自动发现
+   yyb_script_key                                  本脚本在网关账号上的标记 key，默认 mt。
+                                                   账号的 scripts 标记里没有它就不跑这个账号
+                                                   （标记为空 = 不限制，所有脚本都跑）。
+                                                   在扫码面板「应用宝账号」页勾选即可，不用手填。
+   yyb_tag_filter                                  默认 1（按标记过滤）。设 0 则忽略标记跑全部账号
+     - 只影响「网关自动发现」这条路径；显式写了 mt_openid / @ref 时以你写的为准
 
 2. 签名服务（用默认值即可，无需配置）：
    mt_sign_url                                     默认 http://panel:5180/api/meituan/sign
@@ -181,6 +187,11 @@ const GATEWAY = (() => {
 })();
 
 const MT_OPENIDS = env('mt_openid').split(/[&,，\s]+/).map((s) => s.trim()).filter(Boolean);
+
+// 「这个账号要不要跑本脚本」由网关账号上的标记决定（面板「应用宝账号」页勾选）。
+// 标记为空 = 不限制；显式写了 mt_openid / @ref 时不做过滤（你写谁就跑谁）。
+const SCRIPT_KEY = (env('yyb_script_key') || 'mt').toLowerCase();
+const TAG_FILTER = (env('yyb_tag_filter') || '1').toLowerCase() !== '0';
 
 const MT_PROXY = env('mt_proxy', 'MT_PROXY', 'script_proxy', 'SCRIPT_PROXY');
 const PROXY_TYPE = (env('mt_proxy_type') || 'http').toLowerCase();
@@ -538,6 +549,25 @@ async function refreshGatewayAccount(ref) {
 }
 
 /**
+ * 账号上的脚本标记（scripts，逗号分隔）是否允许跑本脚本。
+ *
+ * 语义（三只脚本一致）：
+ *   · 没标记          → 允许（默认行为：所有脚本都跑它）
+ *   · 标记里有本 key  → 允许
+ *   · 标记里没有本 key → 跳过
+ * 关掉过滤：环境变量 yyb_tag_filter=0。
+ */
+function tagAllows(acc) {
+  if (!TAG_FILTER) return true;
+  const tags = String((acc && acc.scripts) || '')
+    .split(/[,，;；\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!tags.length) return true;
+  return tags.includes(SCRIPT_KEY);
+}
+
+/**
  * 解析要跑的账号 [{ref, label}]。
  * 优先级：mt_openid > yyb_server 里的 @ref > 自动拉网关全部 alive 账号。
  * 自动发现一个 alive 都没有时，先给所有账号续期再重拉一次。
@@ -556,11 +586,22 @@ async function resolveAccounts() {
   }
 
   const out = [];
+  let filtered = 0;
   for (const a of alive) {
     const ref = String(a.openid || a.id || '');
     if (!ref) continue;
     const label = String(a.nickname || a.alias || '').trim();
-    out.push({ ref, label: label && label !== '-' ? label : ref });
+    const name = label && label !== '-' ? label : ref;
+    if (!tagAllows(a)) {
+      filtered++;
+      $.log(`⏭️ [账号] 跳过「${name}」：脚本标记 [${String(a.scripts || '').trim()}] 不含本脚本 [${SCRIPT_KEY}]`);
+      continue;
+    }
+    out.push({ ref, label: name });
+  }
+  if (filtered) {
+    $.log(`ℹ️ [账号] 按脚本标记过滤掉 ${filtered} 个账号（本脚本 key=${SCRIPT_KEY}，共 ${alive.length} 个 alive）`);
+    $.log('   想让它跑：面板「应用宝账号」页把美团勾上；或临时设 yyb_tag_filter=0 忽略标记');
   }
   return out;
 }
