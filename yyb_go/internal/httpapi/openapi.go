@@ -165,6 +165,17 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			"/accounts/scripts": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"设置账号要跑哪些脚本",
+					nil,
+					jsonRequestBody(refSchema("AccountsScriptsRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("保存后的账号列表。", refSchema("AccountsMutationResponse")),
+					}),
+				),
+			},
 			"/wxapp/getCode": map[string]any{
 				"post": openAPIOperation(
 					[]string{"wxapp"},
@@ -236,6 +247,7 @@ func newOpenAPISpec() map[string]any {
 					"user_info":    nullableObjectSchema("微信资料（nick_name / head_img_url 等）。"),
 					"login_buffer": map[string]any{"type": "string", "description": "登录态 buffer，导入时必填。"},
 					"credentials":  nullableObjectSchema("access / refresh token 等凭据。"),
+					"scripts":      nullableStringSchema("该账号要跑哪些脚本，逗号分隔（如 mt,sfsy）；空表示不限制。"),
 				}),
 				"AccountsImportRequest": objectSchema(nil, map[string]any{
 					"accounts": arraySchema(refSchema("ExportAccount")),
@@ -250,6 +262,14 @@ func newOpenAPISpec() map[string]any {
 					"skipped":  arraySchema(freeFormObjectSchema("被跳过的账号及原因。")),
 					"accounts": arraySchema(refSchema("AccountPublic")),
 				}),
+				"AccountsScriptsRequest": objectSchema(nil, map[string]any{
+					"ref":     map[string]any{"type": "string", "description": "单个设置时的账号 ref（ID / UIN / openid）。"},
+					"scripts": nullableStringSchema("逗号分隔的脚本 key，如 mt,sfsy,ppcs；空串表示不限制（所有脚本都跑）。"),
+					"items": arraySchema(objectSchema([]string{"ref"}, map[string]any{
+						"ref":     map[string]any{"type": "string"},
+						"scripts": nullableStringSchema("该账号的脚本标记，空串表示不限制。"),
+					})),
+				}),
 				"AccountPublic": objectSchema([]string{"id", "openid", "created_at", "updated_at"}, map[string]any{
 					"id":              int64Schema(),
 					"openid":          map[string]any{"type": "string"},
@@ -258,6 +278,7 @@ func newOpenAPISpec() map[string]any {
 					"nickname":        nullableStringSchema("账号昵称。"),
 					"avatar":          nullableStringSchema("本地头像路径或远程头像 URL。"),
 					"status":          nullableStringSchema("账号状态。"),
+					"scripts":         nullableStringSchema("该账号要跑哪些脚本，逗号分隔；空表示不限制。"),
 					"last_checked_at": nullableInt64Schema(),
 					"created_at":      int64Schema(),
 					"updated_at":      int64Schema(),

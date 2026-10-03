@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS wechat_accounts (
     login_buffer    TEXT    NOT NULL,
     credentials     TEXT,
     status          TEXT,
+    scripts         TEXT,
     sort_order      INTEGER NOT NULL DEFAULT 0,
     last_checked_at INTEGER,
     created_at      INTEGER NOT NULL,
@@ -76,6 +77,7 @@ type WechatAccount struct {
 	LoginBuffer   string         `json:"login_buffer,omitempty"`
 	Credentials   map[string]any `json:"credentials,omitempty"`
 	Status        *string        `json:"status,omitempty"`
+	Scripts       *string        `json:"scripts,omitempty"`
 	LastCheckedAt *int64         `json:"last_checked_at,omitempty"`
 	CreatedAt     int64          `json:"created_at"`
 	UpdatedAt     int64          `json:"updated_at"`
@@ -89,6 +91,7 @@ type AccountPublic struct {
 	Nickname      *string `json:"nickname"`
 	Avatar        *string `json:"avatar"`
 	Status        *string `json:"status"`
+	Scripts       *string `json:"scripts"`
 	LastCheckedAt *int64  `json:"last_checked_at"`
 	CreatedAt     int64   `json:"created_at"`
 	UpdatedAt     int64   `json:"updated_at"`
@@ -144,6 +147,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = ensureSortOrderColumn(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = ensureScriptsColumn(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -225,6 +232,52 @@ func ensureSortOrderColumn(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	return normalizeSortOrder(ctx, db)
+}
+
+// ensureScriptsColumn 给老库补上 scripts 列（新库建表时已有）
+func ensureScriptsColumn(ctx context.Context, db *sql.DB) error {
+	has, err := sqliteColumnExists(ctx, db, "wechat_accounts", "scripts")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, "ALTER TABLE wechat_accounts ADD COLUMN scripts TEXT")
+	return err
+}
+
+// NormalizeScripts 把「跑哪些脚本」的标记规整成 `key,key` 形式：
+// 逗号 / 分号 / 空白都能当分隔符，统一小写、去重、保持先后顺序。
+// 返回空串表示「不限制」——所有脚本都会跑这个账号。
+func NormalizeScripts(raw string) string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		switch r {
+		case ',', ';', '，', '；', ' ', '\t', '\n', '\r':
+			return true
+		}
+		return false
+	})
+	seen := make(map[string]bool, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		k := strings.ToLower(strings.TrimSpace(f))
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return strings.Join(out, ",")
+}
+
+// SetAccountScripts 设置账号的脚本标记（空串 = 清除标记，恢复「所有脚本都跑」）
+func (db *DB) SetAccountScripts(ctx context.Context, id int64, scripts string) error {
+	_, err := db.sql.ExecContext(ctx,
+		"UPDATE wechat_accounts SET scripts=?, updated_at=? WHERE id=?",
+		NormalizeScripts(scripts), time.Now().Unix(), id,
+	)
+	return err
 }
 
 // normalizeSortOrder 把 sort_order 统一编号成 1..N。
@@ -499,6 +552,7 @@ func (a *WechatAccount) Public() AccountPublic {
 		Nickname:      a.Nickname,
 		Avatar:        a.Avatar,
 		Status:        a.Status,
+		Scripts:       a.Scripts,
 		LastCheckedAt: a.LastCheckedAt,
 		CreatedAt:     a.CreatedAt,
 		UpdatedAt:     a.UpdatedAt,
@@ -518,6 +572,9 @@ type ExportAccount struct {
 	UserInfo    map[string]any `json:"user_info"`
 	LoginBuffer string         `json:"login_buffer"`
 	Credentials map[string]any `json:"credentials"`
+	// Scripts 是「这个账号要跑哪些脚本」的逗号分隔标记，空/缺省 = 不限制。
+	// 导出时带上，导入时不传就保留库里的原值（见 UpsertFullAccount 的 COALESCE）。
+	Scripts *string `json:"scripts,omitempty"`
 }
 
 // Export 把账号转成可跨工具导入的结构
@@ -531,6 +588,7 @@ func (a *WechatAccount) Export() ExportAccount {
 		UserInfo:    a.UserInfo,
 		LoginBuffer: a.LoginBuffer,
 		Credentials: a.Credentials,
+		Scripts:     a.Scripts,
 	}
 }
 
@@ -583,6 +641,10 @@ func NormalizeImport(raw map[string]any) (*ExportAccount, error) {
 		UserInfo:    coerceMap(raw["user_info"]),
 		Credentials: coerceMap(raw["credentials"]),
 	}
+	if rawScripts, ok := raw["scripts"]; ok {
+		normalized := NormalizeScripts(coerceString(rawScripts))
+		out.Scripts = &normalized
+	}
 	if out.Nickname == nil {
 		if ui := coerceMap(raw["user_info"]); ui != nil {
 			if s := coerceStringPtr(ui["nick_name"]); s != nil {
@@ -616,8 +678,8 @@ func (db *DB) UpsertFullAccount(ctx context.Context, a *ExportAccount) (bool, er
 	now := time.Now().Unix()
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO wechat_accounts
-		(openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, sort_order, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order), 0) + 1 FROM wechat_accounts),?,?)
+		(openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, scripts, sort_order, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order), 0) + 1 FROM wechat_accounts),?,?)
 		ON CONFLICT(openid) DO UPDATE SET
 			uin=COALESCE(excluded.uin, wechat_accounts.uin),
 			alias=COALESCE(excluded.alias, wechat_accounts.alias),
@@ -627,9 +689,10 @@ func (db *DB) UpsertFullAccount(ctx context.Context, a *ExportAccount) (bool, er
 			login_buffer=excluded.login_buffer,
 			credentials=COALESCE(excluded.credentials, wechat_accounts.credentials),
 			status=wechat_accounts.status,
+			scripts=COALESCE(excluded.scripts, wechat_accounts.scripts),
 			updated_at=excluded.updated_at`,
 		a.OpenID, nullableInt(a.UIN), nullableString(a.Alias), nullableString(a.Nickname),
-		nullableString(a.Avatar), userJSON, a.LoginBuffer, credJSON, nil, now, now,
+		nullableString(a.Avatar), userJSON, a.LoginBuffer, credJSON, nil, nullableString(a.Scripts), now, now,
 	)
 	if err != nil {
 		return false, err
@@ -790,7 +853,7 @@ func coerceMap(v any) map[string]any {
 	return nil
 }
 
-const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at FROM wechat_accounts`
+const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, scripts, last_checked_at, created_at, updated_at FROM wechat_accounts`
 
 type accountScanner interface {
 	Scan(dest ...any) error
@@ -810,11 +873,11 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 		uin, lastChecked        sql.NullInt64
 		alias, nickname, avatar sql.NullString
 		userJSON, credJSON      sql.NullString
-		status                  sql.NullString
+		status, scripts         sql.NullString
 	)
 	err := row.Scan(
 		&a.ID, &a.OpenID, &uin, &alias, &nickname, &avatar, &userJSON,
-		&a.LoginBuffer, &credJSON, &status, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
+		&a.LoginBuffer, &credJSON, &status, &scripts, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -826,6 +889,7 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	a.Nickname = stringPtrFromNull(nickname)
 	a.Avatar = stringPtrFromNull(avatar)
 	a.Status = stringPtrFromNull(status)
+	a.Scripts = stringPtrFromNull(scripts)
 	if lastChecked.Valid {
 		a.LastCheckedAt = &lastChecked.Int64
 	}

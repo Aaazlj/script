@@ -129,6 +129,7 @@ func (a *App) Handler() http.Handler {
 	router.Any("/accounts/export", gin.WrapF(a.handleAccountsExport))
 	router.Any("/accounts/import", gin.WrapF(a.handleAccountsImport))
 	router.Any("/accounts/order", gin.WrapF(a.handleAccountsOrder))
+	router.Any("/accounts/scripts", gin.WrapF(a.handleAccountsScripts))
 	router.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
 	router.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
 	router.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
@@ -476,6 +477,83 @@ func (a *App) handleAccountsOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := a.writeAccountList(r.Context(), map[string]any{"ordered": ordered})
+	writeJSON(w, http.StatusOK, out)
+}
+
+// accountScriptsIn 是 POST /accounts/scripts 的入参，支持两种写法：
+//
+//	单个： {"ref":"1","scripts":"mt,sfsy"}
+//	批量： {"items":[{"ref":"1","scripts":"mt"},{"ref":"2","scripts":""}]}
+//
+// scripts 传空串表示清除标记 —— 该账号恢复成「所有脚本都跑它」；
+// 字段缺省（null）表示不动这一项。
+type accountScriptsIn struct {
+	Ref     string               `json:"ref"`
+	Scripts *string              `json:"scripts"`
+	Items   []accountScriptsItem `json:"items"`
+}
+
+type accountScriptsItem struct {
+	Ref     string  `json:"ref"`
+	Scripts *string `json:"scripts"`
+}
+
+// POST /accounts/scripts —— 设置账号的「跑哪些脚本」标记。
+//
+// 标记是逗号分隔的脚本 key（如 mt,sfsy,ppcs），落在账号表上，
+// 由各个脚本自己拉 /accounts 时按 key 过滤：标记为空 = 不限制。
+func (a *App) handleAccountsScripts(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/accounts/scripts" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body accountScriptsIn
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	items := body.Items
+	if len(items) == 0 && strings.TrimSpace(body.Ref) != "" {
+		items = []accountScriptsItem{{Ref: body.Ref, Scripts: body.Scripts}}
+	}
+	if len(items) == 0 {
+		writeError(w, http.StatusBadRequest, "缺少 ref 或 items")
+		return
+	}
+
+	updated := 0
+	skipped := make([]map[string]any, 0)
+	for _, item := range items {
+		ref := strings.TrimSpace(item.Ref)
+		if ref == "" {
+			skipped = append(skipped, map[string]any{"ref": item.Ref, "reason": "ref 为空"})
+			continue
+		}
+		acc, err := a.db.ResolveAccount(r.Context(), ref)
+		if err != nil {
+			reason := err.Error()
+			if errors.Is(err, sql.ErrNoRows) {
+				reason = "未找到账号: " + ref
+			}
+			skipped = append(skipped, map[string]any{"ref": ref, "reason": reason})
+			continue
+		}
+		value := ""
+		if item.Scripts != nil {
+			value = *item.Scripts
+		}
+		if err := a.db.SetAccountScripts(r.Context(), acc.ID, value); err != nil {
+			skipped = append(skipped, map[string]any{"ref": ref, "reason": err.Error()})
+			continue
+		}
+		updated++
+	}
+
+	out := a.writeAccountList(r.Context(), map[string]any{"updated": updated, "skipped": skipped})
 	writeJSON(w, http.StatusOK, out)
 }
 
