@@ -7,8 +7,10 @@
  *
  * 做法：面板容器本来就挂载了美团专家包（/opt/meituan-expert），其中自带
  * vendor/cliguard/js/cliguard.js —— 这里把它加载进来，暴露成
- * POST /api/meituan/sign，给青龙里跑的 mt_code.py 借用。
- * （meituan_coupon.js 则是同目录 opportunistic 加载，两不耽误。）
+ * POST /api/meituan/sign，给青龙里跑的 meituan_code.js 借用
+ * （其默认 mt_sign_url = http://panel:5180/api/meituan/sign）。
+ *
+ * 注意：面板不依赖专家包做美团扫码登录，只借它的 cliguard.js 做签名。
  *
  * 只用 Node 内置模块，零第三方依赖。
  */

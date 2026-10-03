@@ -1,11 +1,16 @@
 # 扫码登录面板
 
-把「应用宝扫码」和「美团扫码」合成一个页面：普通用户选一个平台扫码，登录成功后凭据**自动写进青龙面板**。
+把「应用宝扫码」做成一个页面：普通用户扫码，账号存进你自己的应用宝网关（脚本运行时自动发现，不用改青龙配置）。
 
 - 普通用户入口：`/`
 - 管理后台：`/admin`（首次打开引导设置密码）
 
 零第三方依赖，只用 Node 内置模块。
+
+> **美团登录已不在面板里做了。** 青龙里直接跑 `meituan_code.js`：它用应用宝网关
+> （`yyb_server`）换微信 code → `open.meituan.com` 换 token → 领券，全程不需要任何扫码面板。
+> 面板只剩一个美团相关能力：给脚本提供 **mtgsig 签名**（`POST /api/meituan/sign`，
+> 签名算法在美团自家的 cliguard.js 里，Node 复刻不了，只能借专家包）。
 
 ---
 
@@ -14,38 +19,26 @@
 | 通道 | 扫码方式 | 写入青龙的变量 | 取值来源 |
 |------|----------|----------------|----------|
 | 应用宝 | 微信扫码 yyb_go 网关的二维码 | `yyb_server` | 后台配置的「写入青龙的地址」，默认 `http://yyb-go:8000` |
-| 美团 | 美团 App 扫官方专家包生成的二维码 | `MT_TOKEN` | 扫码拿到的 token，多账号**按行追加**，已存在则跳过 |
+| 美团 | **不再扫码**（青龙里跑 `meituan_code.js`，走应用宝网关换 token） | 无 | 账号来自网关，与上述应用宝账号同一批 |
 
 > 应用宝这条链路不重写 yyb_go 的 mmtls 协议，而是由面板服务端代理它已有的 `/qr` 接口，
 > 扫到账号后仍存在 yyb_go 自己的库里，面板只负责把网关地址告诉青龙。
 
 ---
 
-## 美团多账号（重要）
+## 美团：为什么不用扫码了
 
-美团 token 走的是官方专家包的 `run.js`，它把登录态缓存在**一个固定路径的单槽位文件**里：
+以前美团 token 来自官方专家包 `run.js` 的扫码登录，token 写进青龙 `MT_TOKEN`。现在这条路已经废掉：
 
-```
-~/.workbuddy/credentials/meituan-living-deals-assistant/pt_passport_auth.json
-（容器里映射到 ./data/meituan-auth，键固定是 <client_id>@prod）
-```
+- 面板不再调用 `run.js`，也不再写 `MT_TOKEN`；
+- 青龙里改成跑 `meituan_code.js`，用 `yyb_server` 指向的应用宝网关拿微信 code，
+  再调 `open.meituan.com/user/v1/weapplogin` 换 token，每次运行都重新换，无需手工维护 token；
+- 实测网关换出来的 token 和扫码 token 是同一套鉴权，`media.meituan.com` 的券接口都认。
 
-也就是说专家包同一时间只认得**一个**美团账号。后果是：
-
-- 扫过第一个账号之后，`auth-get-code` 每次都命中缓存，直接返回 `type:"token"`；
-- 面板于是每次都显示「✓ 已有有效登录态」，**再也出不来第二个二维码**。
-
-所以「再加一个账号」必须先把槽位清掉，再重新取授权链接。页面上对应：
-
-1. 点「美团扫码」→ 若已有登录态，右侧会显示 **「➕ 扫码添加新账号」**；
-2. 点它会先调用 `run.js logout` 清掉本地登录态，再出二维码（**只清专家包的本地缓存，
-   已经写进青龙 `MT_TOKEN` 的账号不受影响**，脚本照常跑）；
-3. 用另一个美团账号扫完，token 会作为新的一行追加进 `MT_TOKEN`。
-
-反复执行 2、3 即可挂上任意多个账号；`meituan_coupon.js` 本来就按行解析 `MT_TOKEN`，无需改配置。
-
-> 缓存异常（清不掉、或想强制回到未登录状态）时，可到 `/admin` → 美团扫码 →
-> 「查看本地登录态」/「清除本地美团登录态」手动处理。
+面板保留的只有签名服务：`media.meituan.com/fulishemini/*` 从 2026-09 起强制校验
+`mtgsig` 头，没有签名一律 403。签名算法在美团自家的混淆 JS（`cliguard.js`）里，
+所以面板容器仍然挂载专家包，把它加载进来对外提供 `POST /api/meituan/sign`。
+青龙里的脚本用 `mt_sign_url`（默认 `http://panel:5180/api/meituan/sign`）调它。
 
 ---
 
@@ -63,10 +56,9 @@ docker compose up -d --build
    （青龙后台 → 系统设置 → 应用设置 → 新建应用）
    容器里默认地址已填好 `http://qinglong-web-1:5700`，点「测试连接」应能读到面板版本。
 2. **应用宝网关**：默认 `http://yyb-go:8000`（compose 内网服务名），点「测试连通」。
-3. **美团**：run.js 路径默认 `/opt/meituan-expert/scripts/run.js`，点「环境自检」。
 
 配置项保存在 `data/panel/config.json`（0600），密码用 scrypt 加盐哈希。
-美团的登录态落在 `data/meituan-auth/`，容器重建也不用重新扫码。
+`/admin` 里的「美团签名服务」面板可以检查 cliguard 是否加载成功（签名服务是否可用）。
 
 ### 网络是怎么打通的
 
@@ -222,8 +214,7 @@ node server.js                 # 默认 0.0.0.0:5180
 node server.js --port 5181     # 换端口
 ```
 
-依赖外部服务：`yyb_go`（应用宝）与官方专家包 `run.js`（美团）。
-缺哪个，对应的那个通道会在页面上给出明确提示，另一个通道不受影响。
+依赖外部服务：`yyb_go`（应用宝）。缺哪个，对应通道会在页面上给出明确提示。
 
 ---
 
@@ -236,8 +227,7 @@ node server.js --port 5181     # 换端口
 | `PANEL_QINGLONG_HOST` | 空 | 后台「青龙地址」的初始默认值 |
 | `PANEL_YYB_BASE_URL` | `http://127.0.0.1:8000` | 面板调网关的地址 |
 | `PANEL_YYB_PUBLIC_BASE_URL` | 空 | 写进青龙的 `yyb_server` 值 |
-| `MT_RUN_JS` | 空 | 美团专家包 `scripts/run.js` 的绝对路径 |
-| `MT_AI_SCENE` | 空 | 美团接口 `aiScene` |
+| `MEITUAN_CLIGUARD_JS` | 空 | cliguard.js 的绝对路径；留空则依次找 `/opt/meituan-expert/...` 与 `~/.cliguard/...` |
 
 > 这些变量只在**首次生成 `config.json` 时**作为默认值，之后一律以后台里保存的配置为准。
 
@@ -252,9 +242,9 @@ node server.js --port 5181     # 换端口
 | `GET` | `/api/health` | 是否已初始化、青龙是否已配置 |
 | `POST` | `/api/yyb/qr` | 新建应用宝二维码会话 |
 | `GET` | `/api/yyb/poll?sid=` | 轮询扫码状态 |
-| `POST` | `/api/yyb/confirm` | 确认授权 → 写入 `yyb_server` |
-| `POST` | `/api/meituan/start` | 取二维码 / 复用已有 token；body `{fresh:true}` = 先清本地登录态再出二维码（加新账号） |
-| `GET` | `/api/meituan/status?sid=` | 轮询登录结果 → 写入 `MT_TOKEN` |
+| `POST` | `/api/yyb/confirm` | 确认授权（账号存网关，不写青龙） |
+| `GET` | `/api/meituan/sign/health` | cliguard 是否加载成功（签名服务可用性） |
+| `POST` | `/api/meituan/sign` | 借专家包 cliguard 生成 mtgsig 签名，body `{method,url,bodyHash}` |
 
 后台（需登录）：
 
@@ -265,9 +255,8 @@ node server.js --port 5181     # 换端口
 | `POST` | `/api/admin/login` / `logout` | 登录 / 退出 |
 | `POST` | `/api/admin/password` | 改密码 |
 | `GET`/`PUT` | `/api/admin/config` | 读写配置（Secret 只回传「是否已设置」） |
-| `POST` | `/api/admin/test/qinglong` / `test/yyb` / `test/meituan` | 连接测试 |
-| `GET` | `/api/admin/meituan/session` | 查看专家包本地缓存的登录态（脱敏） |
-| `POST` | `/api/admin/meituan/logout` | 清除专家包本地登录态（不动青龙里的 `MT_TOKEN`） |
+| `POST` | `/api/admin/test/qinglong` / `test/yyb` | 连接测试 |
+| `GET`/`POST`/`DELETE` | `/api/yyb/accounts*` | 应用宝账号列表 / 刷新 / 导入导出 / 排序 |
 
 ---
 

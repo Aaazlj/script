@@ -27,7 +27,7 @@ const PANELS = [
   { id: 'accounts', name: '应用宝账号', sub: '管理已扫码入库的微信账号', icon: ICONS.users, save: false },
   { id: 'qinglong', name: '青龙面板', sub: 'OpenAPI 凭据配置', icon: ICONS.plug, save: true },
   { id: 'yyb', name: '应用宝网关', sub: 'yyb_go 地址与写入值', icon: ICONS.box, save: true },
-  { id: 'meituan', name: '美团扫码', sub: '官方专家包 run.js', icon: ICONS.bag, save: true },
+  { id: 'sign', name: '美团签名服务', sub: '给脚本提供 mtgsig 签名', icon: ICONS.bag, save: false },
   { id: 'security', name: '账号安全', sub: '修改管理员密码', icon: ICONS.shield, save: false },
 ];
 
@@ -217,7 +217,7 @@ function renderShell() {
   body.appendChild(buildAccounts());
   body.appendChild(buildQinglong());
   body.appendChild(buildYyb());
-  body.appendChild(buildMeituan());
+  body.appendChild(buildSign());
   body.appendChild(buildSecurity());
 
   activateFromHash();
@@ -258,11 +258,10 @@ function buildOverview() {
 
   const hint = node('div', { class: 'card' }, [
     node('h2', { text: '从这里开始' }),
-    node('div', { class: 'hint', text: '按顺序配置下面三项，然后打开扫码页让用户扫码即可。配置项会写入本机 data/config.json（0600）。' }),
+    node('div', { class: 'hint', text: '按顺序配置下面两项，然后打开扫码页让用户扫码即可。配置项会写入本机 data/config.json（0600）。' }),
     node('div', { class: 'row' }, [
       node('button', { class: 'btn small ghost', text: '去配置青龙面板', onclick: () => activate('qinglong') }),
       node('button', { class: 'btn small ghost', text: '去配置应用宝网关', onclick: () => activate('yyb') }),
-      node('button', { class: 'btn small ghost', text: '去配置美团扫码', onclick: () => activate('meituan') }),
     ]),
   ]);
 
@@ -277,7 +276,21 @@ function refreshOverview() {
   overviewGrid.appendChild(stat('Client Secret', cfg.qinglong.clientSecretSet ? '已保存' : '未配置', cfg.qinglong.clientSecretSet ? 'ok' : 'err'));
   overviewGrid.appendChild(stat('应用宝网关', cfg.yyb.baseUrl || '未配置', cfg.yyb.baseUrl ? 'ok' : 'err'));
   overviewGrid.appendChild(stat('写入青龙的地址', cfg.yyb.publicBaseUrl || '（跟随网关地址）', cfg.yyb.publicBaseUrl ? 'ok' : 'warn'));
-  overviewGrid.appendChild(stat('美团 run.js', cfg.meituan.detectedRunJs ? '已探测到' : '未找到', cfg.meituan.detectedRunJs ? 'ok' : 'err'));
+
+  // 美团签名服务是异步探测的，先占位再回填
+  const signStat = stat('美团签名服务', '检查中…', 'warn');
+  overviewGrid.appendChild(signStat);
+  api('GET', '/api/meituan/sign/health').then((r) => {
+    const val = signStat.querySelector('.stat-value');
+    const dot = signStat.querySelector('.dot');
+    if (val) val.textContent = r.available ? '可用' : '不可用';
+    if (dot) dot.className = 'dot ' + (r.available ? 'ok' : 'err');
+  }).catch(() => {
+    const val = signStat.querySelector('.stat-value');
+    const dot = signStat.querySelector('.dot');
+    if (val) val.textContent = '不可用';
+    if (dot) dot.className = 'dot err';
+  });
 }
 
 /* ---------- 青龙面板 ---------- */
@@ -360,44 +373,26 @@ function buildYyb() {
   ]);
 }
 
-/* ---------- 美团 ---------- */
+/* ---------- 美团签名服务 ---------- */
 
-let mtRunJs, mtScene, mtOut;
-
-function buildMeituan() {
-  mtRunJs = input('mtRunJs', { value: cfg.meituan.runJs, attrs: { placeholder: '留空则自动探测' } });
-  mtScene = input('mtScene', { value: cfg.meituan.aiScene, attrs: { placeholder: '可留空' } });
-  mtOut = node('div');
+function buildSign() {
+  const out = node('div');
 
   const wrapper = node('div', { class: 'card' }, [
-    node('h2', { text: '美团扫码' }),
-    node('div', { class: 'hint', text: '复用官方专家包「领券下单找我」里的 scripts/run.js 完成扫码登录。' }),
-    field('run.js 路径', mtRunJs, cfg.meituan.detectedRunJs ? '当前实际使用：' + cfg.meituan.detectedRunJs : '未探测到，请填写绝对路径'),
-    field('aiScene（可选）', mtScene, '接口渠道标识，留空即可'),
-    testButton('环境自检', async () => {
-      if (!(await doSave(true))) throw new Error('请先修正配置后再测试');
-      const r = await api('POST', '/api/admin/test/meituan');
-      return ['环境就绪', 'run.js：' + r.runJs, '脚本目录：' + (r.scripts_dir || '-'), '客户端类型：' + (r.clientType || '-')];
+    node('h2', { text: '美团签名服务（mtgsig）' }),
+    node('div', { class: 'hint', text: 'media.meituan.com 的福利社接口强制校验 mtgsig 签名头，没有签名一律 403。签名算法在美团自家的混淆 JS（cliguard）里，本面板把它加载进来，对外暴露 POST /api/meituan/sign 供青龙里的 meituan_code.js 借用。' }),
+    node('div', { class: 'hint', text: '青龙里的脚本默认把 mt_sign_url 指向 http://panel:5180/api/meituan/sign；面板与青龙在同一个 compose 网络里时开箱即用。' }),
+    testButton('检查签名服务', async () => {
+      const r = await api('GET', '/api/meituan/sign/health');
+      return r.available
+        ? ['cliguard 已加载，签名服务可用', '接口：POST /api/meituan/sign']
+        : ['cliguard 未加载：面板容器里没找到 vendor/cliguard/js/cliguard.js',
+           '请确认已把美团专家包挂到容器内的 /opt/meituan-expert，或用 MEITUAN_CLIGUARD_JS 指定路径。'];
     }),
-    node('div', { class: 'hint', text: '专家包把美团登录态缓存在一个「单槽位」文件里（同一时间只认得一个账号），所以想加账号要回首页点「➕ 扫码添加新账号」。下面两个按钮用于缓存异常时手动查看/清除。' }),
-    testButton('查看本地登录态', async () => {
-      const r = await api('GET', '/api/admin/meituan/session');
-      if (!r.hasToken) {
-        return ['当前没有缓存的登录态，下次扫码会直接出二维码', r.error ? '探测提示：' + r.error : null];
-      }
-      return ['当前缓存着 1 个美团账号', 'token：' + r.masked, '（清掉本地登录态不影响青龙里的 MT_TOKEN，脚本照样能跑）'];
-    }),
-    testButton('清除本地美团登录态', async () => {
-      const r = await api('POST', '/api/admin/meituan/logout');
-      return [
-        r.message || '已处理',
-        r.cleared ? '现在回首页扫「美团扫码」会直接出二维码' : '建议确认 run.js 版本是否支持 logout 命令',
-      ];
-    }),
-    mtOut,
+    out,
   ]);
 
-  return node('section', { class: 'panel hidden', 'data-panel': 'meituan' }, [wrapper]);
+  return node('section', { class: 'panel hidden', 'data-panel': 'sign' }, [wrapper]);
 }
 
 /* ---------- 账号安全 ---------- */
@@ -452,7 +447,6 @@ async function doSave(silent) {
     await api('PUT', '/api/admin/config', {
       qinglong: { host: qlHost.value, clientId: qlId.value, clientSecret: qlSecret.value },
       yyb: { baseUrl: yybBase.value, publicBaseUrl: yybPub.value },
-      meituan: { runJs: mtRunJs.value, aiScene: mtScene.value },
     });
     qlSecret.value = '';
     cfg = await api('GET', '/api/admin/config');
