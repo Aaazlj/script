@@ -108,15 +108,17 @@ route('POST', '/api/yyb/confirm', async (req, res) => {
 });
 
 /**
- * 取二维码 / 复用已有 token
+ * 美团扫码入口 —— **一律走「新账号」流程**
  *
- * run.js 的 pt-passport 缓存是「单槽位」文件（键 <client_id>@prod），所以：
- *   · 没扫过 → auth-get-code 返回 AUTH_LINK → 出二维码
- *   · 扫过一次 → 之后每次都命中缓存返回 type:'token' → 页面永远停在「已有有效登录态」
- * 想加第二个账号，必须先把槽位清掉（run.js logout），再重新取授权链接。
+ * run.js 的 pt-passport 缓存是「单槽位」文件（键 <client_id>@prod）：
+ * 槽位里躺着一个账号时，auth-get-code 永远返回 type:'token'，出不来二维码
+ * （这就是以前「只能扫一个账号、老显示已有有效登录态」的根因）。所以：
+ *   ① 槽位里有旧账号 → 先幂等落一次青龙（切号不丢号）
+ *   ② run.js logout 清掉槽位
+ *   ③ 重新 auth-get-code 拿授权链接 → 出二维码
  *
- * body.fresh = true → 「再扫一个账号」：先 logout 清缓存，再出二维码
- * 不传 fresh       → 老行为：命中缓存就复用并落一次 MT_TOKEN（幂等）
+ * body.remarks 可选：写进青龙那条 MT_TOKEN 的备注（手机号 / 昵称）。
+ * 万一清槽位失败，退化成「已有登录态」并把 degraded 原因带回页面，不卡在二维码上。
  */
 route('POST', '/api/meituan/start', async (req, res) => {
   const cfg = config.load();
@@ -126,7 +128,7 @@ route('POST', '/api/meituan/start', async (req, res) => {
   }
 
   const body = await httpx.readJSON(req).catch(() => ({}));
-  const wantFresh = body.fresh === true || body.fresh === 1 || body.fresh === '1';
+  const remarks = String(body.remarks || '').trim().slice(0, 64);
 
   // 官方建议先拿设备标识，失败不阻断（部分环境没有 auth.py 也能登录）
   await meituan.getDeviceToken(cfg);
@@ -136,29 +138,31 @@ route('POST', '/api/meituan/start', async (req, res) => {
     return httpx.fail(res, 502, code.message || code.error || '获取授权链接失败');
   }
 
-  // 缓存命中：单槽位里已经躺着一个账号
+  let savedOld = null;
+  let degraded = '';
+
+  // 槽位里躺着上一个账号：先落库，再清槽位
   if (code.type === 'token' && code.token) {
-    // 无论接下来走哪条路，都先把已有 token 落一次青龙，保证切账号时不会把这个号弄丢
-    const up = await upload.uploadMeituanToken(cfg, code.token);
+    savedOld = await upload.uploadMeituanToken(cfg, code.token);
 
-    if (!wantFresh) {
-      const sid = newSession({ mode: 'meituan', uploaded: true });
-      return httpx.ok(res, { sid, mode: 'token', cached: true, upload: up });
-    }
-
-    // 要加新账号 → 清掉单槽位缓存，才可能拿到真正的授权链接
     const lg = await meituan.logout(cfg);
     if (!lg.ok) {
-      return httpx.fail(res, 502, `清除本地登录态失败（${lg.message || lg.error || '未知错误'}），无法切换到新账号`);
+      degraded = `清除本地登录态失败（${lg.message || lg.error || '未知错误'}）。可到管理后台点「清除本地美团登录态」后重试。`;
+    } else {
+      const again = await meituan.authGetCode(cfg);
+      if (again.type === 'token' && again.token) {
+        degraded = '本地登录态没清干净，仍然返回旧 token。可到管理后台点「清除本地美团登录态」后重试。';
+      } else if (!again.ok && !again.type) {
+        return httpx.fail(res, 502, again.message || again.error || '清除登录态后重新获取授权链接失败');
+      } else {
+        code = again;
+      }
     }
+  }
 
-    code = await meituan.authGetCode(cfg);
-    if (code.type === 'token' && code.token) {
-      return httpx.fail(res, 502, '本地登录态没清干净，仍然返回旧 token；请到管理后台点「清除本地美团登录态」后重试');
-    }
-    if (!code.ok && !code.type) {
-      return httpx.fail(res, 502, code.message || code.error || '清除登录态后重新获取授权链接失败');
-    }
+  if (degraded) {
+    const sid = newSession({ mode: 'meituan', uploaded: true, upload: savedOld });
+    return httpx.ok(res, { sid, mode: 'token', degraded, upload: savedOld });
   }
 
   if (code.type !== 'auth_link' || !code.url) {
@@ -167,12 +171,14 @@ route('POST', '/api/meituan/start', async (req, res) => {
 
   const qr = await meituan.fetchQRCode(cfg, code.url);
   const taskId = meituan.startPollTask(cfg);
-  const sid = newSession({ mode: 'meituan', taskId, authUrl: code.url });
+  const sid = newSession({ mode: 'meituan', taskId, authUrl: code.url, remarks });
 
   httpx.ok(res, {
     sid,
     mode: 'qrcode',
     authUrl: code.url,
+    remarks,
+    savedOld,
     imageUrl: qr.ok ? qr.imageUrl || '' : '',
     imageBase64: qr.ok ? qr.imageBase64 || '' : '',
     qrError: qr.ok ? '' : qr.message || qr.error || '',
@@ -196,7 +202,7 @@ route('GET', '/api/meituan/status', async (req, res, url) => {
 
   // 只有第一次轮询到成功时才真正上传，避免重复写
   const cfg = config.load();
-  const up = await upload.uploadMeituanToken(cfg, task.token);
+  const up = await upload.uploadMeituanToken(cfg, task.token, sess.remarks);
   sess.uploaded = true;
   sess.upload = up;
   sessions.delete(sid);

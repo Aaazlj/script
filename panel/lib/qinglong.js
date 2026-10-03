@@ -202,7 +202,9 @@ async function setEnv(cfg, name, value, remarks) {
 
 /**
  * 追加式写环境变量：value 按行拆分，已存在就跳过，否则追加一行。
- * 用于 MT_TOKEN 这种「一个变量放多账号」的场景。
+ *
+ * 通用工具。注意 MT_TOKEN 现在**不再**用它 —— 美团改成「一个账号一条同名变量」
+ * 走 addEnvEntry，这样每条能单独写备注、单独删除。
  */
 async function appendEnvLine(cfg, name, line, remarks) {
   const found = await findEnvs(cfg, name);
@@ -245,6 +247,39 @@ async function appendEnvLine(cfg, name, line, remarks) {
   };
 }
 
+/**
+ * 新增一条环境变量条目。
+ *
+ * 允许同名多条共存 —— 青龙对同名变量是按名字分组后用 & 拼成一个值注入给脚本的
+ * （back/services/env.ts: groupBy(envs, 'name') … join('&')），
+ * 所以「一个账号一条 MT_TOKEN」和「一条变量多行」脚本都读得到；
+ * 但前者能在界面上给每条单独写备注（手机号 / 昵称），删账号时也只删对应那条。
+ */
+async function addEnvEntry(cfg, name, value, remarks) {
+  if (!NAME_PATTERN.test(name)) {
+    return { ok: false, error: `变量名 ${name} 不符合青龙命名规则（只允许字母、数字、下划线，且不能以数字开头）` };
+  }
+  const created = await createEnv(cfg, [{ name, value, remarks: remarks || '' }]);
+  if (!created.ok) return created;
+  return { ok: true, action: 'created', name, value, host: created.host, endpoint: created.endpoint };
+}
+
+/** 只改备注（value 不动）。青龙的 PUT /envs 要求带上 name/value，所以把整条传进来。 */
+async function setEnvRemarks(cfg, entry, remarks) {
+  const id = pickID(entry);
+  if (id === null) {
+    return { ok: false, error: `环境变量 ${entry && entry.name} 缺少 id 字段，无法更新备注` };
+  }
+  const updated = await updateEnv(cfg, {
+    id,
+    name: entry.name,
+    value: entry.value,
+    remarks: remarks || '',
+  });
+  if (!updated.ok) return updated;
+  return { ok: true, action: 'remarks-updated', name: entry.name, host: updated.host, endpoint: updated.endpoint };
+}
+
 /** 连接测试：鉴权 + 读一下面板版本和变量条数 */
 async function testConnection(cfg) {
   const auth = await fetchToken(cfg);
@@ -274,5 +309,7 @@ module.exports = {
   findEnvs,
   setEnv,
   appendEnvLine,
+  addEnvEntry,
+  setEnvRemarks,
   testConnection,
 };
