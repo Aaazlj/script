@@ -21,6 +21,34 @@
 
 ---
 
+## 美团多账号（重要）
+
+美团 token 走的是官方专家包的 `run.js`，它把登录态缓存在**一个固定路径的单槽位文件**里：
+
+```
+~/.workbuddy/credentials/meituan-living-deals-assistant/pt_passport_auth.json
+（容器里映射到 ./data/meituan-auth，键固定是 <client_id>@prod）
+```
+
+也就是说专家包同一时间只认得**一个**美团账号。后果是：
+
+- 扫过第一个账号之后，`auth-get-code` 每次都命中缓存，直接返回 `type:"token"`；
+- 面板于是每次都显示「✓ 已有有效登录态」，**再也出不来第二个二维码**。
+
+所以「再加一个账号」必须先把槽位清掉，再重新取授权链接。页面上对应：
+
+1. 点「美团扫码」→ 若已有登录态，右侧会显示 **「➕ 扫码添加新账号」**；
+2. 点它会先调用 `run.js logout` 清掉本地登录态，再出二维码（**只清专家包的本地缓存，
+   已经写进青龙 `MT_TOKEN` 的账号不受影响**，脚本照常跑）；
+3. 用另一个美团账号扫完，token 会作为新的一行追加进 `MT_TOKEN`。
+
+反复执行 2、3 即可挂上任意多个账号；`meituan_coupon.js` 本来就按行解析 `MT_TOKEN`，无需改配置。
+
+> 缓存异常（清不掉、或想强制回到未登录状态）时，可到 `/admin` → 美团扫码 →
+> 「查看本地登录态」/「清除本地美团登录态」手动处理。
+
+---
+
 ## 快速开始（Docker Compose）
 
 在仓库根目录：
@@ -225,7 +253,7 @@ node server.js --port 5181     # 换端口
 | `POST` | `/api/yyb/qr` | 新建应用宝二维码会话 |
 | `GET` | `/api/yyb/poll?sid=` | 轮询扫码状态 |
 | `POST` | `/api/yyb/confirm` | 确认授权 → 写入 `yyb_server` |
-| `POST` | `/api/meituan/start` | 取二维码 / 复用已有 token |
+| `POST` | `/api/meituan/start` | 取二维码 / 复用已有 token；body `{fresh:true}` = 先清本地登录态再出二维码（加新账号） |
 | `GET` | `/api/meituan/status?sid=` | 轮询登录结果 → 写入 `MT_TOKEN` |
 
 后台（需登录）：
@@ -238,6 +266,8 @@ node server.js --port 5181     # 换端口
 | `POST` | `/api/admin/password` | 改密码 |
 | `GET`/`PUT` | `/api/admin/config` | 读写配置（Secret 只回传「是否已设置」） |
 | `POST` | `/api/admin/test/qinglong` / `test/yyb` / `test/meituan` | 连接测试 |
+| `GET` | `/api/admin/meituan/session` | 查看专家包本地缓存的登录态（脱敏） |
+| `POST` | `/api/admin/meituan/logout` | 清除专家包本地登录态（不动青龙里的 `MT_TOKEN`） |
 
 ---
 

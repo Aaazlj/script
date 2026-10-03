@@ -115,6 +115,24 @@ async function getDeviceToken(cfg) {
   return runCli(normalizeRunJs(cfg), ['get-device-token'], 60000);
 }
 
+/**
+ * 读取 pt-passport 本地缓存的 token（仅探测，不写青龙）。
+ * run.js 的缓存是「单槽位」文件（PT_PASSPORT_AUTH_FILE，键为 <client_id>@prod），
+ * 所以有值就代表槽位已被某个账号占用。
+ */
+async function getCachedToken(cfg) {
+  return runCli(normalizeRunJs(cfg), ['get-token'], 60000);
+}
+
+/**
+ * 清掉 pt-passport 单槽位缓存（保留设备标识）。
+ * 这是「再扫一个账号」的关键：不清缓存的话 auth-get-code 永远命中旧 token，
+ * 只会返回 type:'token'，页面就永远停在「已有有效登录态」，出不了二维码。
+ */
+async function logout(cfg) {
+  return runCli(normalizeRunJs(cfg), ['logout'], 60000);
+}
+
 async function authGetCode(cfg) {
   const runJs = normalizeRunJs(cfg);
   const res = await runCli(runJs, ['auth-get-code'], 120000);
@@ -176,6 +194,8 @@ module.exports = {
   normalizeRunJs,
   environmentCheck,
   getDeviceToken,
+  getCachedToken,
+  logout,
   authGetCode,
   fetchQRCode,
   startPollTask,

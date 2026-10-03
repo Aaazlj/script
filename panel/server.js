@@ -107,6 +107,17 @@ route('POST', '/api/yyb/confirm', async (req, res) => {
   httpx.ok(res, { account: conf.account });
 });
 
+/**
+ * 取二维码 / 复用已有 token
+ *
+ * run.js 的 pt-passport 缓存是「单槽位」文件（键 <client_id>@prod），所以：
+ *   · 没扫过 → auth-get-code 返回 AUTH_LINK → 出二维码
+ *   · 扫过一次 → 之后每次都命中缓存返回 type:'token' → 页面永远停在「已有有效登录态」
+ * 想加第二个账号，必须先把槽位清掉（run.js logout），再重新取授权链接。
+ *
+ * body.fresh = true → 「再扫一个账号」：先 logout 清缓存，再出二维码
+ * 不传 fresh       → 老行为：命中缓存就复用并落一次 MT_TOKEN（幂等）
+ */
 route('POST', '/api/meituan/start', async (req, res) => {
   const cfg = config.load();
   const runJs = meituan.normalizeRunJs(cfg);
@@ -114,19 +125,40 @@ route('POST', '/api/meituan/start', async (req, res) => {
     return httpx.fail(res, 500, '未找到美团专家包的 run.js，请先到管理后台填写路径');
   }
 
+  const body = await httpx.readJSON(req).catch(() => ({}));
+  const wantFresh = body.fresh === true || body.fresh === 1 || body.fresh === '1';
+
   // 官方建议先拿设备标识，失败不阻断（部分环境没有 auth.py 也能登录）
   await meituan.getDeviceToken(cfg);
 
-  const code = await meituan.authGetCode(cfg);
+  let code = await meituan.authGetCode(cfg);
   if (!code.ok && !code.type) {
     return httpx.fail(res, 502, code.message || code.error || '获取授权链接失败');
   }
 
-  // 缓存命中：已有可用 token，直接上传
+  // 缓存命中：单槽位里已经躺着一个账号
   if (code.type === 'token' && code.token) {
+    // 无论接下来走哪条路，都先把已有 token 落一次青龙，保证切账号时不会把这个号弄丢
     const up = await upload.uploadMeituanToken(cfg, code.token);
-    const sid = newSession({ mode: 'meituan', uploaded: true });
-    return httpx.ok(res, { sid, mode: 'token', upload: up });
+
+    if (!wantFresh) {
+      const sid = newSession({ mode: 'meituan', uploaded: true });
+      return httpx.ok(res, { sid, mode: 'token', cached: true, upload: up });
+    }
+
+    // 要加新账号 → 清掉单槽位缓存，才可能拿到真正的授权链接
+    const lg = await meituan.logout(cfg);
+    if (!lg.ok) {
+      return httpx.fail(res, 502, `清除本地登录态失败（${lg.message || lg.error || '未知错误'}），无法切换到新账号`);
+    }
+
+    code = await meituan.authGetCode(cfg);
+    if (code.type === 'token' && code.token) {
+      return httpx.fail(res, 502, '本地登录态没清干净，仍然返回旧 token；请到管理后台点「清除本地美团登录态」后重试');
+    }
+    if (!code.ok && !code.type) {
+      return httpx.fail(res, 502, code.message || code.error || '清除登录态后重新获取授权链接失败');
+    }
   }
 
   if (code.type !== 'auth_link' || !code.url) {
@@ -429,6 +461,33 @@ route('POST', '/api/admin/test/meituan', async (req, res) => {
   if (!out.runJs) return httpx.fail(res, 500, '未找到 run.js，请填写绝对路径');
   if (!out.ok) return httpx.fail(res, 502, out.message || out.error || '环境检查失败');
   httpx.ok(res, { runJs: out.runJs, scripts_dir: out.scripts_dir, clientType: out.clientType });
+}, { admin: true });
+
+/**
+ * 查看 / 清除美团本地登录态
+ *
+ * run.js 的 pt-passport 缓存是单槽位文件，页面「再扫一个账号」会自动清；
+ * 这里留一个手动入口，方便缓存异常（清不掉、或想强制回退到未登录状态）时自救。
+ */
+route('GET', '/api/admin/meituan/session', async (req, res) => {
+  const cfg = config.load();
+  const out = await meituan.getCachedToken(cfg);
+  const token = out.ok ? String(out.token || '').trim() : '';
+  httpx.ok(res, {
+    hasToken: Boolean(token),
+    masked: token ? (token.length > 12 ? `${token.slice(0, 8)}****${token.slice(-4)}` : '****') : '',
+    error: token ? '' : (out.message || out.error || ''),
+  });
+}, { admin: true });
+
+route('POST', '/api/admin/meituan/logout', async (req, res) => {
+  const cfg = config.load();
+  const out = await meituan.logout(cfg);
+  if (!out.ok) return httpx.fail(res, 502, out.message || out.error || '清除失败');
+  // 清完再探一次，确认槽位真的空了
+  const probe = await meituan.getCachedToken(cfg);
+  const still = probe.ok && String(probe.token || '').trim();
+  httpx.ok(res, { cleared: !still, message: still ? '仍能读到缓存 token，可能 run.js 版本不支持 logout' : '已清除本地登录态' });
 }, { admin: true });
 
 /* ---------------- 匹配与分发 ---------------- */
