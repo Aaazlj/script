@@ -6,7 +6,7 @@
 cron: 0 10 * * *
 ------------------------------------------
 环境变量：
-MT_TOKEN        必填，美团登录 Token。多账号有两种写法，都支持：
+MT_TOKEN        美团登录 Token。多账号有两种写法，都支持：
                  ① 青龙里一个账号一条**同名**的 MT_TOKEN 环境变量（推荐 —— 扫码面板
                     就是这么写的，好处是每个账号能单独填备注，比如手机号）。
                     青龙会把同名变量的值用 & 拼成一个值注入给脚本，所以 &
@@ -29,6 +29,24 @@ MT_MAX_COUPONS  可选，通知最多展示几张券，默认 8
 MT_CACHE_FILE   可选，当日券缓存路径
                  默认：青龙环境 $QL_DIR/data/mt_coupons_cache.json（容器重建不丢），
                        其它环境 ./data/mt_coupons_cache.json
+
+★ Token 兜底（配了 yyb_server 就不必再人工扫码）：
+  「美团 App 扫码」换来的 token 会过期，过期后原本必须人工重扫。本脚本现在支持在
+  【MT_TOKEN 没配】或【配了但全部 401】时，自动从应用宝网关换一个 token 顶上 ——
+  走的是 mt_code.py 同一条路：网关 → 微信 code → open.meituan.com/weapplogin。
+  实测这个 token 同样被 sendCouponWork 接受：拿它打接口得到 1014，
+  而垃圾 token / 失效 token 得到 401 —— 两者档位不同，说明它通过了鉴权。
+  其它情况（部分 token 正常）不会触发兜底，行为与以前完全一致。
+
+  yyb_server      可选。应用宝网关地址，如 http://yyb-go:8000
+                  支持 @ref 写法 http://yyb-go:8000@1
+  wx_server_url   兼容变量（yyb_server 为空时生效）
+  mt_openid       可选。指定网关 ref；多个用 & , ， 空格 换行 分隔
+                  不配则自动取网关里所有 alive 账号
+  mt_token_auto   可选，默认 1。设 0 彻底关掉兜底（回到「没 token 就不跑」的老行为）
+  MT_GATEWAY_TOKEN_FILE  可选。兜底 token 的缓存文件路径
+                  默认 $QL_DIR/data/mt_gateway_token.json
+                  有缓存的好处：token 稳定 → 当日券缓存的 key 稳定，同日重复跑不白打接口
 ------------------------------------------
 重要：
   每天限领一次。当天已领过时，接口只返回 code 1014，couponList 为空，
@@ -539,25 +557,259 @@ async function push(title, content) {
   if (!sent) $.log('[推送] 未配置推送，结果仅输出日志');
 }
 
-/* ============ 主流程 ============ */
+/* ============ 应用宝网关兜底：拿不到 / 全部失效时自动换 token ============ */
 
-!(async () => {
-  const tokens = getTokens();
-  if (!tokens.length) {
-    $.log('未找到 MT_TOKEN，请先配置 token（可用仓库内 token-web 扫码获取）');
-    $.log('本轮结论: 未配置 MT_TOKEN，脚本未执行');
-    $.done();
-    return;
+// 为什么要有这一块：
+//   「美团 App 扫码」换来的 token（pt-passport，174 字符）会过期，过期后必须人工重扫。
+//   mt_code.py 走的是另一条路 —— 应用宝网关 → 微信 code → open.meituan.com/weapplogin，
+//   得到的 token（152 字符）。实测这个 token 同样被 sendCouponWork 接受：
+//   拿它打接口得到 1014，而垃圾 token / 失效 token 得到 401 —— 档位不同，说明它过了鉴权。
+//   于是把那条路搬过来做兜底，配好 yyb_server 之后就不用再人工扫码了。
+//
+// 触发条件只有两个（其它情况行为与以前完全一致，绝不插手）：
+//   ① MT_TOKEN 压根没配 / 文件里没有
+//   ② 配了，但这一批 token 全部返回 401
+// 见文件头的环境变量说明。
+
+const MT_APPID = 'wxde8ac0a21135c07d';
+const MT_APP_NAME = 'group';
+const MT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 '
+  + 'MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI '
+  + 'MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) '
+  + 'UnifiedPCWindowsWechat(0xf2541c37) XWEB/25364';
+
+const GATEWAY = (() => {
+  const raw = (process.env.yyb_server || process.env.wx_server_url || '').trim();
+  if (!raw) return { on: false, base: '', ref: '' };
+  const at = raw.lastIndexOf('@');
+  let base = at > 0 ? raw.slice(0, at).replace(/\/+$/, '') : raw.replace(/\/+$/, '');
+  const ref = at > 0 ? raw.slice(at + 1).trim() : '';
+  if (base && !/:\/\//.test(base)) base = 'http://' + base;
+  const enabled = (process.env.mt_token_auto || '1').trim() !== '0';
+  return { on: enabled && !!base, base, ref };
+})();
+
+const GW_OPENIDS = String(process.env.mt_openid || '')
+  .split(/[&,，\s]+/).map((s) => s.trim()).filter(Boolean);
+
+const GW_TOKEN_FILE = process.env.MT_GATEWAY_TOKEN_FILE
+  || (process.env.QL_DIR
+    ? path.join(process.env.QL_DIR, 'data', 'mt_gateway_token.json')
+    : path.join(__dirname, 'data', 'mt_gateway_token.json'));
+
+// 极简 JSON / 表单请求（零依赖，只用内置模块）
+// 每个请求都挂硬超时：网关或美团卡住时不能把整个任务拖死
+function gwRequest(method, url, opts) {
+  opts = opts || {};
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(url); } catch (_) { return resolve({ status: 0, error: '非法 URL' }); }
+    const lib = u.protocol === 'http:' ? require('http') : https;
+    const headers = Object.assign({ Accept: '*/*' }, opts.headers || {});
+    let payload = null;
+    if (opts.json != null) {
+      payload = Buffer.from(JSON.stringify(opts.json), 'utf8');
+      headers['Content-Type'] = 'application/json';
+    } else if (opts.form != null) {
+      payload = Buffer.from(new URLSearchParams(opts.form).toString(), 'utf8');
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
+    if (payload) headers['Content-Length'] = payload.length;
+
+    let req;
+    const done = (v) => resolve(v);
+    try {
+      req = lib.request({
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'http:' ? 80 : 443),
+        path: u.pathname + u.search,
+        method,
+        headers,
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('error', (e) => done({ status: 0, error: e.message }));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          let json = null;
+          try { json = text ? JSON.parse(text) : null; } catch (_) { /* 非 JSON */ }
+          done({ status: res.statusCode, json, text });
+        });
+      });
+    } catch (e) {
+      return done({ status: 0, error: e.message });
+    }
+    req.setTimeout(40000, () => { req.destroy(); done({ status: 0, error: 'TIMEOUT' }); });
+    req.on('error', (e) => done({ status: 0, error: e.message }));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+// 从 weapplogin 响应里挑 token（字段名与 mt_code.py 的 extract_token 保持一致）
+function pickMtToken(j) {
+  if (!j || typeof j !== 'object') return '';
+  const inner = (j.data && typeof j.data === 'object') ? j.data : {};
+  const user = (inner.user && typeof inner.user === 'object') ? inner.user : {};
+  const cands = [
+    j.token, j.wm_logintoken, j.accessToken, j.access_token, j.jwt,
+    inner.token, inner.wm_logintoken, inner.accessToken, inner.access_token, inner.jwt,
+    user.token, user.wm_logintoken, user.accessToken, user.access_token, user.jwt,
+  ];
+  for (const c of cands) {
+    if (c && c !== 'null') return String(c);
+  }
+  return '';
+}
+
+async function gwAccounts() {
+  const r = await gwRequest('GET', `${GATEWAY.base}/accounts`, { headers: { 'User-Agent': MT_UA } });
+  const list = (r.json && Array.isArray(r.json.data)) ? r.json.data : [];
+  return list.map((a) => ({
+    ref: String((a && (a.openid || a.id)) || ''),
+    status: String((a && a.status) || '').toLowerCase(),
+    label: String((a && (a.nickname || a.alias)) || '') || '-',
+  })).filter((a) => a.ref);
+}
+
+// 网关里账号登录态失效（409）时，让它续期一次再试
+async function gwRefresh(ref) {
+  try {
+    await gwRequest('POST', `${GATEWAY.base}/accounts/refresh`, {
+      json: { ref },
+      headers: { 'User-Agent': MT_UA },
+    });
+  } catch (_) { /* 续期失败交给后面的失败分支 */ }
+}
+
+// 单个 ref：网关取 code → weapplogin → token
+async function gwTokenForRef(ref) {
+  let code = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = await gwRequest('POST', `${GATEWAY.base}/wxapp/getCode`, {
+      json: { app_id: MT_APPID, ref },
+      headers: { 'User-Agent': MT_UA },
+    });
+    if (r.status === 409) {
+      $.log(`  ♻️ 网关返回 409（${maskToken(ref)} 登录态失效），请求续期后重试`);
+      await gwRefresh(ref);
+      await new Promise((res) => setTimeout(res, 3000));
+      continue;
+    }
+    if (r.json && r.json.code === 0) {
+      const inner = r.json.data || {};
+      code = ((inner.result || {}).code) || inner.code || '';
+    }
+    if (code && code !== 'null') break;
+    if (attempt < 3) {
+      $.log(`  ⚠️ 第 ${attempt} 次取 code 未成功${r.error ? `（${r.error}）` : ''}，重试`);
+      await new Promise((res) => setTimeout(res, 2000));
+    }
+  }
+  if (!code || code === 'null') return { ok: false, error: '取 code 失败' };
+
+  const login = await gwRequest('POST', 'https://open.meituan.com/user/v1/weapplogin', {
+    form: { code, appName: MT_APP_NAME },
+    headers: {
+      'User-Agent': MT_UA,
+      Referer: `https://servicewechat.com/${MT_APPID}/270/page-frame.html`,
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+      xweb_xhr: '1',
+    },
+  });
+  const token = pickMtToken(login.json);
+  if (!token) return { ok: false, error: `登录未返回 token（HTTP ${login.status}${login.error ? ` ${login.error}` : ''}）` };
+  return { ok: true, token };
+}
+
+function readGwCache() {
+  try {
+    const all = JSON.parse(fs.readFileSync(GW_TOKEN_FILE, 'utf8')) || {};
+    const list = Array.isArray(all.entries) ? all.entries : [];
+    return list.filter((e) => e && e.token)
+      .map((e) => ({ token: String(e.token), ref: String(e.ref || ''), source: '网关缓存' }));
+  } catch (_) { return []; }
+}
+
+function writeGwCache(entries) {
+  try {
+    fs.mkdirSync(path.dirname(GW_TOKEN_FILE), { recursive: true });
+    fs.writeFileSync(GW_TOKEN_FILE, JSON.stringify({
+      updated_at: new Date().toISOString(),
+      note: '美团 token 兜底缓存（应用宝网关 → 微信 code → weapplogin）',
+      entries: entries.map((e) => ({ ref: e.ref, token: e.token })),
+    }, null, 2), 'utf8');
+  } catch (e) {
+    $.log(`[提示] 网关 token 缓存写入失败（不影响本次）：${e.message}`);
+  }
+}
+
+/**
+ * 从网关拿 token。
+ *   force=false → 先读上次换出来的，避免每轮都重新登录，也让「当日券缓存」的 key 保持稳定
+ *   force=true  → 无视缓存，重新走一遍「取 code → weapplogin」
+ */
+async function gatewayTokens(force) {
+  if (!GATEWAY.on) return [];
+
+  if (!force) {
+    const cached = readGwCache();
+    if (cached.length) {
+      $.log(`🔁 复用网关缓存的 token（${cached.length} 个）：${cached.map((e) => maskToken(e.token)).join('、')}`);
+      return cached;
+    }
   }
 
+  let refs = GW_OPENIDS.slice();
+  if (!refs.length && GATEWAY.ref) refs = [GATEWAY.ref];
+
+  let all = [];
+  if (!refs.length) {
+    all = await gwAccounts();
+    refs = all.filter((a) => a.status === 'alive').map((a) => a.ref).filter(Boolean);
+    if (!refs.length && all.length) {
+      $.log('⚠️ 网关里没有 alive 账号，逐个请求续期后再看一次');
+      for (const a of all) await gwRefresh(a.ref);
+      refs = (await gwAccounts()).filter((a) => a.status === 'alive').map((a) => a.ref);
+    }
+  }
+  if (!refs.length) {
+    $.log('⚠️ 网关里没有可用账号，无法自动换 token（去面板扫码登录，或配 mt_openid）');
+    return [];
+  }
+
+  $.log(`🔄 从应用宝网关换 token（${refs.length} 个账号，网关 ${GATEWAY.base}）`);
+  const out = [];
+  for (const ref of refs) {
+    const r = await gwTokenForRef(ref);
+    if (r.ok) {
+      $.log(`  ✅ ${maskToken(ref)} → ${maskToken(r.token)}（${r.token.length} 字符）`);
+      out.push({ token: r.token, ref, source: '网关自动登录' });
+    } else {
+      $.log(`  ❌ ${maskToken(ref)} 换 token 失败：${r.error}`);
+    }
+  }
+  if (out.length) writeGwCache(out);
+  return out;
+}
+
+/* ============ 主流程 ============ */
+
+/**
+ * 跑一批 token。抽成函数，是为了「配置的 token 全部失效时，用网关换来的 token 再跑一轮」。
+ * 返回 { sections, anyOk, expired, count }；expired 只统计 401（token 失效）。
+ */
+async function runBatch(entries, label) {
   const sections = [];
   let anyOk = false;
+  let expired = 0;
 
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    const title = `账号 ${i + 1} 领券结果`;
+  for (let i = 0; i < entries.length; i++) {
+    const token = entries[i].token;
+    const title = `账号 ${i + 1} 领券结果${label ? `（${label}）` : ''}`;
     let conclusion = '';
-    $.log(`\n账号 ${i + 1}/${tokens.length} (${maskToken(token)}) 开始领券…`);
+    $.log(`\n账号 ${i + 1}/${entries.length} (${maskToken(token)}) 开始领券…`);
 
     // 先看当日缓存：命中就不再打领券接口。
     // 每天只能领一次，重复请求只会拿到 code 1014，白挨一次风控。
@@ -573,7 +825,7 @@ async function push(title, content) {
       $.log(renderList(cached.coupons || []));
       $.log(`  本轮结论: 今天已领过 ${cached.count} 张（回放本地缓存）`);
       sections.push(parts.join('\n'));
-      if (i < tokens.length - 1) await new Promise((r) => setTimeout(r, 1000));
+      if (i < entries.length - 1) await new Promise((r) => setTimeout(r, 1000));
       continue;
     }
 
@@ -632,6 +884,7 @@ async function push(title, content) {
         sections.push(`${title}\n  ℹ️ ${tip}`);
         conclusion = '服务端 1014 发券失败（未必是"已领过"，看当天首次运行与请求参数）';
       } else if (code === 401) {
+        expired++;
         const tip = '🔑 token 已失效：请用 token-web 重新扫码，并把新的 MT_TOKEN 更新到环境变量或 mt_token.txt';
         $.log(`  ${tip}`);
         sections.push(`${title}\n  ${tip}`);
@@ -655,10 +908,67 @@ async function push(title, content) {
 
     if (conclusion) $.log(`  本轮结论: ${conclusion}`);
 
-    if (i < tokens.length - 1) await new Promise((r) => setTimeout(r, 3000));
+    if (i < entries.length - 1) await new Promise((r) => setTimeout(r, 3000));
   }
 
-  await push(anyOk ? '🎉 美团优惠券领取完成' : '美团优惠券领取结果', sections.join('\n\n'));
-  $.log(`\n========== 本轮汇总 ==========\n共 ${tokens.length} 个账号；${anyOk ? '至少一个账号今日已领到券' : '本次没有账号领到券'}`);
+  return { sections, anyOk, expired, count: entries.length };
+}
+
+!(async () => {
+  const configured = getTokens();
+  const attempted = [];
+  const batches = [];
+
+  // 第一轮：用配置的 token。一个都没配、且网关兜底可用 → 直接让网关顶上。
+  let first = configured.map((t) => ({ token: t, source: '配置' }));
+  let firstLabel = '';
+
+  if (first.length) {
+    $.log(`使用配置的 MT_TOKEN（${first.length} 个）`);
+  } else if (GATEWAY.on) {
+    $.log('未配置 MT_TOKEN，改用应用宝网关自动获取…');
+    first = await gatewayTokens(false);
+    firstLabel = '网关';
+  }
+
+  if (!first.length) {
+    if (GATEWAY.on) {
+      $.log('未找到可用 token：MT_TOKEN 没配，网关那边也没换到。');
+      $.log('  请检查 yyb_server 是否正确、网关里有没有 alive 账号（可去扫码面板登录）。');
+    } else {
+      $.log('未找到 MT_TOKEN，请先配置 token（可用仓库内 token-web 扫码获取）');
+      $.log('  提示：配上 yyb_server 后，token 缺失或失效时脚本会自动从应用宝网关换，免人工扫码。');
+    }
+    $.log('本轮结论: 没有可用 token，脚本未执行');
+    $.done();
+    return;
+  }
+
+  const r1 = await runBatch(first, firstLabel);
+  batches.push(r1);
+  first.forEach((e) => attempted.push(e.token));
+
+  // 配置的 token 全部 401（整批过期）→ 用网关换来的再跑一轮。
+  // 先试缓存（省一次登录），不行再强制重新登录；最多两轮，避免死循环。
+  if (GATEWAY.on && r1.count > 0 && r1.expired === r1.count) {
+    for (const force of [false, true]) {
+      const gw = await gatewayTokens(force);
+      const extra = gw.filter((e) => attempted.indexOf(e.token) === -1);
+      if (!extra.length) continue;
+      extra.forEach((e) => attempted.push(e.token));
+      $.log(`\n🔁 配置的 token 已全部失效，用${force ? '网关重新登录' : '网关缓存'}换来的 token 再跑一轮（${extra.length} 个）`);
+      const r2 = await runBatch(extra, force ? '网关重新登录' : '网关缓存');
+      batches.push(r2);
+      if (r2.expired < r2.count) break;   // 这轮有 token 被认了，收工
+    }
+  }
+
+  const totalCount = batches.reduce((n, b) => n + b.count, 0);
+  const anyOk = batches.some((b) => b.anyOk);
+  const allSections = [];
+  batches.forEach((b) => allSections.push(...b.sections));
+
+  await push(anyOk ? '🎉 美团优惠券领取完成' : '美团优惠券领取结果', allSections.join('\n\n'));
+  $.log(`\n========== 本轮汇总 ==========\n共 ${totalCount} 个账号；${anyOk ? '至少一个账号今日已领到券' : '本次没有账号领到券'}`);
   $.done();
 })();
