@@ -55,6 +55,11 @@
     <div class="card">
       <h2 id="scanTitle"></h2>
       <div class="hint" id="scanHint"></div>
+      <div class="field" id="remarkRow" style="display:none">
+        <label for="remarkInput">备注（选填）</label>
+        <input id="remarkInput" type="text" maxlength="64" autocomplete="off"
+               placeholder="手机号 / 昵称。会写进青龙那条 MT_TOKEN 的备注；留空自动用「美团账号 N」">
+      </div>
       <div class="qr-box" id="qrBox">正在生成二维码…</div>
       <div class="status pending" id="status"></div>
       <div class="countdown" id="countdown"></div>
@@ -77,7 +82,10 @@ const MODES = {
   yyb: { title: '应用宝扫码', hint: '请用手机微信扫描下方二维码，并在手机上确认登录。' },
   meituan: {
     title: '美团扫码',
-    hint: '请用美团 App 扫描下方二维码，并在手机上确认登录。每个账号扫一次，会自动追加到青龙 MT_TOKEN，可以反复添加。',
+    hint: '请用美团 App 扫描下方二维码，并在手机上确认登录。'
+      + '每扫一次就是「新增一个账号」：登录后会在青龙里新增一条独立的 MT_TOKEN'
+      + '（一个账号一条，可各自写备注），加完可以接着扫下一个。',
+    remark: true,
   },
 };
 
@@ -160,10 +168,16 @@ function renderUpload(up) {
   if (!up.ok) return [`❌ 写青龙失败：${up.error || '未知错误'}`, 'err'];
   const name = up.variable || '环境变量';
   if (up.skipped) return [`ℹ️ 青龙 ${name} 已存在，保持现有配置不动`, 'info'];
-  if (up.action === 'created') return [`✅ 已在青龙新建 ${name}`, 'ok'];
+  if (up.action === 'created') {
+    return [`✅ 已在青龙新增一条 ${name}（当前共 ${up.accountCount || 1} 个账号）`, 'ok'];
+  }
   if (up.action === 'updated') return [`✅ 已更新青龙 ${name}`, 'ok'];
   if (up.action === 'appended') return [`✅ 已追加到青龙 ${name}（当前共 ${up.existingLines || 1} 行）`, 'ok'];
-  if (up.action === 'unchanged') return [`ℹ️ 青龙 ${name} 已是最新，无需改动`, 'info'];
+  if (up.action === 'unchanged') {
+    return up.remarksPatched
+      ? ['ℹ️ 这个账号青龙里已有，顺手把备注补上了', 'info']
+      : [`ℹ️ 这个账号青龙里已经有了（共 ${up.accountCount || 1} 条 ${name}），没有重复添加`, 'info'];
+  }
   return [`✅ 已写入青龙 ${name}`, 'ok'];
 }
 
@@ -172,8 +186,9 @@ function renderUploadDetail(up) {
   const rows = [];
   if (up.host) rows.push(['青龙', up.host]);
   rows.push(['变量名', up.variable || '-']);
+  if (up.remarks) rows.push(['备注', up.remarks]);
   rows.push(['token', up.masked || '****']);
-  if (up.duplicates) rows.push(['提示', `青龙里还有 ${up.duplicates} 条同名变量，本次只改了第一条`]);
+  if (up.accountCount) rows.push(['账号总数', String(up.accountCount)]);
   return kv(rows);
 }
 
@@ -200,13 +215,14 @@ function showScan(nextMode, push) {
   $('viewScan').classList.remove('hidden');
   $('scanTitle').textContent = MODES[nextMode].title;
   $('scanHint').textContent = MODES[nextMode].hint;
+  $('remarkRow').style.display = MODES[nextMode].remark ? '' : 'none';
   if (push !== false) history.pushState({ view: 'scan', mode: nextMode }, '', '#' + nextMode);
   startScan();
 }
 
-function startScan(forceFresh) {
+function startScan() {
   if (mode === 'yyb') startYyb();
-  else startMeituan(forceFresh);
+  else startMeituan();
 }
 
 /* ---------- 应用宝 ---------- */
@@ -287,79 +303,92 @@ async function finishYyb() {
     ['状态', acc.status || '-'],
   ])]);
   note('info', ['账号已保存在网关，脚本会自动发现，无需改青龙配置。']);
+  renderActions({ text: '想再挂一个账号，直接点下面按钮继续扫。' });
 }
 
 /* ---------- 美团 ---------- */
 
 /**
- * 「已有有效登录态 / 扫码成功」之后给出的追加入口。
+ * 扫码结束后的两个出口：再加一个账号 / 回平台选择页。
  *
- * 美团 token 在官方专家包里是**单槽位**缓存文件，不清掉的话 auth-get-code 永远命中旧
- * token，页面只会一遍遍显示「已有有效登录态」，出不来第二个二维码 ——
- * 这就是「只能扫一个账号」的原因。所以这里必须给一个显式入口。
+ * 「加新账号」直接重走一遍上方流程即可 —— 服务端 /api/meituan/start 现在一律走
+ * 「新账号」流程（先把槽位里的旧账号落一次青龙，再清槽位取新的授权链接），
+ * 前端不需要再传任何标志。
  */
-function renderAddAnother() {
+function renderActions(opts) {
+  const o = opts || {};
   const box = document.createElement('div');
   box.className = 'note info';
 
-  const p = document.createElement('div');
-  p.append('想再加一个账号？点下面按钮会清掉专家包里的');
-  const b = document.createElement('b');
-  b.textContent = '本地登录态';
-  p.appendChild(b);
-  p.append('，然后重新出二维码。已经写进青龙 ');
-  const code = document.createElement('code');
-  code.textContent = 'MT_TOKEN';
-  p.appendChild(code);
-  p.append(' 的账号不受影响。');
-  box.appendChild(p);
+  if (o.text) {
+    const p = document.createElement('div');
+    p.textContent = o.text;
+    box.appendChild(p);
+  }
 
   const row = document.createElement('div');
   row.className = 'row';
   row.style.marginTop = '10px';
-  const btn = document.createElement('button');
-  btn.className = 'btn small';
-  btn.textContent = '➕ 扫码添加新账号';
-  btn.addEventListener('click', async () => {
-    btn.disabled = true;
-    btn.textContent = '正在清除本地登录态…';
-    await startMeituan(true);
-  });
-  row.appendChild(btn);
-  box.appendChild(row);
 
+  const again = document.createElement('button');
+  again.className = 'btn small';
+  again.textContent = '➕ 扫码添加新账号';
+  again.addEventListener('click', async () => {
+    again.disabled = true;
+    again.textContent = '正在准备新二维码…';
+    await startScan();
+  });
+
+  const back = document.createElement('button');
+  back.className = 'btn small ghost';
+  back.textContent = '← 返回选择平台';
+  back.addEventListener('click', () => showPick(true));
+
+  row.append(again, back);
+  box.appendChild(row);
   $('result').appendChild(box);
 }
 
-async function startMeituan(forceFresh) {
+async function startMeituan() {
   stopTimers();
   clearResult();
   $('linkBtn').style.display = 'none';
   setQr('正在唤起美团登录…');
   setStatus('正在获取登录二维码…', 'pending');
   $('countdown').textContent = '';
+  $('remarkRow').style.display = '';
+
+  const remarks = ($('remarkInput').value || '').trim();
 
   let r;
   try {
-    r = await api('POST', '/api/meituan/start', { fresh: !!forceFresh });
+    r = await api('POST', '/api/meituan/start', { remarks: remarks });
   } catch (e) {
     setStatus('获取二维码失败', 'err');
     setQr('<span style="color:#d64545">×</span>');
     note('err', [e.message]);
+    renderActions({ text: '可以返回选择平台，或点下面按钮重试。' });
     return;
   }
 
   sid = r.sid;
 
+  // 退化路径：本地单槽位缓存没清掉，切不到新账号（正常不该发生）
   if (r.mode === 'token') {
     setQr('<span class="tick">✓</span>');
-    setStatus('✓ 已有有效登录态', 'done');
+    setStatus('没能切换到新账号', 'err');
+    note('err', [r.degraded || '本地登录态没清干净，出不来新二维码。']);
     const [text, kind] = renderUpload(r.upload);
     note(kind, [text]);
     const detail = renderUploadDetail(r.upload);
     if (detail) note('info', [detail]);
-    renderAddAnother();
+    renderActions();
     return;
+  }
+
+  // 上一轮扫的账号还躺在专家包缓存里 —— 已顺手存进青龙，这里告知一声
+  if (r.savedOld && r.savedOld.ok && r.savedOld.action === 'created') {
+    note('info', [`🔁 上一次扫的账号还没入库，已顺手写进青龙 MT_TOKEN（当前共 ${r.savedOld.accountCount || 1} 个）。`]);
   }
 
   if (r.imageUrl) setQr('<img src="' + r.imageUrl + '" alt="美团登录二维码">');
@@ -401,11 +430,12 @@ async function pollMeituan() {
 
     setQr('<span class="tick">✓</span>');
     setStatus('✓ 登录成功', 'done');
+    $('remarkInput').value = '';
     const [text, kind] = renderUpload(st.upload);
     note(kind, [text]);
     const detail = renderUploadDetail(st.upload);
     if (detail) note('info', [detail]);
-    renderAddAnother();
+    renderActions({ text: '想再挂一个账号，直接点下面按钮继续扫；已经入库的账号不会受影响。' });
     return;
   }
 }

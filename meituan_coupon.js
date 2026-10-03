@@ -6,8 +6,13 @@
 cron: 0 10 * * *
 ------------------------------------------
 环境变量：
-MT_TOKEN        必填，美团登录 Token，多账号使用换行分隔
-                 （单行时兼容旧的 # 分隔写法；换行分隔时 token 内的 # 不再被截断）
+MT_TOKEN        必填，美团登录 Token。多账号有两种写法，都支持：
+                 ① 青龙里一个账号一条**同名**的 MT_TOKEN 环境变量（推荐 —— 扫码面板
+                    就是这么写的，好处是每个账号能单独填备注，比如手机号）。
+                    青龙会把同名变量的值用 & 拼成一个值注入给脚本，所以 &
+                    等价于「一个账号一行」。
+                 ② 单条变量里多账号用换行分隔（旧写法）。
+                 另外，更早的「单行 # 分隔」写法也兼容。三种可以混用。
 MT_TOKEN_FILE   可选，Token 文件路径
                  默认依次尝试 mt_token.txt / data/mt_token.txt / token-web/data/mt_token.txt
 MT_AI_SCENE     接口 aiScene 渠道标识，默认官方渠道值 a0d4da77f918ab204d86c911fcdd0ce1
@@ -87,13 +92,43 @@ const $ = (() => {
 
 /* ============ Token 获取 ============ */
 
-// 多账号分隔：优先按换行切分（这样 token 自带的 # 不会被截断）；
-// 只有整段不含换行时才退回按 # 切分，兼容旧的单行写法。
+// token 是 base64url 风格的密文串；用来兜住「误把分隔符切进 token 里」的情况
+function looksLikeToken(s) {
+  return typeof s === 'string' && s.length >= 16 && /^[A-Za-z0-9_\-=+/]+$/.test(s);
+}
+
+/**
+ * 多账号分隔。三种写法都认：
+ *   ① 换行分隔（最稳，token 里的任意字符都不会被误切）
+ *   ② & 分隔 —— 青龙对**同名环境变量**是按名字分组后 .join('&') 注入的
+ *      （见 back/services/env.ts 的 groupBy(envs,'name')），
+ *      所以「一个账号一条同名 MT_TOKEN」最终就是 & 拼接。
+ *      & 不属于 token 的字符集，可以无条件当分隔符。
+ *   ③ 单行 # 分隔 —— 更早的老写法。只在「某一段里含 #」时才细分，
+ *      而且要求细分出来的每一段都长得像 token，避免把 token 自带的 # 截断。
+ *      （老条目 `a#b` 和新条目 c 混在一起会变成 `a#b&c`，上面这步就能兜住。）
+ */
 function splitTokens(text) {
   const raw = String(text || '').replace(/\r/g, '').trim();
   if (!raw) return [];
-  const parts = raw.includes('\n') ? raw.split(/\n+/) : raw.split(/#+/);
-  return parts.map((s) => s.trim()).filter(Boolean);
+
+  let parts;
+  if (raw.includes('\n')) parts = raw.split(/\n+/);
+  else if (raw.includes('&')) parts = raw.split(/&+/);
+  else parts = [raw];
+
+  const out = [];
+  for (const p0 of parts.map((s) => s.trim()).filter(Boolean)) {
+    if (p0.includes('#')) {
+      const sub = p0.split(/#+/).map((s) => s.trim()).filter(Boolean);
+      if (sub.length > 1 && sub.every(looksLikeToken)) {
+        out.push(...sub);
+        continue;
+      }
+    }
+    out.push(p0);
+  }
+  return out;
 }
 
 function readTokenFile() {

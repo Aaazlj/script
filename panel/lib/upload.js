@@ -3,7 +3,9 @@
  *
  *   应用宝 → 不写任何东西：账号保存在网关里，脚本运行时自动发现；
  *            yyb_server 由后台「配置/测试青龙连接」时兜底确保存在（见 ensureYybServerEnv）
- *   美团   → MT_TOKEN（多账号按行追加，已存在则跳过）
+ *   美团   → MT_TOKEN：**一个账号一条同名环境变量**，每条自带备注（手机号 / 昵称）。
+ *            青龙会把同名变量的值用 & 拼成一个值注入脚本，
+ *            meituan_coupon.js 已支持 & 分隔，所以下游不用改。
  */
 
 const qinglong = require('./qinglong');
@@ -62,20 +64,74 @@ async function ensureYybServerEnv(cfg) {
   return { ok: true, variable: 'yyb_server', action: res.action, value };
 }
 
-/** 美团：token 追加进 MT_TOKEN（多账号一行一个） */
-async function uploadMeituanToken(cfg, token) {
+/**
+ * 把一条环境变量的值拆成若干 token，用于「这个账号是不是已经录过了」的去重判断。
+ * 兼容三种写法：换行分隔、青龙的 & 拼接、更早的单行 # 分隔。
+ */
+function splitEnvValue(raw) {
+  return String(raw == null ? '' : raw)
+    .replace(/\r/g, '')
+    .split(/[\n&#]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * 美团：一个账号 → 一条独立的 MT_TOKEN 环境变量（同名多条）。
+ *
+ * 为什么不「换行拼进同一条变量」：
+ *   · 青龙对同名环境变量是按名字分组后 .join('&') 注入的，两种写法脚本都读得到；
+ *   · 但一条一条写能在青龙界面上给每个账号单独填备注（手机号 / 昵称），
+ *     而且删某个账号时只删它那一行，不会误伤别的号。
+ *
+ * @param {string} token    扫码拿到的 token
+ * @param {string} remarks  可选备注；留空则自动用「美团账号 N」
+ */
+async function uploadMeituanToken(cfg, token, remarks) {
   if (!token) return { ok: false, error: 'token 为空，跳过上传' };
-  const res = await qinglong.appendEnvLine(cfg.qinglong, 'MT_TOKEN', token, '美团优惠券自动领取 token（由扫码面板写入）');
-  if (!res.ok) return res;
-  // 只回传脱敏信息，绝不把完整 token 送回前端
+  const value = String(token).trim();
+  const note = String(remarks || '').trim().slice(0, 64);
+
+  const found = await qinglong.findEnvs(cfg.qinglong, 'MT_TOKEN');
+  if (!found.ok) return found;
+
+  const hit = found.list.find((e) => {
+    const v = String(e.value == null ? '' : e.value).replace(/\r/g, '').trim();
+    return v === value || splitEnvValue(v).includes(value);
+  });
+
+  if (hit) {
+    // 这个账号已经录过了：不重复建，但如果原本没备注、这次给了就顺手补上
+    let patched = '';
+    const old = String(hit.remarks || '').trim();
+    if (note && !old) {
+      const up = await qinglong.setEnvRemarks(cfg.qinglong, hit, note);
+      if (up.ok) patched = note;
+    }
+    return {
+      ok: true,
+      action: 'unchanged',
+      variable: 'MT_TOKEN',
+      masked: mask(value),
+      host: found.host,
+      accountCount: found.list.length,
+      remarks: patched || old,
+      remarksPatched: Boolean(patched),
+    };
+  }
+
+  const text = note || `美团账号 ${found.list.length + 1}`;
+  const created = await qinglong.addEnvEntry(cfg.qinglong, 'MT_TOKEN', value, text);
+  if (!created.ok) return created;
+
   return {
     ok: true,
-    action: res.action,
+    action: 'created',
     variable: 'MT_TOKEN',
-    masked: mask(token),
-    host: res.host,
-    existingLines: res.existingLines,
-    duplicates: res.duplicates,
+    masked: mask(value),
+    host: created.host,
+    remarks: text,
+    accountCount: found.list.length + 1,
   };
 }
 
