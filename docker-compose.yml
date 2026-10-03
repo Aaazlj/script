@@ -1,4 +1,4 @@
-# 扫码登录面板 · 应用宝 + 美团 → 青龙
+# 扫码登录面板 · 应用宝扫码 → 青龙（美团改成青龙里跑脚本，面板只留签名接口）
 #
 # 启动：docker compose up -d --build
 # 入口：http://<服务器IP>:5180       管理后台 /admin
@@ -42,13 +42,10 @@ services:
       PANEL_YYB_BASE_URL: http://yyb-go:8000
       # 扫码成功后写进青龙 yyb_server 的值：青龙容器里能解析的地址
       PANEL_YYB_PUBLIC_BASE_URL: http://yyb-go:8000
-      # 美团扫码复用的官方专家包入口（挂载见下）
-      MT_RUN_JS: /opt/meituan-expert/scripts/run.js
     volumes:
       - ./data/panel:/app/data
-      # 美团登录态（pt-passport token），不挂载的话容器重建就要重新扫码
-      - ./data/meituan-auth:/root/.workbuddy/credentials
-      # 美团专家包「领券下单找我」的完整目录；缺失时仅美团通道不可用
+      # 美团专家包目录：面板不再做美团扫码登录，只借它的 vendor/cliguard/js/cliguard.js
+      # 给青龙里的 meituan_code.js 提供 mtgsig 签名。缺失时只是签名接口不可用。
       - ./meituan-expert:/opt/meituan-expert
     networks:
       - panel

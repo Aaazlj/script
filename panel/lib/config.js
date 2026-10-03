@@ -32,11 +32,6 @@ const DEFAULTS = {
     // 扫码成功后写进青龙 yyb_server 的地址；留空则用 baseUrl（并把 0.0.0.0/127.0.0.1 换成面板访问地址的 host）
     publicBaseUrl: process.env.PANEL_YYB_PUBLIC_BASE_URL || '',
   },
-  meituan: {
-    // 官方专家包 run.js 的绝对路径；留空则自动探测
-    runJs: process.env.MT_RUN_JS || '',
-    aiScene: process.env.MT_AI_SCENE || '',
-  },
 };
 
 function clone(v) {

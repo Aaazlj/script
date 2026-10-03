@@ -2,8 +2,12 @@
 /**
  * 扫码登录面板 · 统一入口
  *
- * 普通用户：打开首页 → 选「应用宝」或「美团」→ 扫码 → 自动把凭据写进青龙。
+ * 普通用户：打开首页 → 扫「应用宝」码 → 账号存进网关（不写青龙）。
  * 管理员： 打开 /admin → 首次引导设置密码 → 配置青龙 host / Client ID / Client Secret。
+ *
+ * 另外还对外提供美团接口的 mtgsig 签名服务（/api/meituan/sign），
+ * 供青龙里的 meituan_code.js 调用 —— 这是**唯一的**美团相关能力，
+ * 面板本身不再做美团扫码登录。
  *
  * 启动：
  *   node server.js [--host 0.0.0.0] [--port 5180]
@@ -20,7 +24,6 @@ const auth = require('./lib/auth');
 const httpx = require('./lib/http');
 const qinglong = require('./lib/qinglong');
 const yyb = require('./lib/yyb');
-const meituan = require('./lib/meituan');
 const upload = require('./lib/upload');
 const sign = require('./lib/sign');
 
@@ -107,109 +110,8 @@ route('POST', '/api/yyb/confirm', async (req, res) => {
   httpx.ok(res, { account: conf.account });
 });
 
-/**
- * 美团扫码入口 —— **一律走「新账号」流程**
- *
- * run.js 的 pt-passport 缓存是「单槽位」文件（键 <client_id>@prod）：
- * 槽位里躺着一个账号时，auth-get-code 永远返回 type:'token'，出不来二维码
- * （这就是以前「只能扫一个账号、老显示已有有效登录态」的根因）。所以：
- *   ① 槽位里有旧账号 → 先幂等落一次青龙（切号不丢号）
- *   ② run.js logout 清掉槽位
- *   ③ 重新 auth-get-code 拿授权链接 → 出二维码
- *
- * body.remarks 可选：写进青龙那条 MT_TOKEN 的备注（手机号 / 昵称）。
- * 万一清槽位失败，退化成「已有登录态」并把 degraded 原因带回页面，不卡在二维码上。
- */
-route('POST', '/api/meituan/start', async (req, res) => {
-  const cfg = config.load();
-  const runJs = meituan.normalizeRunJs(cfg);
-  if (!runJs) {
-    return httpx.fail(res, 500, '未找到美团专家包的 run.js，请先到管理后台填写路径');
-  }
-
-  const body = await httpx.readJSON(req).catch(() => ({}));
-  const remarks = String(body.remarks || '').trim().slice(0, 64);
-
-  // 官方建议先拿设备标识，失败不阻断（部分环境没有 auth.py 也能登录）
-  await meituan.getDeviceToken(cfg);
-
-  let code = await meituan.authGetCode(cfg);
-  if (!code.ok && !code.type) {
-    return httpx.fail(res, 502, code.message || code.error || '获取授权链接失败');
-  }
-
-  let savedOld = null;
-  let degraded = '';
-
-  // 槽位里躺着上一个账号：先落库，再清槽位
-  if (code.type === 'token' && code.token) {
-    savedOld = await upload.uploadMeituanToken(cfg, code.token);
-
-    const lg = await meituan.logout(cfg);
-    if (!lg.ok) {
-      degraded = `清除本地登录态失败（${lg.message || lg.error || '未知错误'}）。可到管理后台点「清除本地美团登录态」后重试。`;
-    } else {
-      const again = await meituan.authGetCode(cfg);
-      if (again.type === 'token' && again.token) {
-        degraded = '本地登录态没清干净，仍然返回旧 token。可到管理后台点「清除本地美团登录态」后重试。';
-      } else if (!again.ok && !again.type) {
-        return httpx.fail(res, 502, again.message || again.error || '清除登录态后重新获取授权链接失败');
-      } else {
-        code = again;
-      }
-    }
-  }
-
-  if (degraded) {
-    const sid = newSession({ mode: 'meituan', uploaded: true, upload: savedOld });
-    return httpx.ok(res, { sid, mode: 'token', degraded, upload: savedOld });
-  }
-
-  if (code.type !== 'auth_link' || !code.url) {
-    return httpx.fail(res, 502, code.message || `未知返回：${JSON.stringify(code).slice(0, 200)}`);
-  }
-
-  const qr = await meituan.fetchQRCode(cfg, code.url);
-  const taskId = meituan.startPollTask(cfg);
-  const sid = newSession({ mode: 'meituan', taskId, authUrl: code.url, remarks });
-
-  httpx.ok(res, {
-    sid,
-    mode: 'qrcode',
-    authUrl: code.url,
-    remarks,
-    savedOld,
-    imageUrl: qr.ok ? qr.imageUrl || '' : '',
-    imageBase64: qr.ok ? qr.imageBase64 || '' : '',
-    qrError: qr.ok ? '' : qr.message || qr.error || '',
-  });
-});
-
-route('GET', '/api/meituan/status', async (req, res, url) => {
-  const sid = url.searchParams.get('sid') || '';
-  const sess = sessions.get(sid);
-  if (!sess || sess.mode !== 'meituan') return httpx.fail(res, 404, '扫码会话不存在或已过期，请刷新重试');
-
-  if (sess.uploaded) return httpx.ok(res, { status: 'done', upload: sess.upload || null });
-
-  const task = meituan.getTask(sess.taskId);
-  if (!task) return httpx.fail(res, 404, '登录任务已过期，请刷新重试');
-  if (task.status === 'running') return httpx.ok(res, { status: 'running' });
-  if (task.status === 'failed') {
-    sessions.delete(sid);
-    return httpx.ok(res, { status: 'failed', message: task.error });
-  }
-
-  // 只有第一次轮询到成功时才真正上传，避免重复写
-  const cfg = config.load();
-  const up = await upload.uploadMeituanToken(cfg, task.token, sess.remarks);
-  sess.uploaded = true;
-  sess.upload = up;
-  sessions.delete(sid);
-  httpx.ok(res, { status: 'done', upload: up });
-});
-
-/* 美团签名服务（供青龙里的 mt_code.py 调用，只需容器网络可达） */
+/* 美团签名服务（供青龙里的 meituan_code.js 调用，只需容器网络可达） */
+/* 面板不再做美团扫码登录，这里只保留 mtgsig 签名能力（依赖挂进来的专家包 cliguard.js） */
 
 route('GET', '/api/meituan/sign/health', async (req, res) => {
   httpx.ok(res, { available: sign.available() });
@@ -391,11 +293,6 @@ route('GET', '/api/admin/config', async (req, res) => {
       baseUrl: cfg.yyb.baseUrl,
       publicBaseUrl: cfg.yyb.publicBaseUrl,
     },
-    meituan: {
-      runJs: cfg.meituan.runJs,
-      detectedRunJs: meituan.normalizeRunJs(cfg),
-      aiScene: cfg.meituan.aiScene,
-    },
   });
 }, { admin: true });
 
@@ -419,12 +316,6 @@ route('PUT', '/api/admin/config', async (req, res) => {
       publicBaseUrl: String(body.yyb.publicBaseUrl || '').trim(),
     };
   }
-  if (body.meituan) {
-    patch.meituan = {
-      runJs: String(body.meituan.runJs || '').trim(),
-      aiScene: String(body.meituan.aiScene || '').trim(),
-    };
-  }
 
   const cfg = config.update(patch);
   // 保存青龙配置后顺手兜底确保 yyb_server 存在（已存在则完全不动）
@@ -435,7 +326,6 @@ route('PUT', '/api/admin/config', async (req, res) => {
   httpx.ok(res, {
     qinglong: { host: cfg.qinglong.host, clientId: cfg.qinglong.clientId, clientSecretSet: Boolean(cfg.qinglong.clientSecret) },
     yyb: cfg.yyb,
-    meituan: { runJs: cfg.meituan.runJs, detectedRunJs: meituan.normalizeRunJs(cfg) },
     yyb_server,
   });
 }, { admin: true });
@@ -459,41 +349,6 @@ route('POST', '/api/admin/test/yyb', async (req, res) => {
   const out = await yyb.health(cfg.yyb);
   if (!out.ok) return httpx.fail(res, 502, out.error);
   httpx.ok(res, out);
-}, { admin: true });
-
-route('POST', '/api/admin/test/meituan', async (req, res) => {
-  const cfg = config.load();
-  const out = await meituan.environmentCheck(cfg);
-  if (!out.runJs) return httpx.fail(res, 500, '未找到 run.js，请填写绝对路径');
-  if (!out.ok) return httpx.fail(res, 502, out.message || out.error || '环境检查失败');
-  httpx.ok(res, { runJs: out.runJs, scripts_dir: out.scripts_dir, clientType: out.clientType });
-}, { admin: true });
-
-/**
- * 查看 / 清除美团本地登录态
- *
- * run.js 的 pt-passport 缓存是单槽位文件，页面「再扫一个账号」会自动清；
- * 这里留一个手动入口，方便缓存异常（清不掉、或想强制回退到未登录状态）时自救。
- */
-route('GET', '/api/admin/meituan/session', async (req, res) => {
-  const cfg = config.load();
-  const out = await meituan.getCachedToken(cfg);
-  const token = out.ok ? String(out.token || '').trim() : '';
-  httpx.ok(res, {
-    hasToken: Boolean(token),
-    masked: token ? (token.length > 12 ? `${token.slice(0, 8)}****${token.slice(-4)}` : '****') : '',
-    error: token ? '' : (out.message || out.error || ''),
-  });
-}, { admin: true });
-
-route('POST', '/api/admin/meituan/logout', async (req, res) => {
-  const cfg = config.load();
-  const out = await meituan.logout(cfg);
-  if (!out.ok) return httpx.fail(res, 502, out.message || out.error || '清除失败');
-  // 清完再探一次，确认槽位真的空了
-  const probe = await meituan.getCachedToken(cfg);
-  const still = probe.ok && String(probe.token || '').trim();
-  httpx.ok(res, { cleared: !still, message: still ? '仍能读到缓存 token，可能 run.js 版本不支持 logout' : '已清除本地登录态' });
 }, { admin: true });
 
 /* ---------------- 匹配与分发 ---------------- */
