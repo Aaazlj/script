@@ -446,7 +446,12 @@ async function doSave(silent) {
   try {
     await api('PUT', '/api/admin/config', {
       qinglong: { host: qlHost.value, clientId: qlId.value, clientSecret: qlSecret.value },
-      yyb: { baseUrl: yybBase.value, publicBaseUrl: yybPub.value },
+      yyb: {
+        baseUrl: yybBase.value,
+        publicBaseUrl: yybPub.value,
+        // 账号页还没构建时不要动它（undefined 的键会被 JSON.stringify 丢掉）
+        scripts: acctScriptsInput ? textToScripts(acctScriptsInput.value) : undefined,
+      },
     });
     qlSecret.value = '';
     cfg = await api('GET', '/api/admin/config');
@@ -465,8 +470,54 @@ async function doSave(silent) {
 
 /* ---------- 应用宝账号 ---------- */
 
-let acctListEl, acctOut, acctFileInput;
+let acctListEl, acctOut, acctFileInput, acctScriptsInput;
 let dragRef = null;
+
+/* ---------- 「账号跑哪些脚本」的列定义 ---------- */
+
+/** 当前生效的脚本列（key 必须和脚本自报的一致） */
+function scriptDefs() {
+  const list = (cfg && cfg.yyb && Array.isArray(cfg.yyb.scripts)) ? cfg.yyb.scripts : [];
+  return list.filter((s) => s && s.key);
+}
+
+function scriptName(key) {
+  const hit = scriptDefs().find((s) => s.key === key);
+  return (hit && hit.name) || key;
+}
+
+/** 数组 → 输入框文本：mt=美团, sfsy=顺丰 */
+function scriptsToText(list) {
+  return (list || []).map((s) => (s.name && s.name !== s.key ? s.key + '=' + s.name : s.key)).join(', ');
+}
+
+/** 输入框文本 → 数组：mt=美团, sfsy=顺丰（也接受只写 key） */
+function textToScripts(text) {
+  return String(text || '')
+    .split(/[,，;；]+/)
+    .map((part) => {
+      const i = part.indexOf('=');
+      const key = (i === -1 ? part : part.slice(0, i)).trim().toLowerCase();
+      const name = (i === -1 ? '' : part.slice(i + 1)).trim();
+      return { key, name: name || key };
+    })
+    .filter((s) => s.key);
+}
+
+/** 账号的标记串 → key 数组（逗号 / 空格混用都能解析） */
+function parseTags(value) {
+  return String(value || '')
+    .split(/[,，;；\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/** 标记串 → 给人看的说明 */
+function describeTags(value) {
+  const tags = parseTags(value);
+  if (!tags.length) return '全部脚本';
+  return '只跑：' + tags.map(scriptName).join('、');
+}
 
 function buildAccounts() {
   acctOut = node('div');
@@ -477,10 +528,12 @@ function buildAccounts() {
     style: 'display:none',
     onchange: (e) => importAccounts(e.target),
   });
+  acctScriptsInput = input('acctScripts', { value: scriptsToText(scriptDefs()) });
 
   const card = node('div', { class: 'card' }, [
     node('h2', { text: '已入库的应用宝账号' }),
     node('div', { class: 'hint', text: '这里显示扫码登录后存进 yyb_go 网关的微信账号。青龙脚本通过 yyb_server 调它取 code，删掉某个账号即可让脚本不再用它。拖动左侧手柄可以调整顺序（脚本按这个顺序依次执行）。' }),
+    node('div', { class: 'hint', text: '每个账号下面那排勾选框决定「这个账号跑哪些脚本」：勾掉谁，谁的脚本就跳过它；全部勾上（或从没设置过）= 所有脚本都跑。改完即时生效，不用重跑订阅。' }),
     node('div', { class: 'row', style: 'margin-bottom:14px' }, [
       node('button', { class: 'btn small ghost', text: '刷新列表', onclick: (e) => loadAccounts(e.target) }),
       node('button', {
@@ -495,11 +548,34 @@ function buildAccounts() {
       node('button', { class: 'btn small ghost', text: '导出全部', onclick: (e) => exportAccounts('', e.target) }),
       acctFileInput,
     ]),
+    field(
+      '脚本列',
+      acctScriptsInput,
+      '决定每个账号后面显示哪几个脚本的勾选框，格式 key=显示名，逗号分隔（如 mt=美团, sfsy=顺丰, ppcs=朴朴）。'
+      + ' key 必须和脚本里自报的一致：脚本读环境变量 yyb_script_key，默认 sfsy_code.js 是 sfsy、ppcs_code.js 是 ppcs、meituan_code.js 是 mt。改完点右上角「保存配置」。',
+    ),
+    node('div', { class: 'row', style: 'margin-bottom:6px' }, [
+      node('button', { class: 'btn small ghost', text: '保存脚本列', onclick: (e) => saveScriptColumns(e.target) }),
+    ]),
     acctListEl,
     acctOut,
   ]);
 
   return node('section', { class: 'panel hidden', 'data-panel': 'accounts' }, [card]);
+}
+
+/** 保存「脚本列」定义（复用整体保存，成功后重画账号列表让勾选框跟着变） */
+async function saveScriptColumns(btn) {
+  if (btn) btn.disabled = true;
+  const ok = await doSave(true);
+  if (ok) {
+    acctScriptsInput.value = scriptsToText(scriptDefs());
+    show(acctOut, 'ok', ['✅ 已保存脚本列：' + (scriptDefs().map((s) => s.name + '（' + s.key + '）').join('、') || '（空）')]);
+    await loadAccounts();
+  } else {
+    show(acctOut, 'err', ['保存失败，请检查网络或面板配置']);
+  }
+  if (btn) btn.disabled = false;
 }
 
 function statusBadge(status) {
@@ -512,6 +588,72 @@ function statusBadge(status) {
   ]);
 }
 
+/** 勾选状态 → 要写进网关的标记串；全部勾上 = 空串（= 不限制，所有脚本都跑） */
+function tagValue(checkedKeys, defs, extras) {
+  const allOn = defs.every((d) => checkedKeys.includes(d.key));
+  if (allOn && !extras.length) return '';
+  const ordered = defs.filter((d) => checkedKeys.includes(d.key)).map((d) => d.key);
+  return ordered.concat(extras).join(',');
+}
+
+function checkedKeys(box, defs) {
+  return defs.filter((d) => {
+    const cb = box.querySelector('input[data-script="' + d.key + '"]');
+    return cb && cb.checked;
+  }).map((d) => d.key);
+}
+
+/**
+ * 每个账号下面那排「跑哪些脚本」勾选框。
+ *
+ * 语义：标记为空 = 不限制（所有脚本都跑，也就是默认行为）；
+ * 一旦勾掉某个脚本，就把「剩下的那几个」写成白名单。全勾回去 = 又变回空串。
+ */
+function scriptToggles(a) {
+  const defs = scriptDefs();
+  if (!defs.length) return null;
+
+  const tags = parseTags(a.scripts);
+  const unrestricted = tags.length === 0;
+  // 标记里有、但没写进「脚本列」的 key —— 保留它们，别在保存时悄悄抹掉
+  const extras = tags.filter((k) => !defs.some((d) => d.key === k));
+
+  const box = node('div', { style: 'display:flex;gap:14px;margin-top:7px;align-items:center;flex-wrap:wrap' });
+  for (const def of defs) {
+    const cb = node('input', {
+      type: 'checkbox',
+      'data-script': def.key,
+      style: 'margin:0 5px 0 0;vertical-align:middle;cursor:pointer',
+      onchange: () => saveScriptToggles(a, box, defs, extras),
+    });
+    cb.checked = unrestricted || tags.includes(def.key);
+    box.appendChild(node('label', {
+      style: 'display:inline-flex;align-items:center;font-size:13px;cursor:pointer;color:var(--muted)',
+      title: '脚本标记：' + def.key,
+    }, [cb, node('span', { text: def.name })]));
+  }
+  box.appendChild(node('span', {
+    style: 'font-size:12px;color:var(--muted)',
+    text: unrestricted ? '全部脚本' : describeTags(tags.join(',')),
+  }));
+  return box;
+}
+
+async function saveScriptToggles(a, box, defs, extras) {
+  const value = tagValue(checkedKeys(box, defs), defs, extras);
+  const name = a.nickname || a.alias || a.openid || ('#' + a.ref);
+  show(acctOut, 'info', ['正在保存…']);
+  try {
+    const r = await api('POST', '/api/yyb/accounts/scripts', { items: [{ ref: a.ref, scripts: value }] });
+    if (r.accounts && r.accounts.length) renderAccounts(r.accounts);
+    else await loadAccounts();
+    show(acctOut, 'ok', [`✅「${name}」：${value ? describeTags(value) : '全部脚本（不限制）'}`]);
+  } catch (e) {
+    show(acctOut, 'err', ['保存失败：' + e.message]);
+    await loadAccounts();   // 界面上的勾选回滚成服务端的真实状态
+  }
+}
+
 function accountRow(a) {
   const name = a.nickname || a.alias || a.openid || ('#' + a.ref);
   const avatar = a.hasAvatar
@@ -521,6 +663,7 @@ function accountRow(a) {
   const meta = node('div', { style: 'flex:1;min-width:0' }, [
     node('div', { text: name, style: 'font-weight:500' }),
     node('div', { text: 'openid ' + (a.openid || '-') + (a.uin ? ' · uin ' + a.uin : ''), style: 'font-size:12px;color:var(--muted);word-break:break-all' }),
+    scriptToggles(a),
   ]);
 
   const btn = (text, fn, cls) => node('button', {
