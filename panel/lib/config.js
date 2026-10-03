@@ -31,6 +31,14 @@ const DEFAULTS = {
     baseUrl: process.env.PANEL_YYB_BASE_URL || 'http://127.0.0.1:8000',
     // 扫码成功后写进青龙 yyb_server 的地址；留空则用 baseUrl（并把 0.0.0.0/127.0.0.1 换成面板访问地址的 host）
     publicBaseUrl: process.env.PANEL_YYB_PUBLIC_BASE_URL || '',
+    // 「账号页要显示哪几列脚本」。key 必须和脚本里自报的一致
+    // （脚本读 yyb_script_key，默认 mt / sfsy / ppcs），name 只是面板上的显示名。
+    // 以后加脚本：这里加一行，或者直接在后台页面上改。
+    scripts: [
+      { key: 'mt', name: '美团' },
+      { key: 'sfsy', name: '顺丰' },
+      { key: 'ppcs', name: '朴朴' },
+    ],
   },
 };
 
@@ -56,6 +64,23 @@ function ensureDataDir() {
   fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 }
 
+/**
+ * 规整「账号页显示哪几列脚本」的定义：
+ * 支持 ["mt","sfsy"] 和 [{key,name}] 两种写法，统一小写 key、去重、补默认名。
+ */
+function normalizeScripts(raw) {
+  const out = [];
+  const seen = new Set();
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const src = typeof item === 'string' ? { key: item } : (item || {});
+    const key = String(src.key || '').trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, name: String(src.name || '').trim() || key });
+  }
+  return out;
+}
+
 function load() {
   let parsed = {};
   try {
@@ -70,6 +95,11 @@ function load() {
   }
   if (!path.isAbsolute(cfg.yyb.baseUrl) && !/^https?:\/\//i.test(cfg.yyb.baseUrl)) {
     cfg.yyb.baseUrl = DEFAULTS.yyb.baseUrl;
+    dirty = true;
+  }
+  const scripts = normalizeScripts(cfg.yyb.scripts);
+  if (JSON.stringify(scripts) !== JSON.stringify(cfg.yyb.scripts)) {
+    cfg.yyb.scripts = scripts;
     dirty = true;
   }
   if (dirty) save(cfg);
@@ -107,5 +137,6 @@ module.exports = {
   save,
   update,
   isAdminConfigured,
+  normalizeScripts,
   trimBase,
 };

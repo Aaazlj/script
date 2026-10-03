@@ -102,6 +102,8 @@ function normalizeAccount(a) {
     nickname: (a && (a.nickname || a.alias)) || '',
     alias: (a && a.alias) || '',
     status: (a && a.status) || '',
+    // 「这个账号跑哪些脚本」的标记，逗号分隔；空 = 不限制（所有脚本都跑它）
+    scripts: (a && a.scripts) || '',
     hasAvatar: !!(a && a.avatar),
   };
 }
@@ -210,6 +212,20 @@ async function setAccountOrder(cfg, refs) {
   return { ok: true, result: out.data };
 }
 
+/** 设置账号的「跑哪些脚本」标记。items = [{ref, scripts}]，scripts 空串表示不限制 */
+async function setAccountScripts(cfg, items) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/accounts/scripts`, {
+    method: 'POST',
+    body: { items },
+    timeout: TIMEOUT,
+  });
+  const out = unwrap(res, '保存脚本标记');
+  if (!out.ok) return out;
+  return { ok: true, result: out.data };
+}
+
 module.exports = {
   health,
   createQR,
@@ -223,4 +239,5 @@ module.exports = {
   exportAccounts,
   importAccounts,
   setAccountOrder,
+  setAccountScripts,
 };

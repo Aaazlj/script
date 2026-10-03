@@ -226,6 +226,31 @@ route('POST', '/api/yyb/accounts/order', async (req, res) => {
   httpx.ok(res, { ordered: (out.result && out.result.ordered) || 0, accounts: list.ok ? list.accounts : [] });
 }, { admin: true });
 
+route('POST', '/api/yyb/accounts/scripts', async (req, res) => {
+  const body = await httpx.readJSON(req);
+  const raw = Array.isArray(body.items)
+    ? body.items
+    : (body.ref ? [{ ref: body.ref, scripts: body.scripts }] : []);
+  const items = raw
+    .map((it) => ({
+      ref: String((it && it.ref) || '').trim(),
+      scripts: String(it && it.scripts != null ? it.scripts : '').trim(),
+    }))
+    .filter((it) => it.ref);
+  if (!items.length) return httpx.fail(res, 400, '缺少要修改的账号 ref');
+
+  const cfg = config.load();
+  const out = await yyb.setAccountScripts(cfg.yyb, items);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  const result = out.result || {};
+  const list = await yyb.listAccounts(cfg.yyb);
+  httpx.ok(res, {
+    updated: result.updated || 0,
+    skipped: result.skipped || [],
+    accounts: list.ok ? list.accounts : [],
+  });
+}, { admin: true });
+
 /* 管理后台 */
 
 route('GET', '/api/admin/health', async (req, res) => {
@@ -292,6 +317,7 @@ route('GET', '/api/admin/config', async (req, res) => {
     yyb: {
       baseUrl: cfg.yyb.baseUrl,
       publicBaseUrl: cfg.yyb.publicBaseUrl,
+      scripts: cfg.yyb.scripts,
     },
   });
 }, { admin: true });
@@ -315,6 +341,10 @@ route('PUT', '/api/admin/config', async (req, res) => {
       baseUrl: String(body.yyb.baseUrl || '').trim() || config.DEFAULTS.yyb.baseUrl,
       publicBaseUrl: String(body.yyb.publicBaseUrl || '').trim(),
     };
+    // 脚本列定义：不传就沿用现有值，避免只改地址时把列清空
+    if (body.yyb.scripts !== undefined) {
+      patch.yyb.scripts = config.normalizeScripts(body.yyb.scripts);
+    }
   }
 
   const cfg = config.update(patch);
