@@ -47,12 +47,24 @@ new Env('朴朴超市Code版')
                         零依赖实现（自建 CONNECT 隧道），不需要额外 npm 包。
    yyb_auto_refresh     默认 1。账号状态非 alive 时自动 /accounts/refresh 续期
    yyb_skip_expired     默认 1。续期后仍为 expired 的账号直接跳过
+                        —— 但若该账号本地有登录态缓存，仍会尝试（见下方「登录态复用」）
+   ppcs_login_cache     默认 1。设 0 关闭「登录态复用」，退回每次都去网关取 code
+   PPCS_LOGIN_CACHE_FILE  登录态缓存路径，默认 $QL_DIR/data/ppcs_login_cache.json
+                        ⚠️ 内含 token，写入权限 0600，别外传/别提交
    yyb_script_key       本脚本在网关账号上的标记 key，默认 ppcs。账号的 scripts 标记里
                         没有它就不跑这个账号（标记为空 = 不限制，所有脚本都跑）。
                         在扫码面板「应用宝账号」页勾选即可，不用手填。
    yyb_tag_filter       默认 1（按标记过滤）。设 0 则忽略标记跑全部账号
                         —— 只影响「自动拉取」写法二/三；显式写了 @ref 时以你写的为准
    ppcs_version_check   默认 0。设为 1 时启用远端版本检查（联网慢的环境别开）
+
+登录态复用（重要）：
+  · 登录成功后会把这套凭证（token / refresh_token / open_id / suid / user_id）缓存到本地，
+    **下次运行先用缓存的 token**（用一次「查用户信息」轻量请求验证它是否还被服务端认），
+    有效就不去网关取 code；失效才回退「网关取 code → 重新登录」，并覆盖写入缓存。
+  · 好处：① 省掉每轮的 getCode + silent_login；② 网关里账号授权掉了（status=expired）、
+    取不到 code 时，只要本地缓存 token 还有效，脚本照样能签到 ——
+    不会因为「没有 alive 账号」整体不跑。
 
 4. 账号 ref 说明：
    - 纯数字先按 UIN 匹配，匹配不到再按 账号ID 匹配；非数字按 OpenID 匹配
@@ -67,6 +79,9 @@ new Env('朴朴超市Code版')
 */
 
 // ==================== 常量定义 ====================
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 const CommonUtils = createCommonUtils("朴朴超市");
 const PROJECT_NAME = "pupu";
 const REQUEST_TIMEOUT = 20000;
@@ -100,6 +115,12 @@ const YYB_TAG_FILTER = String(process.env.yyb_tag_filter ?? "1") !== "0";
 // 可选开关
 const AUTO_REFRESH = (process.env.yyb_auto_refresh ?? "1") !== "0";
 const SKIP_EXPIRED = (process.env.yyb_skip_expired ?? "1") !== "0";
+// 登录态复用：下次运行先复用上次的 token，失效再回网关取 code。关掉：ppcs_login_cache=0
+const LOGIN_CACHE_ON = String(process.env.ppcs_login_cache ?? "1") !== "0";
+const LOGIN_CACHE_FILE = process.env.PPCS_LOGIN_CACHE_FILE
+  || (process.env.QL_DIR
+    ? path.join(process.env.QL_DIR, "data", "ppcs_login_cache.json")
+    : path.join(__dirname, "data", "ppcs_login_cache.json"));
 const ENABLE_VERSION_CHECK = (process.env.ppcs_version_check ?? "0") === "1";
 // 定位（默认福州，可自行改成常驻城市）
 const PPCS_LNG = process.env.ppcs_lng || process.env.PPCS_LNG || "119.31";
@@ -697,6 +718,74 @@ async function refreshGatewayAccount(serverUrl, ref) {
 }
 
 // ==================== 网关登录 ====================
+// ==================== 登录态缓存（跨天复用；失效自动回退网关取 code） ====================
+// 形状：{ accounts: { <sha256(ref)[0:12]>: {ref,token,refresh_token,open_id,suid,user_id,nick_name,obtained_at} } }
+// token 属敏感信息，文件按 0600 写。
+function loginCacheKey(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 12);
+}
+
+function readLoginCacheAll() {
+  if (!LOGIN_CACHE_ON) return {};
+  try {
+    const all = JSON.parse(fs.readFileSync(LOGIN_CACHE_FILE, "utf8"));
+    if (all && all.accounts && typeof all.accounts === "object") return all.accounts;
+  } catch (_) { /* 不存在/损坏 → 当没有 */ }
+  return {};
+}
+
+function writeLoginCacheAll(accounts) {
+  if (!LOGIN_CACHE_ON) return;
+  try {
+    fs.mkdirSync(path.dirname(LOGIN_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(LOGIN_CACHE_FILE, JSON.stringify({
+      note: "朴朴登录态缓存（按网关 ref 索引；含 token，敏感文件，权限 0600）。"
+        + "失效后由脚本自动回退「网关取 code 重新登录」并覆盖本文件。",
+      accounts,
+    }, null, 2), { encoding: "utf8", mode: 0o600 });
+    try { fs.chmodSync(LOGIN_CACHE_FILE, 0o600); } catch (_) {}
+  } catch (e) {
+    CommonUtils.log("[提示] 登录态缓存写入失败（不影响签到）：" + e.message);
+  }
+}
+
+/** 取某 ref 的缓存登录数据（无则 null），形状与 silent_login 的返回一致 */
+function getCachedLogin(ref, all) {
+  if (!LOGIN_CACHE_ON) return null;
+  const rec = (all || {})[loginCacheKey(ref)];
+  if (!rec || !rec.token) return null;
+  return {
+    token: String(rec.token),
+    refresh_token: rec.refresh_token || "",
+    open_id: rec.open_id || "",
+    suid: rec.suid || "",
+    user_id: rec.user_id,
+    nick_name: rec.nick_name || "",
+    obtained_at: Number(rec.obtained_at || 0) || 0,
+  };
+}
+
+function putCachedLogin(all, ref, d) {
+  if (!LOGIN_CACHE_ON) return;
+  all[loginCacheKey(ref)] = {
+    ref: String(ref),
+    token: d.token,
+    refresh_token: d.refresh_token || "",
+    open_id: d.open_id || "",
+    suid: d.suid || "",
+    user_id: d.user_id,
+    nick_name: d.nick_name || "",
+    obtained_at: Math.floor(Date.now() / 1000),
+  };
+}
+
+function fmtTs(sec) {
+  if (!sec) return "未知时间";
+  try {
+    return new Date(sec * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  } catch (_) { return "未知时间"; }
+}
+
 // 通过 YYB 网关 /wxapp/getCode → 朴朴 silent_login 获取新 token
 // 网关 getCode 返回：HTTP 200 => { code:0, msg:"success", data:{ openid, result:{ code, errMsg } } }
 //                    HTTP 4xx/5xx => { code:<status>, msg:"<detail>", data:null }
@@ -851,7 +940,44 @@ class PupuUser extends BaseRequest {
     return await this.silent_login();
   }
 
-  // 网关 silent_login（getCode → silent_login → 设置 token/refresh_token/open_id/suid）
+  /** 把一份登录数据应用到实例（设置字段 + 鉴权头） */
+  applyCredentials(d) {
+    this.valid = true;
+    this.access_token = d.token;
+    this.refresh_token = d.refresh_token || "";
+    this.open_id = d.open_id || "";
+    this.suid = d.suid || "";
+    this.user_id = d.user_id;
+    this.name = this.remark || d.nick_name || "";
+
+    this.extendGot({
+      headers: {
+        "User-Agent": PPCS_UA,
+        "pp-version": PPCS_VERSION,
+        "pp-os": "0",
+        "Referer": PPCS_REFERER,
+        "Authorization": "Bearer " + d.token,
+        "pp-userid": String(d.user_id),
+        "open-id": d.open_id || "",
+        "pp-suid": d.suid || ""
+      }
+    });
+  }
+
+  /** 用一次「查用户信息」轻量请求验证当前 token 是否还被服务端认（成功=仍有效） */
+  async probeCredentials() {
+    try {
+      const { result, statusCode } = await this.request({
+        fn: "probe_user_info", method: "get", url: "https://cauth.pupuapi.com/clientauth/user/info"
+      });
+      const code = CommonUtils.get(result, "errcode", statusCode);
+      return Number(code) === 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // 先复用本地缓存的登录态，失效再走网关 silent_login（getCode → 换 token）
   async silent_login() {
     let success = false;
 
@@ -859,33 +985,47 @@ class PupuUser extends BaseRequest {
       if (this.remark) {
         this.log(">>> 开始处理：" + this.remark + "（ref=" + this.ref + "）");
       }
+
+      // 1) 先试本地缓存的登录态（用一次轻量请求验证它是否还被认）
+      if (LOGIN_CACHE_ON && this.ref) {
+        const cached = getCachedLogin(this.ref, readLoginCacheAll());
+        if (cached) {
+          this.applyCredentials(cached);
+          if (await this.probeCredentials()) {
+            this.log("🔐 复用本地登录态缓存（" + fmtTs(cached.obtained_at) + " 获取），已验证有效，不去网关取 code");
+            success = true;
+            await this.user_info();
+            return success;
+          }
+          this.log("♻️ 本地登录态缓存（" + fmtTs(cached.obtained_at) + " 获取）已失效，改用网关取 code 重新登录");
+          this.valid = false;
+        }
+      }
+
+      // 2) 网关 silent_login
       let d = await silentLoginViaGateway(this.ref, (msg) => this.log(msg), this.index, this.wxServerUrl);
       if (!d) {
         return false;
       }
 
-      this.valid = true;
-      this.access_token = d.token;
-      this.refresh_token = d.refresh_token;
-      this.open_id = d.open_id || "";
-      this.suid = d.suid || "";
-      this.user_id = d.user_id;
-      this.name = this.remark || d.nick_name || "";
-
-      this.extendGot({
-        headers: {
-          "User-Agent": PPCS_UA,
-          "pp-version": PPCS_VERSION,
-          "pp-os": "0",
-          "Referer": PPCS_REFERER,
-          "Authorization": "Bearer " + d.token,
-          "pp-userid": String(d.user_id),
-          "open-id": d.open_id || "",
-          "pp-suid": d.suid || ""
-        }
-      });
-
+      this.applyCredentials(d);
       success = true;
+
+      // 3) 网关登录成功 → 回写登录态缓存（下次直接复用）
+      if (LOGIN_CACHE_ON && this.ref) {
+        const all = readLoginCacheAll();
+        putCachedLogin(all, this.ref, {
+          token: this.access_token,
+          refresh_token: this.refresh_token,
+          open_id: this.open_id,
+          suid: this.suid,
+          user_id: this.user_id,
+          nick_name: this.name
+        });
+        writeLoginCacheAll(all);
+        this.log("💾 已缓存本次登录态，下次运行可直接复用");
+      }
+
       await this.user_info();
     } catch (exception) {
       this.log("❌ 登录异常: " + exception.message);
@@ -1376,11 +1516,17 @@ async function loadAccounts() {
             CommonUtils.log("♻️ 账号 " + accountLabel(acc) + " 续期结果: " + status);
           }
           if (status !== "alive") {
-            if (SKIP_EXPIRED) {
+            // 非 alive 但本地有登录态缓存 → 仍尝试（网关账号授权掉了、旧 token 却还有效）
+            const hasCache = !!getCachedLogin(String(acc.id), readLoginCacheAll());
+            if (SKIP_EXPIRED && !hasCache) {
               CommonUtils.log("⚠️ 跳过非存活账号: " + accountLabel(acc) + " (status=" + status + ")");
               continue;
             }
-            CommonUtils.log("⚠️ 账号可能已失效: " + accountLabel(acc) + " (status=" + status + ")");
+            if (hasCache) {
+              CommonUtils.log("🔐 账号 " + accountLabel(acc) + " 在网关里不是 alive，但本地有登录态缓存，仍尝试");
+            } else {
+              CommonUtils.log("⚠️ 账号可能已失效: " + accountLabel(acc) + " (status=" + status + ")");
+            }
           }
           // 用 id 当 ref，最稳（UIN 可能为空，openid 也不会变）
           entries.push({ wxServerUrl: host, ref: String(acc.id), remark: accountLabel(acc) });

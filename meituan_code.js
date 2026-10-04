@@ -75,6 +75,10 @@ cron: 0 10 * * *
    MT_CACHE_FILE                                   当日券缓存路径
                                                    默认：$QL_DIR/data/mt_coupons_cache.json
                                                    （容器重建不丢），其它环境 ./data/...
+   MT_LOGIN_CACHE_FILE                             登录态（token）缓存路径
+                                                   默认：$QL_DIR/data/mt_login_cache.json
+                                                   ⚠️ 文件内含 token，写入权限 0600，别外传/别提交
+   mt_login_cache                                  默认 1。设 0 关闭「登录态复用」，退回每次都去网关取 code
    mt_account_timeout                              单账号上限（秒），最小 30，默认 240。
                                                    某个账号卡死时到点跳过它、继续下一个
    MT_DEBUG                                        设 1 打印服务端原始响应，排查用
@@ -89,8 +93,17 @@ cron: 0 10 * * *
   · 每天限领一次。当天已领过时接口只返回 1014 且 couponList 为空，不带任何券数据。
     所以脚本在【真正领到券】的那次把明细写入本地缓存，之后再跑（当天）直接命中缓存回放，
     不再重复打领券接口，跨天自动失效。
-  · 缓存按【网关账号 ref】索引。因为本脚本每轮都会重新登录换新 token，
+  · 缓存按【网关账号 ref】索引。因为登录态本身也是按 ref 缓存的（见下），
     用 token 当 key 会导致缓存天天失效。
+
+  · 登录态（token）会被缓存到 MT_LOGIN_CACHE_FILE，**下次运行先用上次的 token**，
+    只有当服务端明确拒绝（401/403）时才回头去网关取 code 重新登录。
+    好处有两个：
+      ① 省掉每轮「取 code + 换 token」的往返（网关 mmtls 取 code 通常几秒）；
+      ② **关键**：网关里账号授权掉了（status=expired）、取不到 code 时，
+         只要本地缓存的 token 还有效，脚本照样能领券 —— 不会再因为
+         「一个 alive 账号都没有」而整体不跑。
+    因此账号发现阶段除了 alive 账号，还会把「非 alive 但本地有登录态缓存」的账号一并尝试。
 
 返回码含义（都是 HTTP 200，看 body 里的 code）：
   200   发券成功
@@ -210,6 +223,12 @@ const CACHE_FILE = process.env.MT_CACHE_FILE
   || (process.env.QL_DIR
     ? path.join(process.env.QL_DIR, 'data', 'mt_coupons_cache.json')
     : path.join(__dirname, 'data', 'mt_coupons_cache.json'));
+
+const LOGIN_CACHE_FILE = process.env.MT_LOGIN_CACHE_FILE
+  || (process.env.QL_DIR
+    ? path.join(process.env.QL_DIR, 'data', 'mt_login_cache.json')
+    : path.join(__dirname, 'data', 'mt_login_cache.json'));
+const LOGIN_CACHE_ON = (env('mt_login_cache') || '1').toLowerCase() !== '0';
 
 if (!GATEWAY.base) {
   $.log('❌ [配置] 缺少必填环境变量 yyb_server（应用宝网关地址，兼容旧变量 wx_server_url）');
@@ -585,9 +604,26 @@ async function resolveAccounts() {
     alive = accounts.filter((a) => String(a.status || '').toLowerCase() === 'alive');
   }
 
+  // 除了 alive 账号，还把「网关里不是 alive、但本地有登录态缓存」的账号一并纳入。
+  // 这类账号虽然取不到新 code，但只要旧 token 还有效就照样能领券
+  // （这正是「授权掉了但当天还能抢救」的场景）。
+  const loginCache = readLoginCacheAll();
+  const aliveRefs = new Set(alive.map((a) => String(a.openid || a.id || '')));
+  const revived = accounts.filter((a) => {
+    const ref = String(a.openid || a.id || '');
+    return ref && !aliveRefs.has(ref) && !!getCachedLogin(ref, loginCache);
+  });
+  if (revived.length) {
+    const names = revived.map((a) => {
+      const l = String(a.nickname || a.alias || '').trim();
+      return l && l !== '-' ? l : String(a.openid || a.id || '');
+    });
+    $.log(`🔐 [账号] ${revived.length} 个账号在网关里不是 alive，但本地有登录态缓存，一并尝试：${names.join('、')}`);
+  }
+
   const out = [];
   let filtered = 0;
-  for (const a of alive) {
+  for (const a of alive.concat(revived)) {
     const ref = String(a.openid || a.id || '');
     if (!ref) continue;
     const label = String(a.nickname || a.alias || '').trim();
@@ -600,7 +636,7 @@ async function resolveAccounts() {
     out.push({ ref, label: name });
   }
   if (filtered) {
-    $.log(`ℹ️ [账号] 按脚本标记过滤掉 ${filtered} 个账号（本脚本 key=${SCRIPT_KEY}，共 ${alive.length} 个 alive）`);
+    $.log(`ℹ️ [账号] 按脚本标记过滤掉 ${filtered} 个账号（本脚本 key=${SCRIPT_KEY}，候选 ${alive.length + revived.length} 个）`);
     $.log('   想让它跑：面板「应用宝账号」页把美团勾上；或临时设 yyb_tag_filter=0 忽略标记');
   }
   return out;
@@ -1038,6 +1074,71 @@ function writeCacheAll(accounts) {
   }
 }
 
+/* ============ 登录态缓存（跨天复用；被服务端拒绝时自动回退网关取 code） ============
+ * 形状：{ accounts: { <sha256(ref)[0:12]>: {ref,token,openId,openIdCipher,userId,nickname,obtained_at} } }
+ * 与当日券缓存最大的不同：**不跨天失效** —— 只要服务端还认这个 token 就一直用。
+ * token 属敏感信息，文件按 0600 写。
+ */
+
+function readLoginCacheAll() {
+  if (!LOGIN_CACHE_ON) return {};
+  try {
+    const all = JSON.parse(fs.readFileSync(LOGIN_CACHE_FILE, 'utf8'));
+    if (all && all.accounts && typeof all.accounts === 'object') return all.accounts;
+  } catch (_) { /* 不存在/损坏 → 当没有 */ }
+  return {};
+}
+
+function writeLoginCacheAll(accounts) {
+  if (!LOGIN_CACHE_ON) return;
+  try {
+    fs.mkdirSync(path.dirname(LOGIN_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(LOGIN_CACHE_FILE, JSON.stringify({
+      note: '美团登录态缓存（按网关 ref 索引；含 token，敏感文件，权限 0600）。'
+        + '失效后由脚本自动回退「网关取 code 重新登录」并覆盖本文件。',
+      accounts,
+    }, null, 2), { encoding: 'utf8', mode: 0o600 });
+    try { fs.chmodSync(LOGIN_CACHE_FILE, 0o600); } catch (_) {}
+  } catch (e) {
+    $.log(`[提示] 登录态缓存写入失败（不影响领券）：${e.message}`);
+  }
+}
+
+/** 取某个 ref 的缓存登录态，返回 ctx 形状（无则 null） */
+function getCachedLogin(ref, all) {
+  if (!LOGIN_CACHE_ON) return null;
+  const rec = (all || {})[tokenKey(ref)];
+  if (!rec || !rec.token) return null;
+  return {
+    token: String(rec.token),
+    openId: rec.openId || '',
+    openIdCipher: rec.openIdCipher || '',
+    userId: rec.userId || '',
+    nickname: rec.nickname || '',
+    obtained_at: Number(rec.obtained_at || 0) || 0,
+  };
+}
+
+function putCachedLogin(all, ref, ctx, nickname) {
+  if (!LOGIN_CACHE_ON) return;
+  all[tokenKey(ref)] = {
+    ref: String(ref),
+    token: ctx.token,
+    openId: ctx.openId || '',
+    openIdCipher: ctx.openIdCipher || '',
+    userId: ctx.userId || '',
+    nickname: nickname || ctx.nickname || '',
+    obtained_at: Math.floor(Date.now() / 1000),
+  };
+}
+
+function fmtTs(sec) {
+  if (!sec) return '未知时间';
+  try {
+    return new Date(sec * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  } catch (_) { return '未知时间'; }
+}
+
 /* ============ 推送 ============ */
 
 async function pushByWebhook(title, content) {
@@ -1078,48 +1179,22 @@ async function push(title, content) {
 
 /* ============ 单账号处理 ============ */
 
+/** 错误文本是否像「鉴权失效」而非业务失败 */
+function looksLikeAuthError(text) {
+  const s = String(text || '');
+  return /\bcode=(401|403)\b/.test(s)
+    || /请重新登录|未登录|token\s*(已)?(失效|过期|为空|被拒)/i.test(s);
+}
+
 /**
- * 处理一个账号。任何一步失败都只影响这个账号，返回结果对象，绝不抛出去打断整只脚本。
- * cache：当日缓存里这个账号的记录（可读写）
+ * 跑一个账号的两条链路（A=渠道券、B=福利社），只依赖 ctx（登录态）。
+ * 单独抽出来是为了支持「先用缓存 token → 被拒 → 换新 token 重跑」。
+ * 返回 { sections, result, authFail }；authFail=true 表示某条链路明确报了鉴权失效。
  */
-async function runAccount(index, total, account, cache) {
-  const ref = account.ref;
-  logAccountHeader(index, total, account.label, ref);
-
-  const delay = 2 + Math.floor(Math.random() * 5);
-  $.log(`⏳ [延迟] 启动延迟 ${delay}s`);
-  await sleep(delay * 1000);
-
-  const step = {};
-
-  // 1. 网关取 code
-  const code = await fetchCode(ref);
-  if (!code) {
-    return { ok: false, error: '网关取 code 失败（账号登录态可能已失效，可去面板重扫）', step };
-  }
-
-  // 2. 换 token
-  const login = await loginByCode(code);
-  if (!login.ok) {
-    return { ok: false, error: `登录失败：${login.error}`, step };
-  }
-  const ctx = {
-    token: login.token,
-    openId: login.openId,
-    openIdCipher: login.openIdCipher,
-    userId: login.userId,
-  };
-  $.log(`✅ [登录] token 获取成功: ${mask(ctx.token, 6, 6)}（${ctx.token.length} 字符）`);
-  if (!ctx.userId || !ctx.openId) {
-    return { ok: false, error: '登录响应未返回 openId / openIdCipher / userId', step };
-  }
-
-  // 3. 昵称（拿不到不影响领券，用 ref 顶上）
-  const nickname = await queryNickname(ctx);
-  if (nickname) $.log(`👤 [用户] userId=${ctx.userId} 昵称=${nickname}`);
-
+async function runChains(ctx, cache, step) {
   const sections = [];
-  const result = { ok: false, nickname, coupons: 0, step };
+  const result = { ok: false, coupons: 0 };
+  let authFail = false;
 
   /* ---- 链路 A：sendCouponWork ---- */
   if (CLAIM_WORK) {
@@ -1168,10 +1243,12 @@ async function runAccount(index, total, account, cache) {
         sections.push(`[A] WorkBuddy 渠道券：ℹ️ ${tip}`);
         step.A = '1014';
       } else if (resp.code === 401) {
-        $.log('  ✖ token 被拒（401）。本脚本每轮都重新登录，可重跑一次；持续如此请检查网关账号。');
+        authFail = true;
+        $.log('  ✖ token 被拒（401）—— 若这是缓存的旧 token，会自动去网关重登后重试');
         sections.push('[A] WorkBuddy 渠道券：✖ token 被服务端拒绝（401）');
         step.A = '401';
       } else if (resp.code === 403) {
+        authFail = true;
         $.log('  ✖ token 为空（403）');
         sections.push('[A] WorkBuddy 渠道券：✖ token 为空（403）');
         step.A = '403';
@@ -1202,6 +1279,7 @@ async function runAccount(index, total, account, cache) {
     } else {
       const list = await fulisheList(ctx);
       if (!list.ok) {
+        if (looksLikeAuthError(list.error)) authFail = true;
         $.log(`  ✖ ${list.error}`);
         sections.push(`[B] 福利社红包墙：✖ ${list.error}`);
         step.B = list.error;
@@ -1213,6 +1291,7 @@ async function runAccount(index, total, account, cache) {
         $.log(`  🎟️ 本次查询共有 ${list.tabs.length} 组券包可以领取（${list.activityName}）`);
         const grant = await fulisheGrant(ctx, list);
         if (!grant.ok) {
+          if (looksLikeAuthError(grant.error)) authFail = true;
           $.log(`  ✖ ${grant.error}`);
           sections.push(`[B] 福利社红包墙：✖ ${grant.error}`);
           step.B = grant.error;
@@ -1247,7 +1326,103 @@ async function runAccount(index, total, account, cache) {
     }
   }
 
-  return Object.assign(result, { sections, ctx });
+  return { sections, result, authFail };
+}
+
+/**
+ * 处理一个账号。任何一步失败都只影响这个账号，返回结果对象，绝不抛出去打断整只脚本。
+ * cache      ：当日券缓存里这个账号的记录（可读写）
+ * loginCache ：登录态缓存全表（可读写）
+ *
+ * 登录策略：优先复用本地缓存的登录态；只有当服务端明确拒绝（401/403 等）时，
+ * 才回头去网关「取 code → 换 token」重新登录一次，成功后回写缓存。
+ */
+async function runAccount(index, total, account, cache, loginCache) {
+  const ref = account.ref;
+  logAccountHeader(index, total, account.label, ref);
+
+  const delay = 2 + Math.floor(Math.random() * 5);
+  $.log(`⏳ [延迟] 启动延迟 ${delay}s`);
+  await sleep(delay * 1000);
+
+  const step = {};
+  const needA = CLAIM_WORK && !cache.work;
+  const needB = CLAIM_FULISHE && !cache.fulishe;
+  const needLogin = needA || needB;
+
+  let ctx = null;
+  let fromCache = false;
+  let nickname = '';
+
+  if (!needLogin) {
+    // 两条链路今天都领过了 → 纯回放，连登录都不用做
+    $.log('ℹ️ [登录] 两条链路今天都已领过，无需登录，直接回放当日缓存');
+  } else {
+    const cached = getCachedLogin(ref, loginCache);
+    if (cached) {
+      ctx = cached;
+      fromCache = true;
+      nickname = cached.nickname || '';
+      $.log(`🔐 [登录] 命中本地登录态缓存（${fmtTs(cached.obtained_at)} 获取），先复用它，不去网关取 code`);
+    }
+  }
+
+  /** 去网关取 code → 换 token（仅在需要时调用） */
+  const freshLogin = async (reason) => {
+    if (reason) $.log(`♻️ [登录] ${reason}，改用网关取 code 重新登录`);
+    const code = await fetchCode(ref);
+    if (!code) return { ok: false, error: '网关取 code 失败（账号登录态可能已失效，可去面板重扫）' };
+    const login = await loginByCode(code);
+    if (!login.ok) return { ok: false, error: `登录失败：${login.error}` };
+    if (!login.userId || !login.openId) return { ok: false, error: '登录响应未返回 openId / openIdCipher / userId' };
+    $.log(`✅ [登录] 网关登录成功: ${mask(login.token, 6, 6)}（${login.token.length} 字符）`);
+    return {
+      ok: true,
+      ctx: { token: login.token, openId: login.openId, openIdCipher: login.openIdCipher, userId: login.userId },
+    };
+  };
+
+  if (needLogin && !ctx) {
+    const fresh = await freshLogin('');
+    if (!fresh.ok) return { ok: false, error: fresh.error, step };
+    ctx = fresh.ctx;
+    fromCache = false;
+  }
+  if (ctx && !nickname) {
+    nickname = await queryNickname(ctx);
+    if (nickname) $.log(`👤 [用户] userId=${ctx.userId} 昵称=${nickname}`);
+  }
+
+  // 回退重跑前先给当日缓存拍个快照：重跑时复原，免得半途写进去的记录残留
+  const cacheSnapshot = JSON.stringify(cache);
+
+  let run = await runChains(ctx, cache, step);
+
+  // 缓存的登录态被服务端拒绝 → 换新 token 重跑一次
+  if (needLogin && fromCache && run.authFail) {
+    for (const k of Object.keys(cache)) delete cache[k];
+    Object.assign(cache, JSON.parse(cacheSnapshot));
+    delete step.A;
+    delete step.B;
+    const fresh = await freshLogin('本地登录态被服务端拒绝');
+    if (!fresh.ok) {
+      $.log(`  ✖ 回退登录也失败：${fresh.error}`);
+      return { ok: false, error: fresh.error, step };
+    }
+    ctx = fresh.ctx;
+    fromCache = false;
+    if (!nickname) nickname = await queryNickname(ctx);
+    if (nickname) $.log(`👤 [用户] userId=${ctx.userId} 昵称=${nickname}`);
+    run = await runChains(ctx, cache, step);
+  }
+
+  // 本次是走网关新登的 → 回写登录态缓存，下次直接复用
+  if (!fromCache && ctx && LOGIN_CACHE_ON) {
+    putCachedLogin(loginCache, ref, ctx, nickname);
+    $.log('💾 [登录] 已缓存本次登录态，下次运行可直接复用');
+  }
+
+  return Object.assign(run.result, { nickname, step, sections: run.sections, ctx });
 }
 
 /* ============ 主流程 ============ */
@@ -1303,6 +1478,13 @@ function watchdog(ms, onFire) {
       + ` ｜ ${CLAIM_FULISHE ? 'B=福利社红包墙' : 'B=关闭'}`);
 
     const cacheAll = readCacheAll();
+    const loginCache = readLoginCacheAll();
+    if (LOGIN_CACHE_ON) {
+      const n = Object.keys(loginCache).length;
+      $.log(`🔐 [登录] 本地登录态缓存：${n ? `已存 ${n} 个账号（优先复用）` : '暂无（本次登录后会自动写入）'}`);
+    } else {
+      $.log('🔐 [登录] 已通过 mt_login_cache=0 关闭登录态复用，每次都去网关取 code');
+    }
     const results = [];
 
     for (let i = 0; i < accounts.length; i++) {
@@ -1318,7 +1500,7 @@ function watchdog(ms, onFire) {
 
       let result;
       try {
-        result = await Promise.race([runAccount(i + 1, accounts.length, account, cache), timeout]);
+        result = await Promise.race([runAccount(i + 1, accounts.length, account, cache, loginCache), timeout]);
       } catch (e) {
         result = { ok: false, error: `异常：${e.message}`, coupons: 0, sections: [], step: {} };
       }
@@ -1343,6 +1525,7 @@ function watchdog(ms, onFire) {
     }
 
     try { writeCacheAll(cacheAll); } catch (_) { /* 已在函数里打过日志 */ }
+    try { writeLoginCacheAll(loginCache); } catch (_) { /* 已在函数里打过日志 */ }
 
     // 汇总
     const okCount = results.filter((r) => r.ok).length;
