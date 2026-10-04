@@ -277,7 +277,7 @@ func newOpenAPISpec() map[string]any {
 					"alias":           nullableStringSchema("账号别名。"),
 					"nickname":        nullableStringSchema("账号昵称。"),
 					"avatar":          nullableStringSchema("本地头像路径或远程头像 URL。"),
-					"status":          nullableStringSchema("账号状态。"),
+					"status":          nullableStringSchema(accountStatusDoc),
 					"scripts":         nullableStringSchema("该账号要跑哪些脚本，逗号分隔；空表示不限制。"),
 					"last_checked_at": nullableInt64Schema(),
 					"created_at":      int64Schema(),
@@ -288,7 +288,7 @@ func newOpenAPISpec() map[string]any {
 					"openid":   map[string]any{"type": "string"},
 					"uin":      nullableInt64Schema(),
 					"nickname": nullableStringSchema("账号昵称。"),
-					"status":   map[string]any{"type": "string", "example": "alive"},
+					"status":   map[string]any{"type": "string", "example": "alive", "description": accountStatusDoc},
 				}),
 				"DeleteAccountResponse": objectSchema([]string{"deleted", "openid"}, map[string]any{
 					"deleted": int64Schema(),
@@ -482,6 +482,15 @@ func nullableObjectSchema(description string) map[string]any {
 		"nullable":             true,
 	}
 }
+
+// accountStatusDoc 说明账号状态的三种取值及其区别。关键在于 expired 是「确定性」结论，
+// 只有腾讯明确拒绝凭据时才会出现；网络抖动一类的临时失败不会把账号打成 expired。
+const accountStatusDoc = "账号状态。" +
+	"alive=可用（能取 code）；" +
+	"expired=凭据或授权已作废，必须重新扫码；" +
+	"unknown=暂时判断不了（例如续期时网络不通），下次会重试。" +
+	"续期失败时：腾讯明确拒绝凭据（业务码 -109 / -101[40188] / 42007 等）判 expired；" +
+	"仅传输层失败（超时、代理不可用、HTTP 5xx）且 access token 未到期则保持原状态不变。"
 
 func nullableStringSchema(description string) map[string]any {
 	return map[string]any{
