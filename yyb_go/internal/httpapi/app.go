@@ -904,7 +904,12 @@ func definitiveCredentialFailure(err error) bool {
 		}
 		return definitiveRejectionMessage(rejected.Error())
 	}
-	// 走到这里说明错误来自传输层（超时 / DNS / HTTP / JSON 解析）。留一道文案兜底：
+	var httpErr *protocol.HTTPStatusError
+	if errors.As(err, &httpErr) {
+		// 请求压根没走到业务逻辑（可能是中间网关/WAF/CDN 的问题），不拿它判凭据死活。
+		return false
+	}
+	// 其余都是传输层错误（超时 / DNS / 代理 / JSON 解析）。留一道文案兜底：
 	// 万一有哪条路径把业务错误包成了普通 error，也不至于漏判。
 	return definitiveRejectionMessage(err.Error())
 }

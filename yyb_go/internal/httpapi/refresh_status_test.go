@@ -41,6 +41,21 @@ func TestRefreshFailureStatus(t *testing.T) {
 		{"文案要求重新登录", "alive", fresh, errors.New("please relogin to continue"), "expired"},
 		{"文案：token 已失效", "alive", fresh, errors.New("登录态失效，请重新登录"), "expired"},
 
+		// --- 非 2xx 不算确定性失效：请求可能根本没走到业务逻辑，
+		// 而且这类文案里常带请求 URL（含 refresh_token_auth），最容易被关键词误伤 ---
+		{"HTTP 400 且 body 含 invalid → 不算失效", "alive", fresh,
+			&protocol.HTTPStatusError{Status: 400, Body: `{"msg":"invalid nonce"}`}, "alive"},
+		{"HTTP 403 且 body 含 invalid scope → 不算失效", "alive", fresh,
+			&protocol.HTTPStatusError{Status: 403, Body: "invalid scope"}, "alive"},
+		{"HTTP 502 且凭据已过期 → unknown", "alive", stale,
+			&protocol.HTTPStatusError{Status: 502, Body: "bad gateway"}, "unknown"},
+
+		// --- 传输层错误文案里带着请求 URL（含 refresh_token_auth）也不能误判 ---
+		{"错误文案里的 URL 含 token 但无失效词 → 不动", "alive", fresh,
+			errors.New(`Post "https://yybadaccess.3g.qq.com/pc_yyb_auth/pcyyb_refresh_token_auth": dial tcp 1.2.3.4:443: connect: connection refused`), "alive"},
+		{"decode JSON 失败 → 不动", "alive", fresh,
+			errors.New(`decode JSON: invalid character '<' looking for beginning of value: <html>502</html>`), "alive"},
+
 		// --- 不确定：不许误杀好号 ---
 		{"网络超时 且凭据未过期 → 状态不动", "alive", fresh,
 			errors.New("Post \"https://yybadaccess.3g.qq.com/...\": context deadline exceeded"), "alive"},
