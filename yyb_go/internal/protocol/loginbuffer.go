@@ -30,6 +30,18 @@ func (e *AuthRejectedError) Error() string {
 	return fmt.Sprintf("%s rejected: code=%d msg=%s", e.Step, e.Code, e.Msg)
 }
 
+// HTTPStatusError 表示服务端回了非 2xx。这类错误可能来自腾讯，也可能来自中间的
+// 网关 / WAF / CDN，甚至是一次代理故障，不足以断定凭据有问题；而且它的文案里通常
+// 带着请求 URL，容易被「token 失效」之类的关键词匹配误伤，所以单独成类型让上层排除。
+type HTTPStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
 const (
 	yybHost         = "https://yybadaccess.3g.qq.com"
 	loginBufferURL  = yybHost + "/pc_yyb_auth/pcyyb_get_wx_login_buffer_auth"
@@ -229,7 +241,7 @@ func (c *LoginBufferClient) requestJSON(ctx context.Context, method, url string,
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(data[:min(len(data), 200)]))
+		return &HTTPStatusError{Status: resp.StatusCode, Body: string(data[:min(len(data), 200)])}
 	}
 	if err = json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("decode JSON: %w: %s", err, string(data[:min(len(data), 200)]))
