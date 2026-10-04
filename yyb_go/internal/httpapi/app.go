@@ -851,7 +851,9 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 //   - 凭据本身就是死的（没有 refresh token，或腾讯明确拒绝）→ expired，只能重新扫码；
 //   - 这次请求失败（超时 / 代理挂了 / DNS 抖动 / HTTP 5xx）而 access token 还没到期
 //     → 保持原状态不动，别把好号误判成失效；
-//   - 不确定且 access token 已过期 → unknown，等下次重试，不冒充「已失效」。
+//   - 不确定且 access token 已过期 → unknown，等下次重试，不冒充「已失效」；
+//   - 原本已经是 expired 的不会被降级成 unknown：expired 是明确结论，只靠
+//     刷新成功或重新扫码离开，不靠一次失败的请求。
 //
 // 旧实现是「只要 RefreshLoginBuffer 返回 error 就 expired」，一次网络抖动就能把
 // 好号打成失效（脚本随即跳过它），代价是必须人工重新扫码——这里修的就是这条。
@@ -884,6 +886,12 @@ func refreshFailureStatus(current string, creds protocol.LoginBufferCredentials,
 	if creds.ExpiresAt > now.Unix() {
 		// access token 还没到期，说明这次失败跟号本身无关，别动状态。
 		return current
+	}
+	if current == "expired" {
+		// 已经是「必须重新扫码」的明确结论了。一次说不清的失败不该把它降级成
+		// unknown——那只会让面板变得不可操作（人不知道该不该去重扫）。
+		// expired 只能靠「刷新成功」或「重新扫码」离开，不是靠一次请求失败。
+		return "expired"
 	}
 	return "unknown"
 }

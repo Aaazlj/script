@@ -490,7 +490,8 @@ const accountStatusDoc = "账号状态。" +
 	"expired=凭据或授权已作废，必须重新扫码；" +
 	"unknown=暂时判断不了（例如续期时网络不通），下次会重试。" +
 	"续期失败时：腾讯明确拒绝凭据（业务码 -109 / -101[40188] / 42007 等）判 expired；" +
-	"仅传输层失败（超时、代理不可用、HTTP 5xx）且 access token 未到期则保持原状态不变。"
+	"仅传输层失败（超时、代理不可用、HTTP 5xx）且 access token 未到期则保持原状态不变；" +
+	"status 不会因为一次失败的请求从 expired 降级成 unknown。"
 
 func nullableStringSchema(description string) map[string]any {
 	return map[string]any{
