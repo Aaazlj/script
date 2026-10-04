@@ -6,12 +6,29 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"time"
 )
+
+// ErrMissingRefreshToken 表示本地凭据里压根没有 refresh token：这种号不可能再续期。
+var ErrMissingRefreshToken = errors.New("missing refresh token")
+
+// AuthRejectedError 表示腾讯侧用业务码（code != 0）明确拒绝了这次凭据操作，
+// 而不是超时、DNS、HTTP 5xx、JSON 解析这类过一会儿可能自愈的临时故障。
+// 调用方靠它区分「号真的没了」和「这次网络不好」——前者才配把账号判成失效。
+type AuthRejectedError struct {
+	Step string // "refresh"（换 access token）或 "login_buffer"（取登录态）
+	Code int
+	Msg  string
+}
+
+func (e *AuthRejectedError) Error() string {
+	return fmt.Sprintf("%s rejected: code=%d msg=%s", e.Step, e.Code, e.Msg)
+}
 
 const (
 	yybHost         = "https://yybadaccess.3g.qq.com"
@@ -105,8 +122,8 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 	}, &data); err != nil {
 		return "", err
 	}
-	if intFromAny(data["code"]) != 0 {
-		return "", fmt.Errorf("login_buffer failed: code=%v msg=%v", data["code"], data["msg"])
+	if code := intFromAny(data["code"]); code != 0 {
+		return "", &AuthRejectedError{Step: "login_buffer", Code: code, Msg: stringFromMap(data, "msg")}
 	}
 	values := stringSlicePath(data, "ext_info", "list_s", "login_buffer", "value")
 	if len(values) == 0 || values[0] == "" {
@@ -117,7 +134,7 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 
 func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginBufferCredentials) (LoginBufferCredentials, error) {
 	if creds.RefreshToken == "" {
-		return LoginBufferCredentials{}, fmt.Errorf("missing refresh token")
+		return LoginBufferCredentials{}, ErrMissingRefreshToken
 	}
 	body, err := json.Marshal(refreshTokenRequest{UserInfo: refreshTokenUserInfo{
 		OpenID:       creds.OpenID,
@@ -139,8 +156,8 @@ func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginB
 	}, &data); err != nil {
 		return LoginBufferCredentials{}, err
 	}
-	if intFromAny(data["code"]) != 0 {
-		return LoginBufferCredentials{}, fmt.Errorf("refresh failed: code=%v msg=%v", data["code"], data["msg"])
+	if code := intFromAny(data["code"]); code != 0 {
+		return LoginBufferCredentials{}, &AuthRejectedError{Step: "refresh", Code: code, Msg: stringFromMap(data, "msg")}
 	}
 	info, _ := data["user_info"].(map[string]any)
 	expiresIn := defaultInt64(int64FromMap(info, "expires_in"), 7200)

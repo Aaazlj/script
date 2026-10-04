@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -740,10 +741,14 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 	}
 	result, err := a.invokeWXApp(r.Context(), acc, body.AppID, body.Payload, call)
 	if err != nil {
-		var expired accountExpiredError
+		var unusable accountUnusableError
 		switch {
-		case errors.As(err, &expired):
-			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+		case errors.As(err, &unusable) && unusable.status == "expired":
+			writeError(w, http.StatusConflict, "account login_buffer expired (refresh rejected); re-scan required")
+		case errors.As(err, &unusable):
+			// 状态是 unknown：续期这次没成功，但也说不准号就一定没了，别催人重扫。
+			writeError(w, http.StatusBadGateway,
+				"account is temporarily unusable (status="+unusable.status+"); retry later")
 		default:
 			writeError(w, http.StatusBadGateway, "call failed: "+err.Error())
 		}
@@ -841,16 +846,27 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 	return a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMap(), &status)
 }
 
+// refreshLiveness 复查账号还能不能续期，并按「确定性 / 不确定」三分法落库状态：
+//
+//   - 凭据本身就是死的（没有 refresh token，或腾讯明确拒绝）→ expired，只能重新扫码；
+//   - 这次请求失败（超时 / 代理挂了 / DNS 抖动 / HTTP 5xx）而 access token 还没到期
+//     → 保持原状态不动，别把好号误判成失效；
+//   - 不确定且 access token 已过期 → unknown，等下次重试，不冒充「已失效」。
+//
+// 旧实现是「只要 RefreshLoginBuffer 返回 error 就 expired」，一次网络抖动就能把
+// 好号打成失效（脚本随即跳过它），代价是必须人工重新扫码——这里修的就是这条。
 func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) string {
 	if acc.Credentials == nil {
+		// 从没扫过码、或导入时没带凭据：没有任何可续期的材料。
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "unknown")
 		return "unknown"
 	}
 	creds := protocol.CredentialsFromMap(acc.Credentials)
 	result, err := a.qr.RefreshLoginBuffer(ctx, creds)
 	if err != nil {
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-		return "expired"
+		status := refreshFailureStatus(currentAccountStatus(acc), creds, err, time.Now())
+		_ = a.db.SetAccountStatus(ctx, acc.ID, status)
+		return status
 	}
 	_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, result.Credentials.ToMap())
 	_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
@@ -858,6 +874,89 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 		_ = a.db.SetAccountProfile(ctx, acc.ID, acc.Nickname, &avatar, acc.UserInfo)
 	}
 	return "alive"
+}
+
+// refreshFailureStatus 把一次续期失败翻译成账号状态。current 是失败前的状态。
+func refreshFailureStatus(current string, creds protocol.LoginBufferCredentials, err error, now time.Time) string {
+	if definitiveCredentialFailure(err) {
+		return "expired"
+	}
+	if creds.ExpiresAt > now.Unix() {
+		// access token 还没到期，说明这次失败跟号本身无关，别动状态。
+		return current
+	}
+	return "unknown"
+}
+
+// definitiveCredentialFailure 判断错误是否属于「凭据 / 授权本身已作废」，即腾讯明确拒绝。
+// 只有这类错误才配把账号打成 expired——因为 expired 对使用者意味着「必须重新扫码」。
+func definitiveCredentialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, protocol.ErrMissingRefreshToken) {
+		return true
+	}
+	var rejected *protocol.AuthRejectedError
+	if errors.As(err, &rejected) {
+		if _, ok := definitiveAuthRejections[rejected.Code]; ok {
+			return true
+		}
+		return definitiveRejectionMessage(rejected.Error())
+	}
+	// 走到这里说明错误来自传输层（超时 / DNS / HTTP / JSON 解析）。留一道文案兜底：
+	// 万一有哪条路径把业务错误包成了普通 error，也不至于漏判。
+	return definitiveRejectionMessage(err.Error())
+}
+
+// definitiveAuthRejections 是腾讯 pc_yyb 侧「凭据 / 授权已作废」的业务码，命中即必须重新扫码。
+// 未列出的业务码一律按「服务端这次不认，但原因不明」处理——宁可保守，也不误杀好号。
+var definitiveAuthRejections = map[int]string{
+	-109:  "RC_PARAMS_INVALID：refresh token 已作废（刷新第一步就被拒，实测签名）",
+	-101:  "[40188] invalid scope：token 还在，但授权 scope 失效（取 login_buffer 被拒，实测签名）",
+	42007: "refresh_token 相关拒绝",
+}
+
+// definitiveRejectionMessage 是业务码之外的文案兜底：错误串里同时出现
+// 「无效 / 过期 / 失效」类词和「token / 登录 / 授权」类词，或直接要求重新登录时判为确定性失效。
+func definitiveRejectionMessage(raw string) bool {
+	message := strings.ToLower(strings.TrimSpace(raw))
+	if message == "" {
+		return false
+	}
+	for code := range definitiveAuthRejections {
+		if strings.Contains(message, fmt.Sprintf("code=%d", code)) {
+			return true
+		}
+	}
+	if strings.Contains(message, "42007") && strings.Contains(message, "refresh_token") {
+		return true
+	}
+	if strings.Contains(message, "40188") && strings.Contains(message, "invalid scope") {
+		return true
+	}
+	invalid := strings.Contains(message, "invalid") || strings.Contains(message, "expired") ||
+		strings.Contains(message, "expire") || strings.Contains(message, "无效") ||
+		strings.Contains(message, "过期") || strings.Contains(message, "失效")
+	token := strings.Contains(message, "token") || strings.Contains(message, "登录") ||
+		strings.Contains(message, "凭证") || strings.Contains(message, "授权")
+	relogin := strings.Contains(message, "relogin") || strings.Contains(message, "re-login") ||
+		strings.Contains(message, "重新登录") || strings.Contains(message, "重新授权")
+	return relogin || (invalid && token)
+}
+
+// currentAccountStatus 规整账号当前状态：库里可能存 NULL 或历史遗留值，
+// 一律当作 unknown，避免把空字符串当成状态写回去。
+func currentAccountStatus(acc *store.WechatAccount) string {
+	if acc == nil || acc.Status == nil {
+		return "unknown"
+	}
+	switch s := strings.TrimSpace(*acc.Status); s {
+	case "alive", "expired", "unknown":
+		return s
+	default:
+		return "unknown"
+	}
 }
 
 func (a *App) resyncProfile(ctx context.Context, acc *store.WechatAccount) (*store.WechatAccount, error) {
@@ -872,9 +971,17 @@ func (a *App) resyncProfile(ctx context.Context, acc *store.WechatAccount) (*sto
 	return a.db.GetAccount(ctx, acc.ID)
 }
 
-type accountExpiredError struct{ openid string }
+// accountUnusableError 表示账号当前取不到登录态，无法代它调微信接口。
+// 特意带上 status：expired 是「必须重新扫码」，unknown 只是「这次说不准，待会儿再试」，
+// 两者对调用方的意义完全不同，不能都报成「请重新扫码」。
+type accountUnusableError struct {
+	openid string
+	status string
+}
 
-func (e accountExpiredError) Error() string { return "account expired: " + e.openid }
+func (e accountUnusableError) Error() string {
+	return "account not usable: " + e.openid + " (status=" + e.status + ")"
+}
 
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
 	proxy := a.cfg.TCPProxy
@@ -887,7 +994,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	}
 	status := a.refreshLiveness(ctx, acc)
 	if status != "alive" {
-		return nil, accountExpiredError{openid: acc.OpenID}
+		return nil, accountUnusableError{openid: acc.OpenID, status: status}
 	}
 	fresh, err := a.db.GetAccount(ctx, acc.ID)
 	if err == nil && fresh != nil {
