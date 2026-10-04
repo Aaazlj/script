@@ -71,11 +71,17 @@ func TestRefreshFailureStatus(t *testing.T) {
 		// --- 不确定 + 凭据已过期 → unknown，等重试，不冒充失效 ---
 		{"网络超时 且凭据已过期 → unknown", "alive", stale,
 			errors.New("dial tcp: lookup yybadaccess.3g.qq.com: no such host"), "unknown"},
-		{"未知业务码 且凭据已过期 → unknown", "expired", stale,
+		{"未知业务码 且凭据已过期 → unknown", "unknown", stale,
 			&protocol.AuthRejectedError{Step: "refresh", Code: -1, Msg: "system busy"}, "unknown"},
 		{"空错误文案 → 不当成失效", "alive", stale, errors.New(""), "unknown"},
 		{"expires_at 缺失(=0) 视为已过期", "alive", protocol.LoginBufferCredentials{},
 			errors.New("i/o timeout"), "unknown"},
+
+		// --- expired 在「不确定」时是粘性的：别把明确结论降级成不可操作的「未知」 ---
+		{"已 expired 且凭据已过期 遇上网络抖动 → 仍是 expired", "expired", stale,
+			errors.New("context deadline exceeded"), "expired"},
+		{"已 expired 且凭据未过期 遇上网络抖动 → 仍是 expired", "expired", fresh,
+			errors.New("context deadline exceeded"), "expired"},
 	}
 
 	for _, tc := range cases {
