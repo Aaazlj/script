@@ -39,6 +39,8 @@ type Config struct {
 	AvatarTimeout  time.Duration
 	ScanTimeout    time.Duration
 	QRSessionTTL   time.Duration
+	// KeepAliveInterval：后台保活间隔；<=0 表示关闭（见 keepalive.go）
+	KeepAliveInterval time.Duration
 }
 
 type App struct {
@@ -59,6 +61,9 @@ type App struct {
 	// 面板可热切换的代理开关（见 proxycontrol.go）
 	proxyMu  sync.Mutex
 	proxySet proxySettings
+
+	// 后台保活循环（见 keepalive.go）
+	keepAlive *keepAliveState
 }
 
 var swaggerDocsHandler = httpSwagger.Handler(
@@ -133,10 +138,12 @@ func NewApp(cfg Config) (*App, error) {
 		log.Printf("[proxy] 动态出口已启用：跳板=%v 扫码走代理=%v 取code走代理=%v",
 			cfg.Proxy.Status()["relay"], settings.ScanViaProxy, settings.CodeViaProxy)
 	}
+	app.startKeepAlive()
 	return app, nil
 }
 
 func (a *App) Close() error {
+	a.stopKeepAlive()
 	if a.cfg.Proxy != nil {
 		a.cfg.Proxy.Close()
 	}
@@ -169,6 +176,7 @@ func (a *App) Handler() http.Handler {
 	router.Any("/qr/*path", gin.WrapF(a.handleQR))
 	router.Any("/proxy/status", gin.WrapF(a.handleProxyStatus))
 	router.Any("/proxy/settings", gin.WrapF(a.handleProxySettings))
+	router.Any("/keepalive", gin.WrapF(a.handleKeepAlive))
 	router.Any("/proxy/refresh", gin.WrapF(a.handleProxyRefresh))
 	router.Any("/proxy/probe", gin.WrapF(a.handleProxyProbe))
 	router.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
