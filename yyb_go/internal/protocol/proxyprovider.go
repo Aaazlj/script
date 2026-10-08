@@ -86,6 +86,11 @@ func NewProxyProvider(cfg ProxyProviderConfig) *ProxyProvider {
 	}
 	if relay := strings.TrimSpace(cfg.Relay); relay != "" {
 		if relayURL, err := url.Parse(firstHopOnly(relay)); err == nil && relayURL.Host != "" {
+			// net/http 的 Proxy 只认 http/https/socks5，我们内部用 http-connect 表示
+			// 「HTTP CONNECT 隧道」，这里必须换成 http，否则请求直接发不出去。
+			if relayURL.Scheme == "http-connect" {
+				relayURL.Scheme = "http"
+			}
 			transport.Proxy = http.ProxyURL(relayURL)
 		} else if err != nil {
 			log.Printf("[proxy] 跳板地址解析失败，将直连提取接口: %v", err)
@@ -232,6 +237,7 @@ func (p *ProxyProvider) Refresh(ctx context.Context) error {
 		time.Sleep(800 * time.Millisecond)
 	}
 	p.lastErr = lastErr.Error()
+	log.Printf("[proxy] 提取接口请求失败: %v", lastErr)
 	return lastErr
 }
 
