@@ -262,7 +262,6 @@ function buildOverview() {
     node('div', { class: 'hint', text: '按顺序配置下面两项，然后打开扫码页让用户扫码即可。配置项会写入本机 data/config.json（0600）。' }),
     node('div', { class: 'row' }, [
       node('button', { class: 'btn small ghost', text: '去配置青龙面板', onclick: () => activate('qinglong') }),
-      node('button', { class: 'btn small ghost', text: '去配置应用宝网关', onclick: () => activate('yyb') }),
     ]),
   ]);
 
@@ -345,31 +344,6 @@ function buildQinglong() {
         clearBtn,
       ]),
       qlOut,
-    ]),
-  ]);
-}
-
-/* ---------- 应用宝网关 ---------- */
-
-let yybBase, yybPub, yybOut;
-
-function buildYyb() {
-  yybBase = input('yybBase', { value: cfg.yyb.baseUrl, attrs: { placeholder: 'http://yyb-go:8000' } });
-  yybPub = input('yybPub', { value: cfg.yyb.publicBaseUrl, attrs: { placeholder: '留空则自动推断' } });
-  yybOut = node('div');
-
-  return node('section', { class: 'panel hidden', 'data-panel': 'yyb' }, [
-    node('div', { class: 'card' }, [
-      node('h2', { text: '应用宝网关（yyb_go）' }),
-      node('div', { class: 'hint', text: '扫码时机密由面板服务端去网关取二维码；扫码成功后把网关地址写进青龙的 yyb_server。' }),
-      field('网关地址', yybBase, '面板所在容器能访问到的 yyb_go 地址'),
-      field('写入青龙的地址', yybPub, '写进 yyb_server 的值；留空则用网关地址（本机回环时自动替换成面板访问地址）'),
-      testButton('测试连通', async () => {
-        if (!(await doSave(true))) throw new Error('请先修正配置后再测试');
-        const r = await api('POST', '/api/admin/test/yyb');
-        return ['网关可用：' + r.url, 'HTTP ' + r.status];
-      }),
-      yybOut,
     ]),
   ]);
 }
@@ -502,28 +476,6 @@ async function doProxyAction(btn, url, tip) {
   btn.disabled = false;
 }
 
-/* ---------- 美团签名服务 ---------- */
-
-function buildSign() {
-  const out = node('div');
-
-  const wrapper = node('div', { class: 'card' }, [
-    node('h2', { text: '美团签名服务（mtgsig）' }),
-    node('div', { class: 'hint', text: 'media.meituan.com 的福利社接口强制校验 mtgsig 签名头，没有签名一律 403。签名算法在美团自家的混淆 JS（cliguard）里，本面板把它加载进来，对外暴露 POST /api/meituan/sign 供青龙里的 meituan_code.js 借用。' }),
-    node('div', { class: 'hint', text: '青龙里的脚本默认把 mt_sign_url 指向 http://panel:5180/api/meituan/sign；面板与青龙在同一个 compose 网络里时开箱即用。' }),
-    testButton('检查签名服务', async () => {
-      const r = await api('GET', '/api/meituan/sign/health');
-      return r.available
-        ? ['cliguard 已加载，签名服务可用', '接口：POST /api/meituan/sign']
-        : ['cliguard 未加载：面板容器里没找到 vendor/cliguard/js/cliguard.js',
-           '请确认已把美团专家包挂到容器内的 /opt/meituan-expert，或用 MEITUAN_CLIGUARD_JS 指定路径。'];
-    }),
-    out,
-  ]);
-
-  return node('section', { class: 'panel hidden', 'data-panel': 'sign' }, [wrapper]);
-}
-
 /* ---------- 账号安全 ---------- */
 
 function buildSecurity() {
@@ -575,9 +527,11 @@ async function doSave(silent) {
   try {
     await api('PUT', '/api/admin/config', {
       qinglong: { host: qlHost.value, clientId: qlId.value, clientSecret: qlSecret.value },
+      // 后台已去掉「应用宝网关」菜单，它的地址/写入值不再在界面编辑，
+      // 直接用已加载的配置（保留在 config.json 里），这里只是随整体保存透传
       yyb: {
-        baseUrl: yybBase.value,
-        publicBaseUrl: yybPub.value,
+        baseUrl: cfg.yyb.baseUrl,
+        publicBaseUrl: cfg.yyb.publicBaseUrl,
         // 账号页还没构建时不要动它（undefined 的键会被 JSON.stringify 丢掉）
         scripts: acctScriptsInput ? textToScripts(acctScriptsInput.value) : undefined,
       },
