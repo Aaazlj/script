@@ -87,6 +87,18 @@ func (c *Client) LoginBuffers() *protocol.LoginBufferClient { return c.loginBuff
 // SetProxyFunc 让扫码流程也走代理链。传 nil 表示直连（默认）。
 func (c *Client) SetProxyFunc(proxy func() string) { c.proxy = proxy }
 
+// SetTimeout 调整扫码各步的超时。
+// 走代理链时要放宽：双跳（跳板 + 住宅出口）建立连接本身就要几秒，
+// 用直连时代的 8 秒会大面积 context deadline exceeded。
+func (c *Client) SetTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		c.timeout = timeout
+	}
+}
+
+// Timeout 供调用方参考当前值
+func (c *Client) Timeout() time.Duration { return c.timeout }
+
 // newHTTPClient 建一个（按需走代理的）HTTP 客户端。
 // fallbackDirect=true：代理抖了就直接连，别把扫码功能整体弄挂。
 func (c *Client) newHTTPClient(jar http.CookieJar) *http.Client {
