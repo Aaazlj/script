@@ -55,6 +55,10 @@ type App struct {
 	refreshMu     sync.Mutex
 	refreshLocks  map[int64]*sync.Mutex
 	refreshRecent map[int64]refreshMemo
+
+	// 面板可热切换的代理开关（见 proxycontrol.go）
+	proxyMu  sync.Mutex
+	proxySet proxySettings
 }
 
 var swaggerDocsHandler = httpSwagger.Handler(
@@ -110,20 +114,24 @@ func NewApp(cfg Config) (*App, error) {
 		qrSessions: map[string]*qr.Session{},
 	}
 
-	// 动态出口（品赞链路）：配置了就让「取 code / 续期」都走国内出口。
-	// 没配置时一切照旧（直连或静态代理），不影响原有部署。
+	// 动态出口（品赞链路）：配置了就让「取 code / 扫码 / 续期」都能走国内出口，
+	// 具体走不走由面板里的开关决定（见 proxycontrol.go）。没配置时一切照旧。
+	// 开关配置任何时候都要读：即使这次没配动态出口，面板上也要显示上次保存的状态
+	app.loadProxySettings()
+
 	if cfg.Proxy != nil && cfg.Proxy.Status()["enabled"] == true {
+		// 两个 proxy func 都在调用时才读开关，所以面板一改就立即生效、无需重启
 		app.qr.LoginBuffers().SetProxyFunc(app.tcpProxyValue)
-		if cfg.ProxyScan {
-			app.qr.SetProxyFunc(app.tcpProxyValue)
-			// 走代理链时单步耗时会到数秒；另外扫码轮询本身就是长轮询
-			// （最长 35 秒才回），客户端超时不能比它短，否则每轮都超时。
-			if scanTimeout := 35 * time.Second; app.qr.Timeout() < scanTimeout {
-				app.qr.SetTimeout(scanTimeout)
-			}
+		app.qr.SetProxyFunc(app.scanProxyValue)
+		// 走代理链时单步耗时会到数秒；另外扫码轮询本身就是长轮询
+		// （最长 35 秒才回），客户端超时不能比它短，否则每轮都超时。
+		if scanTimeout := 35 * time.Second; app.qr.Timeout() < scanTimeout {
+			app.qr.SetTimeout(scanTimeout)
 		}
 		cfg.Proxy.Start()
-		log.Printf("[proxy] 动态出口已启用：跳板=%v 扫码也走代理=%v", cfg.Proxy.Status()["relay"], cfg.ProxyScan)
+		settings := app.getProxySettings()
+		log.Printf("[proxy] 动态出口已启用：跳板=%v 扫码走代理=%v 取code走代理=%v",
+			cfg.Proxy.Status()["relay"], settings.ScanViaProxy, settings.CodeViaProxy)
 	}
 	return app, nil
 }
@@ -160,6 +168,8 @@ func (a *App) Handler() http.Handler {
 	router.Any("/qr", gin.WrapF(a.handleQRRoot))
 	router.Any("/qr/*path", gin.WrapF(a.handleQR))
 	router.Any("/proxy/status", gin.WrapF(a.handleProxyStatus))
+	router.Any("/proxy/settings", gin.WrapF(a.handleProxySettings))
+	router.Any("/proxy/refresh", gin.WrapF(a.handleProxyRefresh))
 	router.Any("/proxy/probe", gin.WrapF(a.handleProxyProbe))
 	router.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
 	router.Any("/accounts/export", gin.WrapF(a.handleAccountsExport))
@@ -349,11 +359,7 @@ func (a *App) handleProxyStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "hint": "未配置动态出口，当前走直连或静态代理"})
 		return
 	}
-	out := a.cfg.Proxy.Status()
-	// 扫码 / 续期 / 取 code 各走不走代理，运维一眼可见
-	out["scan_via_proxy"] = a.cfg.ProxyScan
-	out["code_via_proxy"] = true
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, a.proxySummary())
 }
 
 // POST /proxy/probe[?host=&port=] —— 用当前出口真连一次目标，验证「跳板→品赞→目标」是否通
@@ -1220,10 +1226,11 @@ func (e accountUnusableError) Error() string {
 // tcpProxyValue 返回本次请求要用的代理链：优先用动态出口（品赞国内 IP），
 // 拿不到时退回静态代理，再没有就直连（dialTCP 自己会按 fallbackDirect 兜底）。
 func (a *App) tcpProxyValue() string {
-	if a.cfg.Proxy != nil {
-		if v := a.cfg.Proxy.Current(); v != "" {
-			return v
-		}
+	if a.cfg.Proxy == nil || !a.getProxySettings().CodeViaProxy {
+		return a.cfg.TCPProxy
+	}
+	if v := a.cfg.Proxy.Current(); v != "" {
+		return v
 	}
 	return a.cfg.TCPProxy
 }
