@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>管理后台 · 扫码登录面板</title>
-<link rel="stylesheet" href="/style.css?v=20261008-2">
+<link rel="stylesheet" href="/style.css?v=20261008-3">
 </head>
 <body>
 <div id="app"></div>
@@ -67,6 +67,78 @@ function node(tag, props, children) {
   for (const c of (children || [])) if (c) n.appendChild(c);
   return n;
 }
+
+/**
+ * 自定义下拉框（替代原生 select —— 原生控件在各浏览器里样式不可控，太丑）。
+ * 返回 { el, value }：value 可读可写，行为跟原生 select 一致，方便替换。
+ */
+function dropdown(opts) {
+  const o = opts || {};
+  const label = node('span', { class: 'dd-label' });
+  const caret = node('span', {
+    class: 'dd-caret',
+    html: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
+  });
+  const btn = node('button', { class: 'dd-btn', type: 'button', 'aria-haspopup': 'listbox' }, [label, caret]);
+  const menu = node('div', { class: 'dd-menu', role: 'listbox' });
+  const wrap = node('div', { class: 'dd' }, [btn, menu]);
+
+  let value = o.value;
+  const items = (o.options || []).map((opt) => {
+    const el = node('button', { class: 'dd-item', type: 'button', role: 'option' }, [
+      node('span', { text: opt.label }),
+    ]);
+    el.addEventListener('click', () => {
+      value = opt.value;
+      paint();
+      close();
+      if (o.onChange) o.onChange(opt.value);
+    });
+    return { opt, el };
+  });
+
+  function paint() {
+    const hit = items.find((i) => i.opt.value === value);
+    label.textContent = hit ? hit.opt.label : (o.placeholder || '请选择');
+    for (const i of items) {
+      const on = i.opt.value === value;
+      i.el.classList.toggle('active', on);
+      const tick = i.el.querySelector('.tick');
+      if (on && !tick) i.el.appendChild(node('span', { class: 'tick', text: '✓' }));
+      else if (!on && tick) tick.remove();
+    }
+  }
+
+  function onDoc(e) { if (!wrap.contains(e.target)) close(); }
+  function onKey(e) { if (e.key === 'Escape') close(); }
+  function open() {
+    closeAllDropdowns();
+    wrap.classList.add('open');
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+  }
+  function close() {
+    wrap.classList.remove('open');
+    document.removeEventListener('mousedown', onDoc);
+    document.removeEventListener('keydown', onKey);
+  }
+  btn.addEventListener('click', () => (wrap.classList.contains('open') ? close() : open()));
+
+  menu.appendChild(node('div', {}, items.map((i) => i.el)));
+  paint();
+
+  const api = {
+    el: wrap,
+    get value() { return value; },
+    set value(v) { value = v; paint(); },
+    close,
+  };
+  openDropdowns.push(api);
+  return api;
+}
+
+const openDropdowns = [];
+function closeAllDropdowns() { for (const d of openDropdowns) d.close(); }
 
 function noteBox(kind, lines) {
   const box = node('div', { class: 'note ' + kind, style: 'margin-top:14px' });
@@ -181,23 +253,31 @@ function renderShell() {
   document.body.classList.add('admin');
   app.innerHTML = '';
 
-  // 顶部导航：品牌 + 各功能标签（可横滑）+ 前台/后台切换
+  // 顶栏只放 logo 与前后台切换；功能菜单在左侧
+  const appbar = node('header', { class: 'appbar' }, [
+    node('a', { class: 'appbar-brand', href: '/' }, [
+      node('span', { class: 'logo', html: ICONS.grid.replace('width="16" height="16"', 'width="17" height="17"') }),
+      node('span', { class: 'name', text: '扫码面板' }),
+      node('span', { class: 'sub', text: '管理后台' }),
+    ]),
+    node('span', { class: 'appbar-spacer' }),
+    node('nav', { class: 'seg' }, [
+      node('a', { href: '/', text: '前台' }),
+      node('a', { href: '/admin', class: 'active', 'aria-current': 'page', text: '后台' }),
+    ]),
+  ]);
+
   const navItems = PANELS.map((p) => node('button', {
-    class: 'topnav-tab' + (p.id === current ? ' active' : ''),
+    class: 'nav-item' + (p.id === current ? ' active' : ''),
     'data-panel': p.id,
     html: '<span class="ico">' + p.icon + '</span><span>' + p.name + '</span>',
     onclick: () => activate(p.id),
   }));
 
-  const topnav = node('header', { class: 'topnav' }, [
-    node('div', { class: 'topnav-brand' }, [
-      node('span', { class: 'logo', html: ICONS.grid.replace('width="16" height="16"', 'width="18" height="18"') }),
-      node('span', { text: '扫码面板' }),
-      node('span', { class: 'sub', text: '管理后台' }),
-    ]),
-    node('nav', { class: 'topnav-tabs' }, navItems),
-    node('div', { class: 'topnav-right' }, [
-      node('a', { class: 'topnav-link', href: '/', html: '<span aria-hidden="true">↗</span> 扫码前台' }),
+  const nav = node('aside', { class: 'admin-nav' }, [
+    ...navItems,
+    node('div', { class: 'nav-foot' }, [
+      node('a', { class: 'nav-item', href: '/', html: '<span class="ico">↗</span><span>打开扫码页</span>' }),
     ]),
   ]);
 
@@ -211,7 +291,10 @@ function renderShell() {
   ]);
 
   const main = node('main', { class: 'admin-main' }, [head, node('div', { id: 'panels' })]);
-  app.appendChild(node('div', { class: 'admin-shell' }, [topnav, main]));
+  app.appendChild(node('div', { class: 'admin-shell' }, [
+    appbar,
+    node('div', { class: 'admin-body' }, [nav, main]),
+  ]));
 
   const body = $('panels');
   body.appendChild(buildOverview());
@@ -227,7 +310,7 @@ function activate(id, push) {
   const meta = PANELS.find((p) => p.id === id) || PANELS[0];
   id = meta.id;
   current = id;
-  for (const b of document.querySelectorAll('.topnav-tab[data-panel]')) {
+  for (const b of document.querySelectorAll('.nav-item[data-panel]')) {
     b.classList.toggle('active', b.dataset.panel === id);
   }
   for (const p of document.querySelectorAll('.panel')) {
@@ -618,16 +701,16 @@ function buildAccounts() {
 
   acctStatsEl = node('div', { class: 'acct-stats' });
   keepAliveEl = node('div');
-  acctFilterSel = node('select', {
-    class: 'input',
-    style: 'width:auto;min-width:110px',
-    onchange: () => renderAccounts(acctData),
-  }, [
-    node('option', { value: 'all', text: '全部状态' }),
-    node('option', { value: 'alive', text: '存活' }),
-    node('option', { value: 'expired', text: '已失效' }),
-    node('option', { value: 'unknown', text: '待定' }),
-  ]);
+  acctFilterSel = dropdown({
+    value: 'all',
+    options: [
+      { value: 'all', label: '全部状态' },
+      { value: 'alive', label: '存活' },
+      { value: 'expired', label: '已失效' },
+      { value: 'unknown', label: '待定' },
+    ],
+    onChange: () => renderAccounts(acctData),
+  });
 
   const card = node('div', { class: 'card' }, [
     node('h2', { text: '应用宝账号' }),
@@ -647,7 +730,7 @@ function buildAccounts() {
       node('button', { class: 'btn small ghost', text: '导入账号', onclick: () => acctFileInput.click() }),
       node('button', { class: 'btn small ghost', text: '导出全部', onclick: (e) => exportAccounts('', e.target) }),
       node('span', { class: 'grow' }),
-      acctFilterSel,
+      acctFilterSel.el,
       acctFileInput,
     ]),
     field(
@@ -739,7 +822,8 @@ function scriptToggles(a) {
     }, [cb, node('span', { text: def.name })]));
   }
   box.appendChild(node('span', {
-    style: 'font-size:12px;color:var(--muted)',
+    class: 'tag' + (unrestricted ? '' : ' primary'),
+    title: '当前生效范围',
     text: unrestricted ? '全部脚本' : describeTags(tags.join(',')),
   }));
   return box;
@@ -833,7 +917,7 @@ function accountRow(a) {
       node('div', { class: 'acct-head' }, [
         node('span', { class: 'acct-name', text: name }),
         statusPill(a.status),
-        a.uin ? node('span', { class: 'acct-meta', text: 'uin ' + a.uin }) : null,
+        a.uin ? node('span', { class: 'tag mono', text: 'uin ' + a.uin }) : null,
       ]),
       node('div', { class: 'acct-meta', text: 'openid ' + (a.openid || '-') }),
       node('div', { class: 'acct-times' }, [
@@ -906,7 +990,7 @@ function renderAccounts(accounts) {
     for (const [label, n, dot] of tiles) {
       acctStatsEl.appendChild(node('div', { class: 'acct-stat' }, [
         node('strong', { text: String(n) }),
-        node('span', { html: (dot ? '<span class="dot ' + dot + '" style="display:inline-block;vertical-align:1px;margin-right:5px"></span>' : '') + label }),
+        node('span', { html: (dot ? '<span class="dot ' + dot + '" style="display:inline-block;vertical-align:1px;margin-right:6px"></span>' : '') + label }),
       ]));
     }
   }
@@ -936,14 +1020,22 @@ async function loadKeepAlive() {
       return;
     }
     const c = d.counts || {};
-    const line = '每 ' + (d.interval || '—') + ' 刷一轮存活账号'
+    const meta = '每 ' + (d.interval || '—') + ' 刷一轮'
       + (d.last_start_at ? ' · 上次 ' + fmtTime(d.last_start_at) : '')
-      + (d.counts ? ` · 本轮 存活 ${c.alive || 0} / 失效 ${c.expired || 0} / 跳过 ${c.skipped || 0}` : '')
       + (d.next_run_at ? ' · 下轮 ' + fmtTime(d.next_run_at) : '');
+    const counts = d.counts
+      ? node('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-top:7px' }, [
+          node('span', { class: 'tag ok', text: '存活 ' + (c.alive || 0) }),
+          node('span', { class: 'tag err', text: '失效 ' + (c.expired || 0) }),
+          node('span', { class: 'tag warn', text: '待定 ' + (c.unknown || 0) }),
+          node('span', { class: 'tag', text: '跳过 ' + (c.skipped || 0) }),
+        ])
+      : null;
     keepAliveEl.appendChild(node('div', { class: 'stat', style: 'margin-bottom:14px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap' }, [
-      node('div', {}, [
+      node('div', { style: 'flex:1;min-width:200px' }, [
         node('div', { class: 'stat-label', text: '账号保活' + (d.running ? '（刷新中…）' : '') }),
-        node('div', { class: 'stat-value', text: line, style: 'font-size:13px;margin-top:4px;font-weight:400' }),
+        node('div', { style: 'font-size:12.5px;color:var(--muted);margin-top:5px' }, [node('span', { text: meta })]),
+        counts,
       ]),
       node('button', { class: 'btn small ghost', text: '立即保活一轮', onclick: (e) => runKeepAlive(e.target) }),
     ]));
