@@ -17,6 +17,18 @@ import (
 	"yyb_go/internal/protocol"
 )
 
+func envBoolOr(key string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "":
+		return fallback
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -36,6 +48,8 @@ func main() {
 		"到达提取接口与品赞出口所需的跳板，如 http-connect://:token@172.19.0.1:2260（用品赞必须配）")
 	ipzanScheme := flag.String("ipzan-proxy-scheme", envOr("YYB_IPZAN_PROXY_SCHEME", "http-connect"),
 		"品赞出口协议：http-connect（protocol=1）或 socks5（protocol=2）")
+	ipzanScan := flag.Bool("ipzan-scan", envBoolOr("YYB_IPZAN_SCAN", true),
+		"扫码流程（建会话/取二维码/轮询/换登录态）是否也走动态出口，默认是")
 	flag.Parse()
 
 	var proxyProvider *protocol.ProxyProvider
@@ -54,6 +68,7 @@ func main() {
 		DBFilename:     *dbFilename,
 		TCPProxy:       *tcpProxy,
 		Proxy:          proxyProvider,
+		ProxyScan:      *ipzanScan,
 		SessionTTL:     30 * time.Minute,
 		RequestTimeout: 8 * time.Second,
 		AvatarTimeout:  10 * time.Second,
