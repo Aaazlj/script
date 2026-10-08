@@ -116,8 +116,9 @@ func NewApp(cfg Config) (*App, error) {
 		app.qr.LoginBuffers().SetProxyFunc(app.tcpProxyValue)
 		if cfg.ProxyScan {
 			app.qr.SetProxyFunc(app.tcpProxyValue)
-			// 走代理链时单步耗时会到数秒，8 秒默认超时不够用
-			if scanTimeout := 25 * time.Second; app.qr.Timeout() < scanTimeout {
+			// 走代理链时单步耗时会到数秒；另外扫码轮询本身就是长轮询
+			// （最长 35 秒才回），客户端超时不能比它短，否则每轮都超时。
+			if scanTimeout := 35 * time.Second; app.qr.Timeout() < scanTimeout {
 				app.qr.SetTimeout(scanTimeout)
 			}
 		}
