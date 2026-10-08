@@ -405,7 +405,9 @@ func (a *App) handleProxyProbe(w http.ResponseWriter, r *http.Request) {
 }
 
 const (
-	defaultProbeHost = "120.241.131.173" // 微信 HTTPDNS 短连接备用 IP
+	// 默认拿微信 HTTPDNS 的长连接节点来试：实测国内住宅出口到它的连通性
+	// 明显好于短连接备用 IP（120.241.131.173 经常连不上，会让「测试链路」误报不通）
+	defaultProbeHost = "180.153.202.85"
 	defaultProbePort = 80
 )
 
