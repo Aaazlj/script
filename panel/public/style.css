@@ -25,10 +25,9 @@ body {
   font-size: 14px;
   line-height: 1.6;
   min-height: 100vh;
-  padding: 32px 16px 48px;
 }
 
-.wrap { max-width: 720px; margin: 0 auto; }
+.wrap { max-width: 720px; margin: 0 auto; padding: 26px 16px 56px; }
 .wrap.wide { max-width: 900px; }
 
 .page-title { font-size: 20px; font-weight: 600; letter-spacing: .2px; }
@@ -212,55 +211,94 @@ body.admin { padding: 0; }
   .admin-head { flex-direction: column; }
 }
 
-/* ============ 顶部导航（前台/后台共用） ============ */
+/* ============ 应用栏（前后台共用：logo + 前后台切换） ============ */
 
-.topnav {
-  position: sticky; top: 0; z-index: 40;
-  display: flex; align-items: center; gap: 14px;
-  background: rgba(255, 255, 255, .92); backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+.appbar {
+  position: sticky; top: 0; z-index: 60;
+  height: 56px;
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 20px;
+  background: rgba(255, 255, 255, .94);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--line);
-  padding: 0 20px; height: 56px;
 }
-.topnav-brand {
-  display: flex; align-items: baseline; gap: 8px;
-  font-size: 15px; font-weight: 600; white-space: nowrap;
+.appbar-brand {
+  display: flex; align-items: center; gap: 9px;
+  min-width: 0; text-decoration: none; color: var(--text);
 }
-.topnav-brand .logo { display: inline-flex; color: var(--primary); }
-.topnav-brand .sub { font-size: 11px; color: var(--muted); font-weight: 400; }
-.topnav-tabs {
-  display: flex; gap: 2px; flex: 1; overflow-x: auto;
-  padding: 0 4px; scrollbar-width: none;
+.appbar-brand .logo {
+  width: 26px; height: 26px; flex: 0 0 26px;
+  border-radius: 8px; background: var(--primary-soft); color: var(--primary);
+  display: flex; align-items: center; justify-content: center;
 }
-.topnav-tabs::-webkit-scrollbar { display: none; }
-.topnav-tab {
-  border: none; background: none; font-family: inherit; font-size: 14px; color: #4a5058;
-  padding: 8px 12px; border-radius: 8px; cursor: pointer; white-space: nowrap;
-  display: flex; align-items: center; gap: 7px;
-  transition: background .15s, color .15s;
+.appbar-brand .name {
+  font-size: 15px; font-weight: 600; letter-spacing: .2px;
+  line-height: 1; white-space: nowrap;
 }
-.topnav-tab:hover { background: #f4f6fa; }
-.topnav-tab.active { background: var(--primary-soft); color: var(--primary); font-weight: 500; }
-.topnav-tab .ico { display: inline-flex; }
-.topnav-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-.topnav-link {
-  font-size: 13px; color: var(--primary); text-decoration: none;
-  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
-  padding: 7px 10px; border-radius: 8px; border: 1px solid transparent;
+.appbar-brand .sub {
+  font-size: 12px; color: var(--muted); line-height: 1;
+  padding-left: 8px; margin-left: 2px; border-left: 1px solid var(--line);
+  white-space: nowrap;
 }
-.topnav-link:hover { background: var(--primary-soft); border-color: var(--line); }
-.topnav-link.ghost { color: #4a5058; }
-.topnav-link.ghost:hover { color: var(--ink); background: #f4f6fa; }
+.appbar-spacer { flex: 1; }
 
-/* 顶部导航出现时，后台主区顶部留一点呼吸 */
-.topnav + .admin-main { padding-top: 22px; }
+/* 前台 / 后台 分段切换 */
+.seg {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 3px; border-radius: 10px; background: #f1f3f8; border: 1px solid var(--line);
+}
+.seg a {
+  font-size: 13px; color: #4a5058; text-decoration: none;
+  padding: 5px 14px; border-radius: 7px; line-height: 1.4;
+  transition: background .15s, color .15s, box-shadow .15s;
+}
+.seg a:hover { color: var(--text); }
+.seg a.active {
+  background: var(--card); color: var(--primary); font-weight: 500;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .08);
+}
 
 @media (max-width: 760px) {
-  .topnav { padding: 0 12px; gap: 10px; height: 52px; }
-  .topnav-brand .sub { display: none; }
-  .topnav-brand { font-size: 14px; }
-  .topnav-tab { padding: 8px 10px; font-size: 13px; }
-  .topnav-link { padding: 6px 8px; }
+  .appbar { height: 52px; padding: 0 12px; gap: 10px; }
+  .appbar-brand .sub { display: none; }
+  .appbar-brand .name { font-size: 14px; }
+  .seg a { padding: 5px 10px; font-size: 12px; }
+}
+
+/* ============ 后台：顶栏 + 左侧菜单 ============ */
+
+.admin-body { display: flex; align-items: flex-start; min-height: calc(100vh - 56px); }
+
+.admin-nav {
+  width: var(--nav-w); flex: 0 0 var(--nav-w);
+  position: sticky; top: 56px; height: calc(100vh - 56px);
+  background: var(--card); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 14px 12px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  border: none; background: none; font-family: inherit; font-size: 14px; color: #4a5058;
+  text-align: left; padding: 9px 12px; border-radius: 8px; cursor: pointer;
+  transition: background .15s, color .15s; white-space: nowrap;
+}
+.nav-item:hover { background: #f4f6fa; }
+.nav-item.active { background: var(--primary-soft); color: var(--primary); font-weight: 500; }
+.nav-item .ico { width: 16px; display: inline-flex; }
+.nav-foot { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); }
+
+@media (max-width: 760px) {
+  /* 小屏：左侧菜单变成可横滑的一条，贴在顶栏下面 */
+  .admin-body { display: block; }
+  .admin-nav {
+    width: 100%; flex: none; height: auto; position: sticky; top: 52px;
+    flex-direction: row; overflow-x: auto; scrollbar-width: none;
+    border-right: none; border-bottom: 1px solid var(--line);
+    padding: 8px 10px; gap: 4px; z-index: 30;
+  }
+  .admin-nav::-webkit-scrollbar { display: none; }
+  .nav-item { padding: 7px 10px; font-size: 13px; }
+  .nav-foot { display: none; }
 }
 
 /* ============ 账号页（参考 YYB-Go-Enhanced） ============ */
@@ -315,3 +353,55 @@ body.admin { padding: 0; }
   .acct-card { flex-direction: row; padding: 12px; }
   .acct-actions .btn { flex: 1 1 auto; }
 }
+
+
+/* ============ 自定义下拉框（替代原生 select） ============ */
+
+.dd { position: relative; display: inline-block; }
+.dd-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: inherit; font-size: 13px; color: var(--text);
+  background: var(--card); border: 1px solid var(--line); border-radius: 9px;
+  padding: 7px 11px; cursor: pointer; min-width: 118px; justify-content: space-between;
+  transition: border-color .15s, box-shadow .15s;
+}
+.dd-btn:hover { border-color: #cdd4e0; }
+.dd.open .dd-btn, .dd-btn:focus-visible {
+  border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); outline: none;
+}
+.dd-caret { color: var(--muted); transition: transform .18s; display: inline-flex; }
+.dd.open .dd-caret { transform: rotate(180deg); }
+.dd-menu {
+  position: absolute; z-index: 70; top: calc(100% + 6px); left: 0; min-width: 100%;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, .12);
+  padding: 5px; display: none; max-height: 260px; overflow-y: auto;
+}
+.dd.open .dd-menu { display: block; }
+.dd-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  font-family: inherit; font-size: 13px; color: var(--text); text-align: left;
+  background: none; border: none; border-radius: 7px; padding: 8px 10px; cursor: pointer;
+  white-space: nowrap;
+}
+.dd-item:hover { background: #f4f6fa; }
+.dd-item.active { background: var(--primary-soft); color: var(--primary); font-weight: 500; }
+.dd-item .tick { margin-left: auto; font-size: 12px; opacity: .9; }
+@media (max-width: 760px) {
+  .dd, .dd-btn { width: 100%; }
+  .dd-menu { left: 0; right: 0; }
+}
+
+/* ============ 内联标签 ============ */
+
+.tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; line-height: 1.4; padding: 2px 8px; border-radius: 6px;
+  background: #f1f3f8; color: #5b6472; border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.tag.primary { background: var(--primary-soft); color: var(--primary); border-color: #d8e3ff; }
+.tag.ok { background: var(--ok-soft); color: var(--ok); border-color: #d3ecdd; }
+.tag.warn { background: var(--warn-soft); color: var(--warn); border-color: #f2e3c4; }
+.tag.err { background: var(--err-soft); color: var(--err); border-color: #f7d6d6; }
+.tag.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
