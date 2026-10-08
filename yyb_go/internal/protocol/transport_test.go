@@ -155,8 +155,8 @@ func TestDialChainThroughTwoProxies(t *testing.T) {
 	}()
 	targetHost, targetPortStr, _ := net.SplitHostPort(targetLn.Addr().String())
 
-	relay := newFakeProxy(t)    // 第一跳：树脂（用户名空，token 在密码位）
-	final := newFakeProxy(t)    // 第二跳：品赞（账号密码）
+	relay := newFakeProxy(t) // 第一跳：树脂（用户名空，token 在密码位）
+	final := newFakeProxy(t) // 第二跳：品赞（账号密码）
 	finalHost, finalPort, _ := net.SplitHostPort(final.addr())
 
 	chain := "http-connect://:" + relayToken + "@" + relay.addr() +
