@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -867,6 +868,10 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 	result, err := a.qr.RefreshLoginBuffer(ctx, creds)
 	if err != nil {
 		status := refreshFailureStatus(currentAccountStatus(acc), creds, err, time.Now())
+		// 失败原因必须落日志：面板上只看到 expired，不知道到底是凭据真废了
+		// 还是网络/网关抖动，排查时全靠这一行。
+		log.Printf("[refresh] 账号 #%d %s → %s（%s）：%v",
+			acc.ID, accountLabel(acc), status, credsExpiryHint(creds), err)
 		_ = a.db.SetAccountStatus(ctx, acc.ID, status)
 		return status
 	}
@@ -876,6 +881,33 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 		_ = a.db.SetAccountProfile(ctx, acc.ID, acc.Nickname, &avatar, acc.UserInfo)
 	}
 	return "alive"
+}
+
+// accountLabel 给日志一个能认出人的短标识
+func accountLabel(acc *store.WechatAccount) string {
+	if acc == nil {
+		return "?"
+	}
+	if acc.Nickname != nil && strings.TrimSpace(*acc.Nickname) != "" {
+		return *acc.Nickname
+	}
+	openid := acc.OpenID
+	if len(openid) > 10 {
+		openid = openid[:10] + "…"
+	}
+	return openid
+}
+
+// credsExpiryHint 说明 access token 是否还有效，便于区分「号废了」和「这次请求失败」
+func credsExpiryHint(creds protocol.LoginBufferCredentials) string {
+	if creds.ExpiresAt <= 0 {
+		return "无过期时间"
+	}
+	left := time.Until(time.Unix(creds.ExpiresAt, 0))
+	if left > 0 {
+		return fmt.Sprintf("access token 还剩 %s", left.Truncate(time.Minute))
+	}
+	return fmt.Sprintf("access token 已过期 %s", (-left).Truncate(time.Minute))
 }
 
 // refreshFailureStatus 把一次续期失败翻译成账号状态。current 是失败前的状态。
