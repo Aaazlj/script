@@ -32,18 +32,22 @@ type ProxyProviderConfig struct {
 	RotateAhead time.Duration // 提前多久换出口
 	// URLTTL 是从提取 URL 的 minute 参数推出来的寿命，纯文本格式不返回过期时间时用它
 	URLTTL time.Duration
+	// RetryBackoff 提取失败后的退避时间（默认 60 秒），避免把提取接口打爆
+	RetryBackoff time.Duration
 }
 
 type ProxyProvider struct {
 	cfg    ProxyProviderConfig
 	client *http.Client
 
-	mu       sync.Mutex
-	current  *tcpProxy
-	expireAt time.Time
-	lastErr  string
-	extracts int64
-	lastAt   time.Time
+	mu            sync.Mutex
+	refreshing    bool
+	lastAttemptAt time.Time
+	current       *tcpProxy
+	expireAt      time.Time
+	lastErr       string
+	extracts      int64
+	lastAt        time.Time
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -81,6 +85,9 @@ func NewProxyProvider(cfg ProxyProviderConfig) *ProxyProvider {
 	}
 	if cfg.URLTTL <= 0 {
 		cfg.URLTTL = minuteFromURL(cfg.ExtractURL)
+	}
+	if cfg.RetryBackoff <= 0 {
+		cfg.RetryBackoff = 60 * time.Second
 	}
 
 	transport := &http.Transport{
@@ -135,6 +142,9 @@ func (p *ProxyProvider) Start() {
 	if p == nil || strings.TrimSpace(p.cfg.ExtractURL) == "" {
 		return
 	}
+	// 启动就先预热一个出口，别让首批请求落到直连
+	p.refreshAsync("启动预热")
+
 	go func() {
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
@@ -144,9 +154,7 @@ func (p *ProxyProvider) Start() {
 				return
 			case <-ticker.C:
 				if p.needRefresh() {
-					if err := p.Refresh(context.Background()); err != nil {
-						log.Printf("[proxy] 换出口失败（将继续用上一个/直连）: %v", err)
-					}
+					p.refreshAsync("定时预热")
 				}
 			}
 		}
@@ -179,22 +187,59 @@ func (p *ProxyProvider) needRefreshLocked() bool {
 
 // Current 返回当前可用的代理链（跳板>>出口）；没有可用出口时返回空串，
 // 调用方会按 fallbackDirect 直连——不会因为品赞抖动把功能整体弄挂。
+//
+// 关键：绝不阻塞请求路径。需要换出口时只在后台换（single-flight），
+// 手上还有可用出口就继续用它；哪怕没有，也是立刻返回空串走直连。
+// 早期版本在这里同步等提取，一旦提取慢/失败就把 HTTP 请求的整体超时耗光，
+// 表现成「明明是直连却超时」。
 func (p *ProxyProvider) Current() string {
 	if !p.enabled() {
 		return ""
 	}
-	if p.needRefresh() {
-		if err := p.Refresh(context.Background()); err != nil {
-			log.Printf("[proxy] 取出口失败，本次直连: %v", err)
-		}
-	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.current == nil {
-		return ""
+	needRefresh := p.needRefreshLocked()
+	chain := ""
+	if p.current != nil {
+		chain = p.chainLocked()
 	}
-	return p.chainLocked()
+	p.mu.Unlock()
+
+	if needRefresh {
+		p.refreshAsync("请求触发的换出口")
+	}
+	return chain
+}
+
+// refreshAsync 后台换出口，同一时刻只有一个在跑（single-flight），
+// 并且失败后 60 秒内不再重试（避免提取接口被我们自己打爆）。
+func (p *ProxyProvider) refreshAsync(reason string) {
+	if !p.enabled() {
+		return
+	}
+	p.mu.Lock()
+	if p.refreshing {
+		p.mu.Unlock()
+		return
+	}
+	if !p.lastAttemptAt.IsZero() && time.Since(p.lastAttemptAt) < p.cfg.RetryBackoff {
+		p.mu.Unlock()
+		return
+	}
+	p.refreshing = true
+	p.lastAttemptAt = time.Now()
+	p.mu.Unlock()
+
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			p.refreshing = false
+			p.mu.Unlock()
+		}()
+		if err := p.Refresh(context.Background()); err != nil {
+			log.Printf("[proxy] 换出口失败（%s），暂时直连: %v", reason, err)
+		}
+	}()
 }
 
 func (p *ProxyProvider) chainLocked() string {
