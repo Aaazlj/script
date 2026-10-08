@@ -149,7 +149,7 @@ table.kv td.k { color: var(--muted); width: 96px; }
 
 body.admin { padding: 0; }
 
-.admin-shell { display: flex; min-height: 100vh; }
+.admin-shell { display: block; min-height: 100vh; }
 
 .admin-nav {
   width: var(--nav-w); flex: 0 0 var(--nav-w);
@@ -182,6 +182,8 @@ body.admin { padding: 0; }
 .head-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 
 .panel { max-width: 620px; }
+.panel[data-panel="accounts"] { max-width: 960px; }
+.panel[data-panel="proxy"] { max-width: 760px; }
 .panel.hidden { display: none; }
 
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
