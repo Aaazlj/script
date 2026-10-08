@@ -137,21 +137,24 @@ func dialChain(ctx context.Context, hops []*tcpProxy, targetHost string, targetP
 	}
 
 	// 用第 i-1 跳把第 i 跳「打开」（第二跳开始都是套在隧道里谈的）
+	// 注意：出错时 proxyConnect 会返回 nil，必须用原 conn 去 Close，
+	// 否则就是空指针解引用（会让 HTTP handler 直接 panic）。
 	for i := 1; i < len(hops); i++ {
-		conn, err = proxyConnect(conn, hops[i-1], hops[i].Host, mustAtoi(hops[i].Port))
+		next, err := proxyConnect(conn, hops[i-1], hops[i].Host, mustAtoi(hops[i].Port))
 		if err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("穿透到第 %d 跳 %s 失败: %w", i+1, hops[i].Display(), err)
 		}
+		conn = next
 	}
 
 	last := hops[len(hops)-1]
-	conn, err = proxyConnect(conn, last, targetHost, targetPort)
+	next, err := proxyConnect(conn, last, targetHost, targetPort)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("经代理 %s 连接 %s:%d 失败: %w", last.Display(), targetHost, targetPort, err)
 	}
-	return conn, nil
+	return next, nil
 }
 
 func proxyConnect(conn net.Conn, via *tcpProxy, host string, port int) (net.Conn, error) {

@@ -294,3 +294,38 @@ func TestMinuteFromURL(t *testing.T) {
 		t.Fatalf("没有 minute 参数应返回 0，实际 %v", got)
 	}
 }
+
+// 代理回非 200 时（CONNECT 被拒）必须干净地返回错误，
+// 而不是因为拿 nil conn 去 Close 而 panic。
+func TestDialChainProxyRejectsConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("监听失败: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				if _, err := http.ReadRequest(br); err != nil {
+					return
+				}
+				_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			}(c)
+		}
+	}()
+
+	ctx := context.Background()
+	_, err = dialTCP(ctx, "127.0.0.1", 9, 2*time.Second, "http-connect://"+ln.Addr().String(), false)
+	if err == nil {
+		t.Fatalf("代理拒绝 CONNECT 时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "CONNECT") {
+		t.Fatalf("错误信息应说明是 CONNECT 失败，实际: %v", err)
+	}
+}
