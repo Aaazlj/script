@@ -106,14 +106,50 @@ func (c *Client) newHTTPClient(jar http.CookieJar) *http.Client {
 	if c.proxy == nil {
 		return hc
 	}
-	hc.Transport = &http.Transport{
-		DialContext:           protocol.NewProxyDialer(c.timeout, c.proxy, true),
-		TLSHandshakeTimeout:   c.timeout,
-		ResponseHeaderTimeout: c.timeout,
-		MaxIdleConns:          8,
-		MaxIdleConnsPerHost:   4,
+	hc.Transport = &fallbackTransport{
+		primary: &http.Transport{
+			DialContext:           protocol.NewProxyDialer(c.timeout, c.proxy, true),
+			TLSHandshakeTimeout:   c.timeout,
+			ResponseHeaderTimeout: c.timeout,
+			MaxIdleConns:          8,
+			MaxIdleConnsPerHost:   4,
+		},
+		// 国内住宅出口对 open.weixin.qq.com 这种交互式请求并不稳定
+		// （实测 10~21 秒、约 1/3 失败），所以失败立刻用直连再走一次：
+		// 代理能用就走代理，用不了也不会让扫码卡住。
+		secondary: http.DefaultTransport,
 	}
 	return hc
+}
+
+// fallbackTransport 先走 primary（代理），失败且请求可重放时改走 secondary（直连）。
+//
+// 扫码是交互式流程，用户就看着二维码出不出来；住宅出口抖动时宁可退回直连，
+// 也不要让面板扫码变慢或报错。
+type fallbackTransport struct {
+	primary   http.RoundTripper
+	secondary http.RoundTripper
+}
+
+func (t *fallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.primary.RoundTrip(req)
+	if err == nil {
+		return resp, nil
+	}
+	// 请求体不可重放时不重试（扫码流程都是 GET，正常不会走到这）
+	if req.Body != nil && req.GetBody == nil {
+		return nil, err
+	}
+	log.Printf("[qr] 代理出口失败（%v），本次改用直连重试", err)
+	retry := req.Clone(req.Context())
+	if req.GetBody != nil {
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return nil, err
+		}
+		retry.Body = body
+	}
+	return t.secondary.RoundTrip(retry)
 }
 
 func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
