@@ -245,3 +245,52 @@ func TestDialTCPFallsBackToDirect(t *testing.T) {
 		t.Fatalf("fallbackDirect=false 时代理不可用应报错")
 	}
 }
+
+func TestParseExtractBody(t *testing.T) {
+	// 品赞默认的纯文本：ip:port 账号 密码
+	e, err := parseExtractBody([]byte("218.95.39.53:10174 THET0AUNQ0O d09o26i4cmhktog"))
+	if err != nil {
+		t.Fatalf("纯文本解析失败: %v", err)
+	}
+	if e.IP != "218.95.39.53" || e.Port != "10174" || e.Account != "THET0AUNQ0O" || e.Password != "d09o26i4cmhktog" {
+		t.Fatalf("纯文本解析结果不对: %+v", e)
+	}
+
+	// 白名单模式：只有 ip:port
+	e, err = parseExtractBody([]byte("218.95.39.53:10174\n218.95.39.54:10175"))
+	if err != nil {
+		t.Fatalf("白名单模式解析失败: %v", err)
+	}
+	if e.IP != "218.95.39.53" || e.Port != "10174" || e.Account != "" {
+		t.Fatalf("多行应取第一行且无账号: %+v", e)
+	}
+
+	// format=json 时的结构
+	e, err = parseExtractBody([]byte(`{"code":0,"data":{"list":[{"ip":"1.2.3.4","port":"8080","expired":1790755974897,"net":"移动","account":"a","password":"b"}]}}`))
+	if err != nil {
+		t.Fatalf("JSON 解析失败: %v", err)
+	}
+	if e.IP != "1.2.3.4" || e.Expired == 0 {
+		t.Fatalf("JSON 解析结果不对: %+v", e)
+	}
+
+	// 接口报错：不能当成 IP 用
+	if _, err := parseExtractBody([]byte("找不到价格表 请联系客服")); err == nil {
+		t.Fatalf("错误提示应该报错")
+	}
+	if _, err := parseExtractBody([]byte(`{"code":-1,"message":"找不到价格表 请联系客服"}`)); err == nil {
+		t.Fatalf("JSON 错误码应该报错")
+	}
+	if _, err := parseExtractBody([]byte("")); err == nil {
+		t.Fatalf("空响应应该报错")
+	}
+}
+
+func TestMinuteFromURL(t *testing.T) {
+	if got := minuteFromURL("https://service.ipzan.com/core-extract?num=1&minute=10&area=440100"); got != 10*time.Minute {
+		t.Fatalf("minute=10 应解析为 10 分钟，实际 %v", got)
+	}
+	if got := minuteFromURL("https://service.ipzan.com/core-extract?num=1"); got != 0 {
+		t.Fatalf("没有 minute 参数应返回 0，实际 %v", got)
+	}
+}
