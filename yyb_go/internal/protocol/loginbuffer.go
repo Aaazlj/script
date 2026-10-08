@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -99,6 +101,37 @@ type LoginBufferResult struct {
 type LoginBufferClient struct {
 	httpClient *http.Client
 	timeout    time.Duration
+}
+
+// SetProxyFunc 让续期 / 取登录态的 HTTPS 请求也走代理链。
+//
+// 这些请求直接打腾讯（yybadaccess.3g.qq.com），海外 IP 高频访问更容易被风控，
+// 走国内住宅出口更接近真实用户。传入的函数每次拨号都会被调用，
+// 所以出口轮换后自动生效；传 nil 表示保持直连。
+func (c *LoginBufferClient) SetProxyFunc(proxy func() string) {
+	if c == nil || proxy == nil {
+		return
+	}
+	timeout := c.timeout
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, portStr, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				return nil, err
+			}
+			// fallbackDirect=true：代理挂了就直连，别把续期能力整体弄没
+			return dialTCP(ctx, host, port, timeout, proxy(), true)
+		},
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+	}
+	c.httpClient = &http.Client{Timeout: timeout, Transport: transport}
 }
 
 func NewLoginBufferClient(timeout time.Duration) *LoginBufferClient {
