@@ -9,11 +9,20 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"yyb_go/internal/httpapi"
+	"yyb_go/internal/protocol"
 )
+
+func envOr(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func main() {
 	host := flag.String("host", "127.0.0.1", "listen host")
@@ -21,12 +30,30 @@ func main() {
 	resourceRoot := flag.String("resource-root", filepath.Join(".", "resource"), "runtime resource directory")
 	dbFilename := flag.String("db", httpapi.DefaultDBFilename, "SQLite database filename under resource/db")
 	tcpProxy := flag.String("tcp-proxy", "", "optional TCP proxy: socks5://host:port or http-connect://host:port")
+	ipzanExtract := flag.String("ipzan-extract", os.Getenv("YYB_IPZAN_EXTRACT_URL"),
+		"提取接口（品赞）地址，含 secret；配置后取 code / 续期都会走国内住宅出口")
+	ipzanRelay := flag.String("ipzan-relay", os.Getenv("YYB_IPZAN_RELAY"),
+		"到达提取接口与品赞出口所需的跳板，如 http-connect://:token@172.19.0.1:2260（用品赞必须配）")
+	ipzanScheme := flag.String("ipzan-proxy-scheme", envOr("YYB_IPZAN_PROXY_SCHEME", "http-connect"),
+		"品赞出口协议：http-connect（protocol=1）或 socks5（protocol=2）")
 	flag.Parse()
+
+	var proxyProvider *protocol.ProxyProvider
+	if strings.TrimSpace(*ipzanExtract) != "" {
+		proxyProvider = protocol.NewProxyProvider(protocol.ProxyProviderConfig{
+			ExtractURL:  strings.TrimSpace(*ipzanExtract),
+			Relay:       strings.TrimSpace(*ipzanRelay),
+			ProxyScheme: strings.TrimSpace(*ipzanScheme),
+			Timeout:     15 * time.Second,
+		})
+		log.Printf("已启用动态出口（品赞链路）: 跳板=%v", *ipzanRelay != "")
+	}
 
 	cfg := httpapi.Config{
 		ResourceRoot:   *resourceRoot,
 		DBFilename:     *dbFilename,
 		TCPProxy:       *tcpProxy,
+		Proxy:          proxyProvider,
 		SessionTTL:     30 * time.Minute,
 		RequestTimeout: 8 * time.Second,
 		AvatarTimeout:  10 * time.Second,

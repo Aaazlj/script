@@ -9,9 +9,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +27,11 @@ import (
 )
 
 type Config struct {
-	ResourceRoot   string
-	DBFilename     string
-	TCPProxy       string
+	ResourceRoot string
+	DBFilename   string
+	TCPProxy     string
+	// Proxy 为空表示不使用动态出口（品赞链路），只用上面的静态 TCPProxy
+	Proxy          *protocol.ProxyProvider
 	SessionTTL     time.Duration
 	RequestTimeout time.Duration
 	AvatarTimeout  time.Duration
@@ -94,17 +98,30 @@ func NewApp(cfg Config) (*App, error) {
 	poolCfg.ShortlinkTimeout = cfg.RequestTimeout
 	poolCfg.TCPProxy = cfg.TCPProxy
 	pool := protocol.NewPool(poolCfg, db)
-	return &App{
+
+	app := &App{
 		cfg:        cfg,
 		resources:  res,
 		db:         db,
 		pool:       pool,
 		qr:         qr.NewClient(cfg.RequestTimeout),
 		qrSessions: map[string]*qr.Session{},
-	}, nil
+	}
+
+	// 动态出口（品赞链路）：配置了就让「取 code / 续期」都走国内出口。
+	// 没配置时一切照旧（直连或静态代理），不影响原有部署。
+	if cfg.Proxy != nil && cfg.Proxy.Status()["enabled"] == true {
+		app.qr.LoginBuffers().SetProxyFunc(app.tcpProxyValue)
+		cfg.Proxy.Start()
+		log.Printf("[proxy] 动态出口已启用：%v", cfg.Proxy.Status()["relay"])
+	}
+	return app, nil
 }
 
 func (a *App) Close() error {
+	if a.cfg.Proxy != nil {
+		a.cfg.Proxy.Close()
+	}
 	if a.db != nil {
 		return a.db.Close()
 	}
@@ -132,6 +149,8 @@ func (a *App) Handler() http.Handler {
 	router.StaticFS("/static", http.Dir(a.resources.Static))
 	router.Any("/qr", gin.WrapF(a.handleQRRoot))
 	router.Any("/qr/*path", gin.WrapF(a.handleQR))
+	router.Any("/proxy/status", gin.WrapF(a.handleProxyStatus))
+	router.Any("/proxy/probe", gin.WrapF(a.handleProxyProbe))
 	router.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
 	router.Any("/accounts/export", gin.WrapF(a.handleAccountsExport))
 	router.Any("/accounts/import", gin.WrapF(a.handleAccountsImport))
@@ -298,6 +317,87 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "qr session not found")
 	}
+}
+
+// GET /proxy/status —— 看当前国内出口是什么、还有多久过期、上次报错
+func (a *App) handleProxyStatus(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/proxy/status" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if a.cfg.Proxy == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "hint": "未配置动态出口，当前走直连或静态代理"})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.cfg.Proxy.Status())
+}
+
+// POST /proxy/probe[?host=&port=] —— 用当前出口真连一次目标，验证「跳板→品赞→目标」是否通
+func (a *App) handleProxyProbe(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/proxy/probe" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if a.cfg.Proxy == nil {
+		writeError(w, http.StatusBadRequest, "未配置动态出口")
+		return
+	}
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	port := 80
+	if v := strings.TrimSpace(r.URL.Query().Get("port")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			port = n
+		}
+	}
+	if host == "" {
+		host = defaultProbeHost
+		port = defaultProbePort
+	}
+	started := time.Now()
+	chain, err := a.cfg.Proxy.Probe(r.Context(), host, port, a.cfg.RequestTimeout+7*time.Second)
+	out := map[string]any{
+		"target":     fmt.Sprintf("%s:%d", host, port),
+		"chain":      maskChain(chain),
+		"elapsed_ms": time.Since(started).Milliseconds(),
+	}
+	if err != nil {
+		out["ok"] = false
+		out["error"] = err.Error()
+		writeJSON(w, http.StatusBadGateway, out)
+		return
+	}
+	out["ok"] = true
+	writeJSON(w, http.StatusOK, out)
+}
+
+const (
+	defaultProbeHost = "120.241.131.173" // 微信 HTTPDNS 短连接备用 IP
+	defaultProbePort = 80
+)
+
+// maskChain 只保留出口的 host:port，抹掉用户名密码
+func maskChain(chain string) string {
+	if chain == "" {
+		return ""
+	}
+	parts := strings.Split(chain, protocol.ProxyChainSeparator())
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if u, err := url.Parse(part); err == nil && u.Host != "" {
+			out = append(out, u.Scheme+"://"+u.Host)
+			continue
+		}
+		out = append(out, "?")
+	}
+	return strings.Join(out, protocol.ProxyChainSeparator())
 }
 
 func (a *App) handleAccountsRoot(w http.ResponseWriter, r *http.Request) {
@@ -1097,8 +1197,19 @@ func (e accountUnusableError) Error() string {
 	return "account not usable: " + e.openid + " (status=" + e.status + ")"
 }
 
+// tcpProxyValue 返回本次请求要用的代理链：优先用动态出口（品赞国内 IP），
+// 拿不到时退回静态代理，再没有就直连（dialTCP 自己会按 fallbackDirect 兜底）。
+func (a *App) tcpProxyValue() string {
+	if a.cfg.Proxy != nil {
+		if v := a.cfg.Proxy.Current(); v != "" {
+			return v
+		}
+	}
+	return a.cfg.TCPProxy
+}
+
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
-	proxy := a.cfg.TCPProxy
+	proxy := a.tcpProxyValue()
 	if _, err := a.db.GetSession(ctx, acc.ID, proxy); err == nil {
 		result, err := call(ctx, acc, appID, payload)
 		if err == nil {
@@ -1118,15 +1229,15 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 }
 
 func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.tcpProxyValue())
 }
 
 func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, a.tcpProxyValue())
 }
 
 func (a *App) invokeOperateWXData(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any) (map[string]any, error) {
-	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, a.cfg.TCPProxy)
+	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, a.tcpProxyValue())
 }
 
 func refreshOut(acc *store.WechatAccount, status string) map[string]any {

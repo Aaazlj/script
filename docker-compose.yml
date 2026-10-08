@@ -18,6 +18,12 @@ services:
       # 只持久化账号库与头像；二维码/模板留在容器层即可
       - ./data/yyb/db:/app/resource/db
       - ./data/yyb/avatars:/app/resource/avatars
+    environment:
+      # 动态出口（品赞国内住宅 IP）：取 code / 续期走国内出口，降低海外 IP 被风控的概率。
+      # 值放同目录 .env（已被 .gitignore 忽略，禁止提交），留空则退回直连/静态代理。
+      YYB_IPZAN_EXTRACT_URL: ${YYB_IPZAN_EXTRACT_URL:-}
+      YYB_IPZAN_RELAY: ${YYB_IPZAN_RELAY:-}
+      YYB_IPZAN_PROXY_SCHEME: ${YYB_IPZAN_PROXY_SCHEME:-http-connect}
     networks:
       - panel
       - qinglong
