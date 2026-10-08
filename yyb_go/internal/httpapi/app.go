@@ -116,6 +116,10 @@ func NewApp(cfg Config) (*App, error) {
 		app.qr.LoginBuffers().SetProxyFunc(app.tcpProxyValue)
 		if cfg.ProxyScan {
 			app.qr.SetProxyFunc(app.tcpProxyValue)
+			// 走代理链时单步耗时会到数秒，8 秒默认超时不够用
+			if scanTimeout := 25 * time.Second; app.qr.Timeout() < scanTimeout {
+				app.qr.SetTimeout(scanTimeout)
+			}
 		}
 		cfg.Proxy.Start()
 		log.Printf("[proxy] 动态出口已启用：跳板=%v 扫码也走代理=%v", cfg.Proxy.Status()["relay"], cfg.ProxyScan)
