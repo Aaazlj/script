@@ -174,6 +174,42 @@ route('GET', '/api/yyb/avatar', async (req, res, url) => {
   httpx.pipeThrough(target, res);
 }, { admin: true });
 
+/* 动态出口（品赞）开关与状态（管理后台） */
+
+route('GET', '/api/yyb/proxy', async (req, res) => {
+  const cfg = config.load();
+  const out = await yyb.proxySummary(cfg.yyb);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, out.data);
+}, { admin: true });
+
+route('POST', '/api/yyb/proxy/settings', async (req, res) => {
+  const body = await httpx.readJSON(req);
+  const patch = {};
+  if (typeof body.scan_via_proxy === 'boolean') patch.scan_via_proxy = body.scan_via_proxy;
+  if (typeof body.code_via_proxy === 'boolean') patch.code_via_proxy = body.code_via_proxy;
+  if (!Object.keys(patch).length) return httpx.fail(res, 400, '没有要修改的开关');
+
+  const cfg = config.load();
+  const out = await yyb.updateProxySettings(cfg.yyb, patch);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, out.data);
+}, { admin: true });
+
+route('POST', '/api/yyb/proxy/refresh', async (req, res) => {
+  const cfg = config.load();
+  const out = await yyb.refreshProxy(cfg.yyb);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, out.data);
+}, { admin: true });
+
+route('POST', '/api/yyb/proxy/probe', async (req, res, url) => {
+  const cfg = config.load();
+  const out = await yyb.probeProxy(cfg.yyb, url.searchParams.get('host') || '', url.searchParams.get('port') || '');
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, out.data);
+}, { admin: true });
+
 /* 账号导出 / 导入 / 排序（管理后台） */
 
 route('GET', '/api/yyb/accounts/export', async (req, res, url) => {

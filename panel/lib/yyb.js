@@ -226,6 +226,49 @@ async function setAccountScripts(cfg, items) {
   return { ok: true, result: out.data };
 }
 
+/* ---------------- 动态出口（品赞链路）开关 ---------------- */
+
+/** 读代理状态 + 开关 */
+async function proxySummary(cfg) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/proxy/settings`, { timeout: TIMEOUT });
+  const out = unwrap(res, '读取代理状态');
+  if (!out.ok) return out;
+  return { ok: true, data: out.data };
+}
+
+/** 改开关：patch 形如 {scan_via_proxy: true} / {code_via_proxy: false} */
+async function updateProxySettings(cfg, patch) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/proxy/settings`, { method: 'POST', body: patch, timeout: TIMEOUT });
+  const out = unwrap(res, '保存代理开关');
+  if (!out.ok) return out;
+  return { ok: true, data: out.data };
+}
+
+/** 强制换一个出口 */
+async function refreshProxy(cfg) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/proxy/refresh`, { method: 'POST', timeout: 45000 });
+  const out = unwrap(res, '换出口');
+  if (!out.ok) return out;
+  return { ok: true, data: out.data };
+}
+
+/** 用当前出口真连一次目标（默认微信 HTTPDNS IP） */
+async function probeProxy(cfg, host, port) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const qs = host ? `?host=${encodeURIComponent(host)}${port ? '&port=' + port : ''}` : '';
+  const res = await requestRaw(`${b}/proxy/probe${qs}`, { method: 'POST', timeout: 45000 });
+  const out = unwrap(res, '测试链路');
+  if (!out.ok) return out;
+  return { ok: true, data: out.data };
+}
+
 module.exports = {
   health,
   createQR,
