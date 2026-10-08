@@ -31,7 +31,9 @@ type Config struct {
 	DBFilename   string
 	TCPProxy     string
 	// Proxy 为空表示不使用动态出口（品赞链路），只用上面的静态 TCPProxy
-	Proxy          *protocol.ProxyProvider
+	Proxy *protocol.ProxyProvider
+	// ProxyScan 控制扫码流程（建会话/取二维码/轮询/换登录态）是否也走动态出口
+	ProxyScan      bool
 	SessionTTL     time.Duration
 	RequestTimeout time.Duration
 	AvatarTimeout  time.Duration
@@ -112,8 +114,11 @@ func NewApp(cfg Config) (*App, error) {
 	// 没配置时一切照旧（直连或静态代理），不影响原有部署。
 	if cfg.Proxy != nil && cfg.Proxy.Status()["enabled"] == true {
 		app.qr.LoginBuffers().SetProxyFunc(app.tcpProxyValue)
+		if cfg.ProxyScan {
+			app.qr.SetProxyFunc(app.tcpProxyValue)
+		}
 		cfg.Proxy.Start()
-		log.Printf("[proxy] 动态出口已启用：%v", cfg.Proxy.Status()["relay"])
+		log.Printf("[proxy] 动态出口已启用：跳板=%v 扫码也走代理=%v", cfg.Proxy.Status()["relay"], cfg.ProxyScan)
 	}
 	return app, nil
 }
@@ -333,7 +338,11 @@ func (a *App) handleProxyStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "hint": "未配置动态出口，当前走直连或静态代理"})
 		return
 	}
-	writeJSON(w, http.StatusOK, a.cfg.Proxy.Status())
+	out := a.cfg.Proxy.Status()
+	// 扫码 / 续期 / 取 code 各走不走代理，运维一眼可见
+	out["scan_via_proxy"] = a.cfg.ProxyScan
+	out["code_via_proxy"] = true
+	writeJSON(w, http.StatusOK, out)
 }
 
 // POST /proxy/probe[?host=&port=] —— 用当前出口真连一次目标，验证「跳板→品赞→目标」是否通

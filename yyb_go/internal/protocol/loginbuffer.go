@@ -10,9 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
-	"strconv"
 	"time"
 )
 
@@ -114,18 +112,8 @@ func (c *LoginBufferClient) SetProxyFunc(proxy func() string) {
 	}
 	timeout := c.timeout
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, portStr, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			port, err := strconv.Atoi(portStr)
-			if err != nil {
-				return nil, err
-			}
-			// fallbackDirect=true：代理挂了就直连，别把续期能力整体弄没
-			return dialTCP(ctx, host, port, timeout, proxy(), true)
-		},
+		// fallbackDirect=true：代理挂了就直连，别把续期能力整体弄没
+		DialContext:           NewProxyDialer(timeout, proxy, true),
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
 		MaxIdleConns:          8,

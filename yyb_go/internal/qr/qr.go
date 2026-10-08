@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +69,10 @@ type PollResult struct {
 type Client struct {
 	timeout      time.Duration
 	loginBuffers *protocol.LoginBufferClient
+
+	// proxy 返回当前代理链（空串=直连）。扫码整条链路（建会话 / 取二维码 /
+	// 轮询 / 换登录态）都用它，让「扫码」这件事也发生在国内出口上。
+	proxy func() string
 }
 
 func NewClient(timeout time.Duration) *Client {
@@ -77,6 +83,26 @@ func NewClient(timeout time.Duration) *Client {
 }
 
 func (c *Client) LoginBuffers() *protocol.LoginBufferClient { return c.loginBuffers }
+
+// SetProxyFunc 让扫码流程也走代理链。传 nil 表示直连（默认）。
+func (c *Client) SetProxyFunc(proxy func() string) { c.proxy = proxy }
+
+// newHTTPClient 建一个（按需走代理的）HTTP 客户端。
+// fallbackDirect=true：代理抖了就直接连，别把扫码功能整体弄挂。
+func (c *Client) newHTTPClient(jar http.CookieJar) *http.Client {
+	hc := &http.Client{Timeout: c.timeout, Jar: jar}
+	if c.proxy == nil {
+		return hc
+	}
+	hc.Transport = &http.Transport{
+		DialContext:           protocol.NewProxyDialer(c.timeout, c.proxy, true),
+		TLSHandshakeTimeout:   c.timeout,
+		ResponseHeaderTimeout: c.timeout,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+	}
+	return hc
+}
 
 func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
 	sess, err := c.CreateSession(ctx)
@@ -95,7 +121,10 @@ func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{Timeout: c.timeout, Jar: jar}
+	hc := c.newHTTPClient(jar)
+	if c.proxy != nil {
+		log.Printf("[qr] 建扫码会话走代理: %s", maskProxyChain(c.proxy()))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oauthURL, nil)
 	if err != nil {
 		return nil, err
@@ -306,4 +335,21 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// maskProxyChain 只保留各跳的 host:port，去掉用户名密码
+func maskProxyChain(chain string) string {
+	if chain == "" {
+		return "direct"
+	}
+	parts := strings.Split(chain, protocol.ProxyChainSeparator())
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if u, err := url.Parse(part); err == nil && u.Host != "" {
+			out = append(out, u.Host)
+			continue
+		}
+		out = append(out, "?")
+	}
+	return strings.Join(out, protocol.ProxyChainSeparator())
 }

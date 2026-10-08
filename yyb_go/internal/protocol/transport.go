@@ -115,6 +115,28 @@ func dialTCP(ctx context.Context, host string, port int, timeout time.Duration, 
 	return dialDirect(ctx, host, port, timeout)
 }
 
+// NewProxyDialer 返回一个给 http.Transport.DialContext 用的拨号函数。
+//
+// 代理链在每次拨号时才取（proxy()），所以出口轮换后自动生效；
+// fallbackDirect=true 表示代理不可用时直接连目标，避免把功能整体弄挂。
+func NewProxyDialer(timeout time.Duration, proxy func() string, fallbackDirect bool) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, err
+		}
+		value := ""
+		if proxy != nil {
+			value = proxy()
+		}
+		return dialTCP(ctx, host, port, timeout, value, fallbackDirect)
+	}
+}
+
 func dialDirect(ctx context.Context, host string, port int, timeout time.Duration) (net.Conn, error) {
 	var d net.Dialer
 	if timeout > 0 {
