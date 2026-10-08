@@ -30,6 +30,8 @@ type ProxyProviderConfig struct {
 	ProxyScheme string        // 品赞出口协议：http-connect（protocol=1）/ socks5（protocol=2）
 	Timeout     time.Duration // 提取请求超时
 	RotateAhead time.Duration // 提前多久换出口
+	// URLTTL 是从提取 URL 的 minute 参数推出来的寿命，纯文本格式不返回过期时间时用它
+	URLTTL time.Duration
 }
 
 type ProxyProvider struct {
@@ -77,6 +79,9 @@ func NewProxyProvider(cfg ProxyProviderConfig) *ProxyProvider {
 	if cfg.ProxyScheme == "" {
 		cfg.ProxyScheme = "http-connect"
 	}
+	if cfg.URLTTL <= 0 {
+		cfg.URLTTL = minuteFromURL(cfg.ExtractURL)
+	}
 
 	transport := &http.Transport{
 		// 提取接口本身也常常只能从国内访问（品赞就是），统一走跳板
@@ -102,6 +107,19 @@ func NewProxyProvider(cfg ProxyProviderConfig) *ProxyProvider {
 		client: &http.Client{Timeout: cfg.Timeout, Transport: transport},
 		stopCh: make(chan struct{}),
 	}
+}
+
+// minuteFromURL 从提取接口的 minute 参数推寿命（纯文本格式不带 expired 字段）
+func minuteFromURL(raw string) time.Duration {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(u.Query().Get("minute")))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Minute
 }
 
 // firstHopOnly 取链里的第一跳（跳板本身）——提取接口只需要第一跳就能到。
@@ -209,8 +227,13 @@ func (p *ProxyProvider) Refresh(ctx context.Context) error {
 		if err == nil {
 			expireAt := time.Unix(entry.Expired/1000, 0)
 			if entry.Expired <= 0 || expireAt.Before(time.Now().Add(30*time.Second)) {
-				// 提取接口没给（或给了个已过期的）寿命：按 5 分钟保守估
-				expireAt = time.Now().Add(5 * time.Minute)
+				// 提取接口没给（或给了个已过期的）寿命：优先用 URL 里的 minute 参数，
+				// 再退到 5 分钟保守值
+				ttl := p.cfg.URLTTL
+				if ttl <= 0 {
+					ttl = 5 * time.Minute
+				}
+				expireAt = time.Now().Add(ttl)
 			}
 			prev := ""
 			if p.current != nil {
@@ -266,24 +289,68 @@ func (p *ProxyProvider) extract(ctx context.Context) (*extractEntry, error) {
 		return nil, fmt.Errorf("提取接口返回 HTTP %d: %s", resp.StatusCode, cropText(string(body), 120))
 	}
 
-	var parsed extractResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("提取结果不是合法 JSON: %s", cropText(string(body), 120))
+	return parseExtractBody(body)
+}
+
+// parseExtractBody 同时支持两种返回格式：
+//   - JSON（URL 带 format=json）：{"code":0,"data":{"list":[{"ip","port","expired",...}]}}
+//   - 纯文本（默认）：每行「ip:port [账号] [密码]」，取第一行
+func parseExtractBody(body []byte) (*extractEntry, error) {
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return nil, fmt.Errorf("提取接口返回空内容")
 	}
-	if parsed.Code != 0 {
-		return nil, fmt.Errorf("提取接口报错 code=%d: %s", parsed.Code, defaultStr(parsed.Message, "无 message"))
+
+	if strings.HasPrefix(text, "{") {
+		var parsed extractResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("提取结果不是合法 JSON: %s", cropText(text, 120))
+		}
+		if parsed.Code != 0 {
+			return nil, fmt.Errorf("提取接口报错 code=%d: %s", parsed.Code, defaultStr(parsed.Message, "无 message"))
+		}
+		if len(parsed.Data.List) == 0 {
+			return nil, fmt.Errorf("提取接口没给 IP: %s", cropText(text, 120))
+		}
+		entry := parsed.Data.List[0]
+		if err := validateEntry(&entry); err != nil {
+			return nil, err
+		}
+		return &entry, nil
 	}
-	if len(parsed.Data.List) == 0 {
-		return nil, fmt.Errorf("提取接口没给 IP: %s", cropText(string(body), 120))
+
+	// 纯文本：一行一个，取第一行（num>1 时会返回多行）
+	line := strings.TrimSpace(strings.Split(text, "\n")[0])
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("提取结果为空: %s", cropText(text, 120))
 	}
-	entry := parsed.Data.List[0]
-	if entry.IP == "" || entry.Port == "" {
-		return nil, fmt.Errorf("提取结果缺少 ip/port")
+	if !strings.Contains(fields[0], ":") {
+		// 很可能是一句错误提示（如「找不到价格表 请联系客服」）
+		return nil, fmt.Errorf("提取接口返回: %s", cropText(text, 120))
 	}
-	if _, err := strconv.Atoi(entry.Port); err != nil {
-		return nil, fmt.Errorf("提取结果端口非法: %q", entry.Port)
+	hostPort := strings.SplitN(fields[0], ":", 2)
+	entry := extractEntry{IP: strings.TrimSpace(hostPort[0]), Port: strings.TrimSpace(hostPort[1])}
+	if len(fields) >= 2 {
+		entry.Account = fields[1]
+	}
+	if len(fields) >= 3 {
+		entry.Password = fields[2]
+	}
+	if err := validateEntry(&entry); err != nil {
+		return nil, err
 	}
 	return &entry, nil
+}
+
+func validateEntry(entry *extractEntry) error {
+	if entry.IP == "" || entry.Port == "" {
+		return fmt.Errorf("提取结果缺少 ip/port")
+	}
+	if _, err := strconv.Atoi(entry.Port); err != nil {
+		return fmt.Errorf("提取结果端口非法: %q", entry.Port)
+	}
+	return nil
 }
 
 // Status 给运维/调试用的状态（不含凭据）
