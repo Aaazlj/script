@@ -283,4 +283,8 @@ module.exports = {
   importAccounts,
   setAccountOrder,
   setAccountScripts,
+  proxySummary,
+  updateProxySettings,
+  refreshProxy,
+  probeProxy,
 };
