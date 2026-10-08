@@ -26,9 +26,7 @@ const PANELS = [
   { id: 'overview', name: '概览', sub: '各通道状态一览', icon: ICONS.grid, save: false },
   { id: 'accounts', name: '应用宝账号', sub: '管理已扫码入库的微信账号', icon: ICONS.users, save: false },
   { id: 'qinglong', name: '青龙面板', sub: 'OpenAPI 凭据配置', icon: ICONS.plug, save: true },
-  { id: 'yyb', name: '应用宝网关', sub: 'yyb_go 地址与写入值', icon: ICONS.box, save: true },
   { id: 'proxy', name: '国内出口', sub: '品赞代理开关与状态', icon: ICONS.plug, save: false },
-  { id: 'sign', name: '美团签名服务', sub: '给脚本提供 mtgsig 签名', icon: ICONS.bag, save: false },
   { id: 'security', name: '账号安全', sub: '修改管理员密码', icon: ICONS.shield, save: false },
 ];
 
@@ -183,21 +181,23 @@ function renderShell() {
   document.body.classList.add('admin');
   app.innerHTML = '';
 
+  // 顶部导航：品牌 + 各功能标签（可横滑）+ 前台/后台切换
   const navItems = PANELS.map((p) => node('button', {
-    class: 'nav-item' + (p.id === current ? ' active' : ''),
+    class: 'topnav-tab' + (p.id === current ? ' active' : ''),
     'data-panel': p.id,
     html: '<span class="ico">' + p.icon + '</span><span>' + p.name + '</span>',
     onclick: () => activate(p.id),
   }));
 
-  const nav = node('aside', { class: 'admin-nav' }, [
-    node('div', { class: 'brand' }, [
-      node('span', { text: '扫码登录面板' }),
-      node('span', { text: '应用宝 · 美团 → 青龙' }),
+  const topnav = node('header', { class: 'topnav' }, [
+    node('div', { class: 'topnav-brand' }, [
+      node('span', { class: 'logo', html: ICONS.grid.replace('width="16" height="16"', 'width="18" height="18"') }),
+      node('span', { text: '扫码面板' }),
+      node('span', { class: 'sub', text: '管理后台' }),
     ]),
-    node('nav', { class: 'nav-list' }, navItems),
-    node('div', { class: 'nav-foot' }, [
-      node('a', { class: 'nav-item', href: '/', html: '<span class="ico">↗</span><span>打开扫码页</span>' }),
+    node('nav', { class: 'topnav-tabs' }, navItems),
+    node('div', { class: 'topnav-right' }, [
+      node('a', { class: 'topnav-link', href: '/', html: '<span aria-hidden="true">↗</span> 扫码前台' }),
     ]),
   ]);
 
@@ -211,15 +211,13 @@ function renderShell() {
   ]);
 
   const main = node('main', { class: 'admin-main' }, [head, node('div', { id: 'panels' })]);
-  app.appendChild(node('div', { class: 'admin-shell' }, [nav, main]));
+  app.appendChild(node('div', { class: 'admin-shell' }, [topnav, main]));
 
   const body = $('panels');
   body.appendChild(buildOverview());
   body.appendChild(buildAccounts());
   body.appendChild(buildQinglong());
-  body.appendChild(buildYyb());
   body.appendChild(buildProxy());
-  body.appendChild(buildSign());
   body.appendChild(buildSecurity());
 
   activateFromHash();
@@ -229,7 +227,7 @@ function activate(id, push) {
   const meta = PANELS.find((p) => p.id === id) || PANELS[0];
   id = meta.id;
   current = id;
-  for (const b of document.querySelectorAll('.nav-item[data-panel]')) {
+  for (const b of document.querySelectorAll('.topnav-tab[data-panel]')) {
     b.classList.toggle('active', b.dataset.panel === id);
   }
   for (const p of document.querySelectorAll('.panel')) {
@@ -650,6 +648,9 @@ function describeTags(value) {
   return '只跑：' + tags.map(scriptName).join('、');
 }
 
+let acctData = [];
+let acctStatsEl, acctFilterSel, keepAliveEl;
+
 function buildAccounts() {
   acctOut = node('div');
   acctListEl = node('div');
@@ -661,11 +662,25 @@ function buildAccounts() {
   });
   acctScriptsInput = input('acctScripts', { value: scriptsToText(scriptDefs()) });
 
+  acctStatsEl = node('div', { class: 'acct-stats' });
+  keepAliveEl = node('div');
+  acctFilterSel = node('select', {
+    class: 'input',
+    style: 'width:auto;min-width:110px',
+    onchange: () => renderAccounts(acctData),
+  }, [
+    node('option', { value: 'all', text: '全部状态' }),
+    node('option', { value: 'alive', text: '存活' }),
+    node('option', { value: 'expired', text: '已失效' }),
+    node('option', { value: 'unknown', text: '待定' }),
+  ]);
+
   const card = node('div', { class: 'card' }, [
-    node('h2', { text: '已入库的应用宝账号' }),
-    node('div', { class: 'hint', text: '这里显示扫码登录后存进 yyb_go 网关的微信账号。青龙脚本通过 yyb_server 调它取 code，删掉某个账号即可让脚本不再用它。拖动左侧手柄可以调整顺序（脚本按这个顺序依次执行）。' }),
-    node('div', { class: 'hint', text: '每个账号下面那排勾选框决定「这个账号跑哪些脚本」：勾掉谁，谁的脚本就跳过它；全部勾上（或从没设置过）= 所有脚本都跑。改完即时生效，不用重跑订阅。' }),
-    node('div', { class: 'row', style: 'margin-bottom:14px' }, [
+    node('h2', { text: '应用宝账号' }),
+    node('div', { class: 'hint', text: '扫码登录后存进 yyb_go 网关的微信账号；青龙脚本通过 yyb_server 调它取 code。拖动卡片左侧手柄可以调整顺序（脚本按这个顺序依次执行）。' }),
+    acctStatsEl,
+    keepAliveEl,
+    node('div', { class: 'acct-toolbar' }, [
       node('button', { class: 'btn small ghost', text: '刷新列表', onclick: (e) => loadAccounts(e.target) }),
       node('button', {
         class: 'btn small ghost', text: '刷新全部登录态',
@@ -677,6 +692,8 @@ function buildAccounts() {
       }),
       node('button', { class: 'btn small ghost', text: '导入账号', onclick: () => acctFileInput.click() }),
       node('button', { class: 'btn small ghost', text: '导出全部', onclick: (e) => exportAccounts('', e.target) }),
+      node('span', { class: 'grow' }),
+      acctFilterSel,
       acctFileInput,
     ]),
     field(
@@ -709,14 +726,18 @@ async function saveScriptColumns(btn) {
   if (btn) btn.disabled = false;
 }
 
-function statusBadge(status) {
+function statusPill(status) {
   const s = String(status || '').toLowerCase();
-  const kind = s === 'alive' ? 'ok' : (s === 'expired' ? 'err' : (s === 'unknown' ? 'warn' : 'warn'));
-  const text = s === 'alive' ? '正常' : (s === 'expired' ? '已失效' : (s === 'unknown' ? '未知' : (status || '未知')));
-  return node('span', { class: 'stat-label', style: 'gap:5px' }, [
-    node('span', { class: 'dot ' + kind }),
-    node('span', { text: text }),
-  ]);
+  const kind = s === 'alive' ? 'ok' : (s === 'expired' ? 'err' : 'warn');
+  const text = s === 'alive' ? '存活' : (s === 'expired' ? '已失效' : (s === 'unknown' ? '待定' : (status || '待定')));
+  return node('span', { class: 'pill ' + kind, text });
+}
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 /** 勾选状态 → 要写进网关的标记串；全部勾上 = 空串（= 不限制，所有脚本都跑） */
@@ -787,41 +808,36 @@ async function saveScriptToggles(a, box, defs, extras) {
 
 function accountRow(a) {
   const name = a.nickname || a.alias || a.openid || ('#' + a.ref);
+  const initial = (a.nickname || a.alias || a.openid || '#').slice(0, 1);
   const avatar = a.hasAvatar
-    ? node('img', { src: '/api/yyb/avatar?ref=' + encodeURIComponent(a.ref), alt: '', style: 'width:38px;height:38px;border-radius:50%;object-fit:cover;background:#f1efea;flex:0 0 38px' })
-    : node('div', { style: 'width:38px;height:38px;border-radius:50%;background:#eef0f4;flex:0 0 38px' });
-
-  const meta = node('div', { style: 'flex:1;min-width:0' }, [
-    node('div', { text: name, style: 'font-weight:500' }),
-    node('div', { text: 'openid ' + (a.openid || '-') + (a.uin ? ' · uin ' + a.uin : ''), style: 'font-size:12px;color:var(--muted);word-break:break-all' }),
-    scriptToggles(a),
-  ]);
+    ? node('div', { class: 'acct-avatar' }, [
+        node('img', { src: '/api/yyb/avatar?ref=' + encodeURIComponent(a.ref), alt: '' }),
+      ])
+    : node('div', { class: 'acct-avatar', text: initial.toUpperCase() });
 
   const btn = (text, fn, cls) => node('button', {
     class: 'btn small ' + (cls || 'ghost'), text,
     style: 'font-size:12px;padding:5px 10px', onclick: fn,
   });
 
-  const ops = node('div', { class: 'row', style: 'flex:0 0 auto;gap:6px' }, [
-    btn('刷新登录态', (e) => doAccountAction(e.target, '/api/yyb/accounts/refresh', a.ref)),
-    btn('同步资料', (e) => doAccountAction(e.target, '/api/yyb/accounts/resync', a.ref)),
-    btn('导出', (e) => exportAccounts(a.ref, e.target)),
-    btn('删除', (e) => removeAccount(e.target, a), ''),
-  ]);
-
+  // 筛选视图下禁止拖拽（否则只保存可见账号的顺序，会把被筛掉的号顶到最后）
+  const allView = !acctFilterSel || acctFilterSel.value === 'all';
   const handle = node('span', {
     text: '⠿',
-    title: '拖动调整顺序',
-    style: 'flex:0 0 auto;cursor:grab;color:var(--muted);font-size:16px;line-height:1;user-select:none;padding:0 2px',
+    title: allView ? '拖动调整顺序' : '切回「全部状态」后可拖动排序',
+    style: 'flex:0 0 auto;cursor:' + (allView ? 'grab' : 'not-allowed')
+      + ';color:var(--muted);font-size:16px;line-height:46px;user-select:none;padding:0 2px'
+      + (allView ? '' : ';opacity:.4'),
   });
 
-  const row = node('div', {
+  const card = node('div', {
+    class: 'acct-card' + (String(a.status) === 'expired' ? ' expired' : ''),
     'data-ref': a.ref,
-    draggable: 'true',
-    style: 'display:flex;gap:12px;align-items:center;padding:12px 0;border-top:1px solid var(--line)',
+    draggable: allView ? 'true' : 'false',
     ondragstart: (e) => {
+      if (!allView) return;
       dragRef = a.ref;
-      row.style.opacity = '0.4';
+      card.style.opacity = '0.4';
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = 'move';
         try { e.dataTransfer.setData('text/plain', a.ref); } catch (_) { /* IE */ }
@@ -829,36 +845,59 @@ function accountRow(a) {
     },
     ondragend: () => {
       dragRef = null;
-      row.style.opacity = '';
+      card.style.opacity = '';
       clearDropHint();
     },
     ondragover: (e) => {
-      if (!dragRef || dragRef === a.ref) return;
+      if (!allView || !dragRef || dragRef === a.ref) return;
       e.preventDefault();
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
       clearDropHint();
-      const rect = row.getBoundingClientRect();
+      const rect = card.getBoundingClientRect();
       const after = e.clientY > rect.top + rect.height / 2;
-      row.style.boxShadow = after ? 'inset 0 -2px 0 0 #2f6feb' : 'inset 0 2px 0 0 #2f6feb';
-      row.dataset.dropAfter = after ? '1' : '0';
+      card.style.boxShadow = after ? 'inset 0 -2px 0 0 #2f6feb' : 'inset 0 2px 0 0 #2f6feb';
+      card.dataset.dropAfter = after ? '1' : '0';
     },
     ondragleave: () => {
-      row.style.boxShadow = '';
-      delete row.dataset.dropAfter;
+      card.style.boxShadow = '';
+      delete card.dataset.dropAfter;
     },
     ondrop: async (e) => {
       e.preventDefault();
-      const after = row.dataset.dropAfter === '1';
-      row.style.boxShadow = '';
-      delete row.dataset.dropAfter;
-      if (!dragRef || dragRef === a.ref) return;
+      const after = card.dataset.dropAfter === '1';
+      card.style.boxShadow = '';
+      delete card.dataset.dropAfter;
+      if (!allView || !dragRef || dragRef === a.ref) return;
       reorderRow(dragRef, a.ref, after);
       dragRef = null;
       await saveAccountOrder();
     },
-  }, [handle, avatar, meta, statusBadge(a.status), ops]);
+  }, [
+    handle,
+    avatar,
+    node('div', { class: 'acct-body' }, [
+      node('div', { class: 'acct-head' }, [
+        node('span', { class: 'acct-name', text: name }),
+        statusPill(a.status),
+        a.uin ? node('span', { class: 'acct-meta', text: 'uin ' + a.uin }) : null,
+      ]),
+      node('div', { class: 'acct-meta', text: 'openid ' + (a.openid || '-') }),
+      node('div', { class: 'acct-times' }, [
+        node('span', { html: '最后探测 <b>' + fmtTime(a.last_checked_at) + '</b>' }),
+        node('span', { html: '入库 <b>' + fmtTime(a.created_at) + '</b>' }),
+        node('span', { html: '最近刷新 <b>' + fmtTime(a.updated_at) + '</b>' }),
+      ]),
+      scriptToggles(a),
+      node('div', { class: 'acct-actions' }, [
+        btn('刷新登录态', (e) => doAccountAction(e.target, '/api/yyb/accounts/refresh', a.ref)),
+        btn('同步资料', (e) => doAccountAction(e.target, '/api/yyb/accounts/resync', a.ref)),
+        btn('导出', (e) => exportAccounts(a.ref, e.target)),
+        btn('删除', (e) => removeAccount(e.target, a)),
+      ]),
+    ]),
+  ]);
 
-  return row;
+  return card;
 }
 
 /** 把拖动的行插到目标行的前面或后面 */
@@ -892,15 +931,86 @@ async function saveAccountOrder() {
 }
 
 function renderAccounts(accounts) {
+  acctData = accounts || [];
+
+  // 统计瓦片（参考 YYB-Go-Enhanced 的 account console）
+  if (acctStatsEl) {
+    const counts = { alive: 0, expired: 0, unknown: 0 };
+    for (const a of acctData) {
+      const s = String(a.status || '').toLowerCase();
+      if (s === 'alive') counts.alive++;
+      else if (s === 'expired') counts.expired++;
+      else counts.unknown++;
+    }
+    acctStatsEl.innerHTML = '';
+    const tiles = [
+      ['全部账号', acctData.length, ''],
+      ['存活', counts.alive, 'ok'],
+      ['已失效', counts.expired, 'err'],
+      ['待定', counts.unknown, 'warn'],
+    ];
+    for (const [label, n, dot] of tiles) {
+      acctStatsEl.appendChild(node('div', { class: 'acct-stat' }, [
+        node('strong', { text: String(n) }),
+        node('span', { html: (dot ? '<span class="dot ' + dot + '" style="display:inline-block;vertical-align:1px;margin-right:5px"></span>' : '') + label }),
+      ]));
+    }
+  }
+
   acctListEl.innerHTML = '';
-  if (!accounts || !accounts.length) {
+  if (!acctData.length) {
     acctListEl.appendChild(node('div', { class: 'note info', text: '还没有账号。去扫码页用「应用宝扫码」扫一次就会出现在这里。' }));
     return;
   }
-  acctListEl.appendChild(node('div', { class: 'stat-label', style: 'margin-bottom:4px' }, [
-    node('span', { text: '共 ' + accounts.length + ' 个账号（拖动 ⠿ 可调整顺序）' }),
-  ]));
-  for (const a of accounts) acctListEl.appendChild(accountRow(a));
+
+  const filter = acctFilterSel ? acctFilterSel.value : 'all';
+  const items = acctData.filter((a) => filter === 'all' || String(a.status || '').toLowerCase() === filter);
+  if (!items.length) {
+    acctListEl.appendChild(node('div', { class: 'note info', text: '当前筛选下没有账号。' }));
+    return;
+  }
+  for (const a of items) acctListEl.appendChild(accountRow(a));
+}
+
+async function loadKeepAlive() {
+  if (!keepAliveEl) return;
+  try {
+    const d = await api('GET', '/api/yyb/keepalive');
+    keepAliveEl.innerHTML = '';
+    if (!d.enabled) {
+      keepAliveEl.appendChild(node('div', { class: 'note warn', style: 'margin-bottom:14px', text: '保活未启用（YYB_KEEPALIVE_INTERVAL 未配置）。登录态只有 2 小时有效，建议开启：后台定时刷一轮存活账号，防闲置失效。' }));
+      return;
+    }
+    const c = d.counts || {};
+    const line = '每 ' + (d.interval || '—') + ' 刷一轮存活账号'
+      + (d.last_start_at ? ' · 上次 ' + fmtTime(d.last_start_at) : '')
+      + (d.counts ? ` · 本轮 存活 ${c.alive || 0} / 失效 ${c.expired || 0} / 跳过 ${c.skipped || 0}` : '')
+      + (d.next_run_at ? ' · 下轮 ' + fmtTime(d.next_run_at) : '');
+    keepAliveEl.appendChild(node('div', { class: 'stat', style: 'margin-bottom:14px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap' }, [
+      node('div', {}, [
+        node('div', { class: 'stat-label', text: '账号保活' + (d.running ? '（刷新中…）' : '') }),
+        node('div', { class: 'stat-value', text: line, style: 'font-size:13px;margin-top:4px;font-weight:400' }),
+      ]),
+      node('button', { class: 'btn small ghost', text: '立即保活一轮', onclick: (e) => runKeepAlive(e.target) }),
+    ]));
+  } catch (e) {
+    keepAliveEl.innerHTML = '';
+    keepAliveEl.appendChild(node('div', { class: 'note err', style: 'margin-bottom:14px', text: '读取保活状态失败：' + e.message }));
+  }
+}
+
+async function runKeepAlive(btn) {
+  btn.disabled = true;
+  show(acctOut, 'info', ['已触发一轮保活，正在后台刷新存活账号…']);
+  try {
+    await api('POST', '/api/yyb/keepalive');
+    await new Promise((r) => setTimeout(r, 2500));
+    await loadKeepAlive();
+    await loadAccounts();
+  } catch (e) {
+    show(acctOut, 'err', ['保活失败：' + e.message]);
+  }
+  btn.disabled = false;
 }
 
 async function loadAccounts(btn) {
@@ -909,6 +1019,7 @@ async function loadAccounts(btn) {
     const r = await api('GET', '/api/yyb/accounts');
     renderAccounts(r.accounts);
     acctOut.innerHTML = '';
+    loadKeepAlive();
   } catch (e) {
     acctListEl.innerHTML = '';
     show(acctOut, 'err', [e.message]);

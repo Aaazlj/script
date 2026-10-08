@@ -210,6 +210,22 @@ route('POST', '/api/yyb/proxy/probe', async (req, res, url) => {
   httpx.ok(res, out.data);
 }, { admin: true });
 
+/* 保活（管理后台） */
+
+route('GET', '/api/yyb/keepalive', async (req, res) => {
+  const cfg = config.load();
+  const out = await yyb.keepAliveStatus(cfg.yyb);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, out.data);
+}, { admin: true });
+
+route('POST', '/api/yyb/keepalive', async (req, res) => {
+  const cfg = config.load();
+  const out = await yyb.runKeepAlive(cfg.yyb);
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  httpx.ok(res, out.data);
+}, { admin: true });
+
 /* 账号导出 / 导入 / 排序（管理后台） */
 
 route('GET', '/api/yyb/accounts/export', async (req, res, url) => {

@@ -105,6 +105,10 @@ function normalizeAccount(a) {
     // 「这个账号跑哪些脚本」的标记，逗号分隔；空 = 不限制（所有脚本都跑它）
     scripts: (a && a.scripts) || '',
     hasAvatar: !!(a && a.avatar),
+    // 卡片上要展示的时间（秒）
+    last_checked_at: (a && a.last_checked_at) || 0,
+    created_at: (a && a.created_at) || 0,
+    updated_at: (a && a.updated_at) || 0,
   };
 }
 
@@ -258,6 +262,26 @@ async function refreshProxy(cfg) {
   return { ok: true, data: out.data };
 }
 
+/** 保活状态 */
+async function keepAliveStatus(cfg) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/keepalive`, { timeout: TIMEOUT });
+  const out = unwrap(res, '读取保活状态');
+  if (!out.ok) return out;
+  return { ok: true, data: out.data };
+}
+
+/** 立即跑一轮保活 */
+async function runKeepAlive(cfg) {
+  const b = base(cfg);
+  if (!b) return { ok: false, error: '未配置 yyb_go 网关地址' };
+  const res = await requestRaw(`${b}/keepalive`, { method: 'POST', timeout: 20000 });
+  const out = unwrap(res, '触发保活');
+  if (!out.ok) return out;
+  return { ok: true, data: out.data };
+}
+
 /** 用当前出口真连一次目标（默认微信 HTTPDNS IP） */
 async function probeProxy(cfg, host, port) {
   const b = base(cfg);
@@ -287,4 +311,6 @@ module.exports = {
   updateProxySettings,
   refreshProxy,
   probeProxy,
+  keepAliveStatus,
+  runKeepAlive,
 };
