@@ -44,6 +44,11 @@ type App struct {
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session
+
+	// 登录态刷新的串行化与冷却（见 refreshLiveness）
+	refreshMu     sync.Mutex
+	refreshLocks  map[int64]*sync.Mutex
+	refreshRecent map[int64]refreshMemo
 }
 
 var swaggerDocsHandler = httpSwagger.Handler(
@@ -858,7 +863,71 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 //
 // 旧实现是「只要 RefreshLoginBuffer 返回 error 就 expired」，一次网络抖动就能把
 // 好号打成失效（脚本随即跳过它），代价是必须人工重新扫码——这里修的就是这条。
+// refreshCooldown：同一账号在这么短的时间内只真刷一次。
+//
+// 微信侧的 refresh token 每次使用都会轮换，两次并发刷新必然有一条拿着已作废的
+// 旧 token 被拒（-109 RC_PARAMS_INVALID），账号就"莫名其妙"失效了。面板连点、
+// 多个青龙脚本同时跑、或脚本与面板同时刷新，都会踩到。这里做两件事：
+//  1. 同一账号的刷新串行执行；
+//  2. 冷却期内直接复用上一次结果（拿锁前后各查一次，避免惊群）。
+const refreshCooldown = 90 * time.Second
+
+type refreshMemo struct {
+	at     time.Time
+	status string
+}
+
 func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) string {
+	if status, ok := a.recentRefreshStatus(acc.ID); ok {
+		return status
+	}
+
+	lock := a.accountRefreshLock(acc.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// 等锁期间可能已经有别的请求刷完了
+	if status, ok := a.recentRefreshStatus(acc.ID); ok {
+		return status
+	}
+
+	status := a.doRefreshLiveness(ctx, acc)
+	a.rememberRefresh(acc.ID, status)
+	return status
+}
+
+func (a *App) recentRefreshStatus(id int64) (string, bool) {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	memo, ok := a.refreshRecent[id]
+	if !ok || time.Since(memo.at) >= refreshCooldown {
+		return "", false
+	}
+	return memo.status, true
+}
+
+func (a *App) rememberRefresh(id int64, status string) {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.refreshRecent == nil {
+		a.refreshRecent = map[int64]refreshMemo{}
+	}
+	a.refreshRecent[id] = refreshMemo{at: time.Now(), status: status}
+}
+
+func (a *App) accountRefreshLock(id int64) *sync.Mutex {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.refreshLocks == nil {
+		a.refreshLocks = map[int64]*sync.Mutex{}
+	}
+	if a.refreshLocks[id] == nil {
+		a.refreshLocks[id] = &sync.Mutex{}
+	}
+	return a.refreshLocks[id]
+}
+
+func (a *App) doRefreshLiveness(ctx context.Context, acc *store.WechatAccount) string {
 	if acc.Credentials == nil {
 		// 从没扫过码、或导入时没带凭据：没有任何可续期的材料。
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "unknown")
