@@ -229,7 +229,13 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.pruneQR()
-	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.RequestTimeout+35*time.Second)
+	// 预算是给代理链留余量的：走国内住宅出口时单步可能十几秒
+	// （面板侧的超时是 60 秒，这里别比它先放弃）
+	budget := a.cfg.RequestTimeout + 35*time.Second
+	if a.cfg.ProxyScan {
+		budget = a.cfg.RequestTimeout + 50*time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), budget)
 	defer cancel()
 	img, err := a.qr.GetQRCodeImage(ctx)
 	if err != nil {
