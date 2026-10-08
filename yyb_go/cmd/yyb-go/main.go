@@ -17,6 +17,15 @@ import (
 	"yyb_go/internal/protocol"
 )
 
+func envDurationOr(key string, fallback time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
+}
+
 func envBoolOr(key string, fallback bool) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	switch v {
@@ -50,6 +59,8 @@ func main() {
 		"品赞出口协议：http-connect（protocol=1）或 socks5（protocol=2）")
 	ipzanScan := flag.Bool("ipzan-scan", envBoolOr("YYB_IPZAN_SCAN", true),
 		"扫码流程（建会话/取二维码/轮询/换登录态）是否也走动态出口，默认是")
+	keepAlive := flag.Duration("keepalive-interval", envDurationOr("YYB_KEEPALIVE_INTERVAL", 6*time.Hour),
+		"后台保活间隔（<=0 关闭）：定时刷新所有存活账号的登录态")
 	flag.Parse()
 
 	var proxyProvider *protocol.ProxyProvider
@@ -64,16 +75,17 @@ func main() {
 	}
 
 	cfg := httpapi.Config{
-		ResourceRoot:   *resourceRoot,
-		DBFilename:     *dbFilename,
-		TCPProxy:       *tcpProxy,
-		Proxy:          proxyProvider,
-		ProxyScan:      *ipzanScan,
-		SessionTTL:     30 * time.Minute,
-		RequestTimeout: 8 * time.Second,
-		AvatarTimeout:  10 * time.Second,
-		ScanTimeout:    180 * time.Second,
-		QRSessionTTL:   5 * time.Minute,
+		ResourceRoot:      *resourceRoot,
+		DBFilename:        *dbFilename,
+		TCPProxy:          *tcpProxy,
+		Proxy:             proxyProvider,
+		ProxyScan:         *ipzanScan,
+		KeepAliveInterval: *keepAlive,
+		SessionTTL:        30 * time.Minute,
+		RequestTimeout:    8 * time.Second,
+		AvatarTimeout:     10 * time.Second,
+		ScanTimeout:       180 * time.Second,
+		QRSessionTTL:      5 * time.Minute,
 	}
 
 	app, err := httpapi.NewApp(cfg)

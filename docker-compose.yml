@@ -24,6 +24,8 @@ services:
       YYB_IPZAN_EXTRACT_URL: ${YYB_IPZAN_EXTRACT_URL:-}
       YYB_IPZAN_RELAY: ${YYB_IPZAN_RELAY:-}
       YYB_IPZAN_PROXY_SCHEME: ${YYB_IPZAN_PROXY_SCHEME:-http-connect}
+      # 后台保活间隔：定时刷新所有存活账号的登录态，防闲置失效（如 6h；<=0 关闭）
+      YYB_KEEPALIVE_INTERVAL: ${YYB_KEEPALIVE_INTERVAL:-6h}
     networks:
       - panel
       - qinglong
