@@ -61,15 +61,21 @@ func main() {
 		"扫码流程（建会话/取二维码/轮询/换登录态）是否也走动态出口，默认是")
 	keepAlive := flag.Duration("keepalive-interval", envDurationOr("YYB_KEEPALIVE_INTERVAL", 6*time.Hour),
 		"后台保活间隔（<=0 关闭）：定时刷新所有存活账号的登录态")
+	ipzanIdleStop := flag.Duration("ipzan-idle-stop", envDurationOr("YYB_IPZAN_IDLE_STOP", 10*time.Minute),
+		"按需提取：距最后一次用到出口超过这么久就停止后台提取（闲置不花钱）")
+	ipzanWaitExit := flag.Duration("ipzan-wait-exit", envDurationOr("YYB_IPZAN_WAIT_EXIT", 3*time.Second),
+		"手上没有可用出口时，首个请求最多等这么久让提取赶上（超时则本次直连）")
 	flag.Parse()
 
 	var proxyProvider *protocol.ProxyProvider
 	if strings.TrimSpace(*ipzanExtract) != "" {
 		proxyProvider = protocol.NewProxyProvider(protocol.ProxyProviderConfig{
-			ExtractURL:  strings.TrimSpace(*ipzanExtract),
-			Relay:       strings.TrimSpace(*ipzanRelay),
-			ProxyScheme: strings.TrimSpace(*ipzanScheme),
-			Timeout:     15 * time.Second,
+			ExtractURL:    strings.TrimSpace(*ipzanExtract),
+			Relay:         strings.TrimSpace(*ipzanRelay),
+			ProxyScheme:   strings.TrimSpace(*ipzanScheme),
+			Timeout:       15 * time.Second,
+			IdleStopAfter: *ipzanIdleStop,
+			WaitForExit:   *ipzanWaitExit,
 		})
 		log.Printf("已启用动态出口（品赞链路）: 跳板=%v", *ipzanRelay != "")
 	}
