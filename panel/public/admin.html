@@ -659,12 +659,9 @@ function scriptName(key) {
   return (hit && hit.name) || key;
 }
 
-/** 数组 → 输入框文本：mt=美团, sfsy=顺丰, pc=爷爷不泡茶!off（!off = 默认不勾选） */
+/** 数组 → 输入框文本：mt=美团, sfsy=顺丰 */
 function scriptsToText(list) {
-  return (list || []).map((s) => {
-    const label = (s.name && s.name !== s.key ? s.key + '=' + s.name : s.key) + (s.defaultOff ? '!off' : '');
-    return label;
-  }).join(', ');
+  return (list || []).map((s) => (s.name && s.name !== s.key ? s.key + '=' + s.name : s.key)).join(', ');
 }
 
 /** 输入框文本 → 数组：mt=美团, sfsy=顺丰（也接受只写 key） */
@@ -674,11 +671,8 @@ function textToScripts(text) {
     .map((part) => {
       const i = part.indexOf('=');
       const key = (i === -1 ? part : part.slice(0, i)).trim().toLowerCase();
-      let name = (i === -1 ? '' : part.slice(i + 1)).trim();
-      // !off = 这个脚本默认不勾选（新账号不会自动跑它，需要手工勾）
-      const defaultOff = /!off\s*$/i.test(name);
-      name = name.replace(/!off\s*$/i, '').trim();
-      return { key, name: name || key, defaultOff };
+      const name = (i === -1 ? '' : part.slice(i + 1)).trim();
+      return { key, name: name || key };
     })
     .filter((s) => s.key);
 }
@@ -694,10 +688,7 @@ function parseTags(value) {
 /** 标记串 → 给人看的说明 */
 function describeTags(value) {
   const tags = parseTags(value);
-  if (!tags.length) {
-    const offNames = scriptDefs().filter((d) => d.defaultOff).map((d) => d.name);
-    return offNames.length ? '默认脚本（不含 ' + offNames.join('、') + '）' : '全部脚本';
-  }
+  if (!tags.length) return '全部脚本';
   return '只跑：' + tags.map(scriptName).join('、');
 }
 
@@ -752,9 +743,8 @@ function buildAccounts() {
     field(
       '脚本列',
       acctScriptsInput,
-      '决定每个账号后面显示哪几个脚本的勾选框，格式 key=显示名，逗号分隔（如 mt=美团, sfsy=顺丰, ppcs=朴朴, pc=爷爷不泡茶!off）。'
-      + ' key 必须和脚本里自报的一致：脚本读环境变量 yyb_script_key（sfsy_code.js→sfsy、ppcs_code.js→ppcs、meituan_code.js→mt、yybpc_code.py→pc）。'
-      + ' 名字后面加 !off 表示「默认不勾选」：新账号不会自动跑它，需要你手工勾上才跑。改完点右上角「保存配置」。',
+      '决定每个账号后面显示哪几个脚本的勾选框，格式 key=显示名，逗号分隔（如 mt=美团, sfsy=顺丰, ppcs=朴朴）。'
+      + ' key 必须和脚本里自报的一致：脚本读环境变量 yyb_script_key，默认 sfsy_code.js 是 sfsy、ppcs_code.js 是 ppcs、meituan_code.js 是 mt。改完点右上角「保存配置」。',
     ),
     node('div', { class: 'row', style: 'margin-bottom:6px' }, [
       node('button', { class: 'btn small ghost', text: '保存脚本列', onclick: (e) => saveScriptColumns(e.target) }),
@@ -796,11 +786,8 @@ function fmtTime(ts) {
 
 /** 勾选状态 → 要写进网关的标记串；全部勾上 = 空串（= 不限制，所有脚本都跑） */
 function tagValue(checkedKeys, defs, extras) {
-  // 空标记的含义 = 「默认开的脚本全跑、默认关的不跑」。所以只有当
-  // ① 默认开的都勾上 ② 默认关的一个都没勾 ③ 没有未知 key 时才用空串。
-  const defaultOnAllChecked = defs.filter((d) => !d.defaultOff).every((d) => checkedKeys.includes(d.key));
-  const anyDefaultOffChecked = defs.some((d) => d.defaultOff && checkedKeys.includes(d.key));
-  if (defaultOnAllChecked && !anyDefaultOffChecked && !extras.length) return '';
+  const allOn = defs.every((d) => checkedKeys.includes(d.key));
+  if (allOn && !extras.length) return '';
   const ordered = defs.filter((d) => checkedKeys.includes(d.key)).map((d) => d.key);
   return ordered.concat(extras).join(',');
 }
@@ -835,7 +822,7 @@ function scriptToggles(a) {
       style: 'margin:0 5px 0 0;vertical-align:middle;cursor:pointer',
       onchange: () => saveScriptToggles(a, box, defs, extras),
     });
-    cb.checked = unrestricted ? !def.defaultOff : tags.includes(def.key);
+    cb.checked = unrestricted || tags.includes(def.key);
     box.appendChild(node('label', {
       style: 'display:inline-flex;align-items:center;font-size:13px;cursor:pointer;color:var(--muted)',
       title: '脚本标记：' + def.key,
