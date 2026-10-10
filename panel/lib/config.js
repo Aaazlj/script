@@ -76,10 +76,7 @@ function normalizeScripts(raw) {
     const key = String(src.key || '').trim().toLowerCase();
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    const entry = { key, name: String(src.name || '').trim() || key };
-    // defaultOff：这个脚本默认不勾选（面板里写 key=名称!off），别在保存时丢掉
-    if (src.defaultOff === true) entry.defaultOff = true;
-    out.push(entry);
+    out.push({ key, name: String(src.name || '').trim() || key });
   }
   return out;
 }
