@@ -133,6 +133,8 @@ func NewApp(cfg Config) (*App, error) {
 		if scanTimeout := 35 * time.Second; app.qr.Timeout() < scanTimeout {
 			app.qr.SetTimeout(scanTimeout)
 		}
+		// 让 HTTPDNS 探测也走国内出口（否则海外只能靠系统 DNS 撞运气）
+		protocol.SetDNSProxy(app.tcpProxyValue)
 		cfg.Proxy.Start()
 		settings := app.getProxySettings()
 		log.Printf("[proxy] 动态出口已启用：跳板=%v 扫码走代理=%v 取code走代理=%v",
