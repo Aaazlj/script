@@ -34,6 +34,15 @@ type ProxyProviderConfig struct {
 	URLTTL time.Duration
 	// RetryBackoff 提取失败后的退避时间（默认 60 秒），避免把提取接口打爆
 	RetryBackoff time.Duration
+	// IdleStopAfter：距最后一次「真的用到出口」超过这么久，就完全停止提取。
+	//
+	// 提取接口是按次计费的（品赞 10 分钟档 0.02/次），24 小时无条件预热
+	// 一天要烧 144 次 ≈ 2.88 元，而脚本一天只用几个时间点 —— 空转的九成以上
+	// 都是白花的钱。改成只在活跃期（有请求真的用过出口）才预热。
+	IdleStopAfter time.Duration
+	// WaitForExit：请求来了但手上没有可用出口时，最多等这么久让后台提取赶上。
+	// 首个请求值得等这一下，否则这一次会退回直连（海外 IP），失去走国内出口的意义。
+	WaitForExit time.Duration
 }
 
 type ProxyProvider struct {
@@ -43,6 +52,7 @@ type ProxyProvider struct {
 	mu            sync.Mutex
 	refreshing    bool
 	lastAttemptAt time.Time
+	lastDemandAt  time.Time // 最后一次「有请求真的需要出口」，用于判断活跃期
 	current       *tcpProxy
 	expireAt      time.Time
 	lastErr       string
@@ -88,6 +98,12 @@ func NewProxyProvider(cfg ProxyProviderConfig) *ProxyProvider {
 	}
 	if cfg.RetryBackoff <= 0 {
 		cfg.RetryBackoff = 60 * time.Second
+	}
+	if cfg.IdleStopAfter <= 0 {
+		cfg.IdleStopAfter = 10 * time.Minute
+	}
+	if cfg.WaitForExit <= 0 {
+		cfg.WaitForExit = 3 * time.Second
 	}
 
 	transport := &http.Transport{
@@ -142,9 +158,6 @@ func (p *ProxyProvider) Start() {
 	if p == nil || strings.TrimSpace(p.cfg.ExtractURL) == "" {
 		return
 	}
-	// 启动就先预热一个出口，别让首批请求落到直连
-	p.refreshAsync("启动预热")
-
 	go func() {
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
@@ -153,8 +166,10 @@ func (p *ProxyProvider) Start() {
 			case <-p.stopCh:
 				return
 			case <-ticker.C:
-				if p.needRefresh() {
-					p.refreshAsync("定时预热")
+				// 只在活跃期预热：闲置时段一次都不提取（按次计费，空转就是烧钱）。
+				// 第一笔请求由 Current() 自己按需触发，不必启动就提。
+				if p.inActiveWindow() && p.needRefresh() {
+					p.refreshAsync("活跃期预热")
 				}
 			}
 		}
@@ -185,30 +200,74 @@ func (p *ProxyProvider) needRefreshLocked() bool {
 	return time.Now().Add(p.cfg.RotateAhead).After(p.expireAt)
 }
 
-// Current 返回当前可用的代理链（跳板>>出口）；没有可用出口时返回空串，
-// 调用方会按 fallbackDirect 直连——不会因为品赞抖动把功能整体弄挂。
+// Current 返回当前可用的代理链（跳板>>出口）；拿不到就返回空串，调用方会退回直连。
 //
-// 关键：绝不阻塞请求路径。需要换出口时只在后台换（single-flight），
-// 手上还有可用出口就继续用它；哪怕没有，也是立刻返回空串走直连。
-// 早期版本在这里同步等提取，一旦提取慢/失败就把 HTTP 请求的整体超时耗光，
-// 表现成「明明是直连却超时」。
+// 按需提取（省钱的关键）：只有真的有人要过代理时才会去提取接口。手上还有有效出口
+// 就直接复用；没有就触发一次后台提取，并最多等 WaitForExit 让这一次请求也用上
+// 国内出口（否则首个请求会退回直连）。闲置时段（IdleStopAfter 内没有任何需求）
+// 后台一次都不提取 —— 提取接口按次计费，空转全是白花的钱。
 func (p *ProxyProvider) Current() string {
 	if !p.enabled() {
 		return ""
 	}
+	p.noteDemand()
 
+	if chain := p.readyChain(); chain != "" {
+		// 手上有出口：如果快过期了，顺手让后台去换一个新的（不阻塞这次请求）
+		if p.needRefresh() {
+			p.refreshAsync("请求触发的换出口")
+		}
+		return chain
+	}
+
+	// 手上没有可用出口：按需提取，并等一小会儿
+	p.refreshAsync("按需提取")
+	return p.waitForExit()
+}
+
+// noteDemand 记下「此刻有请求需要出口」，用于判断是否还在活跃期
+func (p *ProxyProvider) noteDemand() {
 	p.mu.Lock()
-	needRefresh := p.needRefreshLocked()
-	chain := ""
-	if p.current != nil {
-		chain = p.chainLocked()
-	}
+	p.lastDemandAt = time.Now()
 	p.mu.Unlock()
+}
 
-	if needRefresh {
-		p.refreshAsync("请求触发的换出口")
+// readyChain 返回仍然有效的出口链；不触发任何提取
+func (p *ProxyProvider) readyChain() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.current == nil || !time.Now().Before(p.expireAt) {
+		return ""
 	}
-	return chain
+	return p.chainLocked()
+}
+
+// waitForExit 最多等 budget 这么久，看后台提取能不能赶上（避免这次请求退回直连）
+func (p *ProxyProvider) waitForExit() string {
+	budget := p.cfg.WaitForExit
+	if budget <= 0 {
+		return ""
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		time.Sleep(80 * time.Millisecond)
+		if chain := p.readyChain(); chain != "" {
+			return chain
+		}
+		if !time.Now().Before(deadline) {
+			return ""
+		}
+	}
+}
+
+// inActiveWindow 判断当前是否处于活跃期（最近真的用过出口）
+func (p *ProxyProvider) inActiveWindow() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lastDemandAt.IsZero() {
+		return false
+	}
+	return time.Since(p.lastDemandAt) < p.cfg.IdleStopAfter
 }
 
 // refreshAsync 后台换出口，同一时刻只有一个在跑（single-flight），
@@ -419,6 +478,14 @@ func (p *ProxyProvider) Status() map[string]any {
 	if !p.lastAt.IsZero() {
 		out["last_extract_at"] = p.lastAt.Format(time.RFC3339)
 	}
+	// 按需模式：让面板能看出「现在是活跃期还是已休眠（闲置不提取）」。
+	// 注意这里已经持有 p.mu，不能调 inActiveWindow()（它也会加锁，会自死锁）。
+	out["on_demand"] = true
+	out["active"] = !p.lastDemandAt.IsZero() && time.Since(p.lastDemandAt) < p.cfg.IdleStopAfter
+	if !p.lastDemandAt.IsZero() {
+		out["last_demand_at"] = p.lastDemandAt.Unix()
+	}
+	out["idle_stop_after"] = p.cfg.IdleStopAfter.String()
 	return out
 }
 

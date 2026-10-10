@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>管理后台 · 扫码登录面板</title>
-<link rel="stylesheet" href="/style.css?v=20261008-3">
+<link rel="stylesheet" href="/style.css?v=20261010-1">
 </head>
 <body>
 <div id="app"></div>
@@ -509,6 +509,13 @@ async function loadProxy(btn) {
         line('剩余有效', d.expires_in_seconds > 0 ? Math.round(d.expires_in_seconds) + ' 秒' : '已过期');
       }
       if (d.last_extract_at) line('上次提取', String(d.last_extract_at).replace('T', ' ').slice(0, 19));
+      // 按需提取：闲置时段完全不提取（提取接口按次计费，空转就是白烧钱）
+      if (d.on_demand) {
+        line('提取模式', '按需提取 · ' + (d.active ? '当前活跃（有请求在走代理）' : '当前休眠（闲置不提取）'));
+      }
+      if (typeof d.extracts === 'number') {
+        line('累计提取', d.extracts + ' 次（本次运行）');
+      }
       if (d.last_err) line('上次错误', String(d.last_err), 'err');
       proxyScanCb.disabled = false;
       proxyCodeCb.disabled = false;
