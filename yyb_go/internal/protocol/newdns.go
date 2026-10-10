@@ -15,6 +15,26 @@ import (
 	"time"
 )
 
+// dnsProxyFunc 由上层注入：返回当前代理链。
+//
+// 微信 HTTPDNS 入口（aedns.weixin.qq.com）只在大陆可达，海外直连必失败，
+// 失败后回退系统 DNS 会解析到香港/新加坡节点（43.129.x / 101.32.x），
+// mmtls 长连接握手直接失败（ManualAuthResponse missing session block）——
+// 表现就是「整个取 code 全挂」。既然已经有国内出口，DNS 探测也必须走它。
+var dnsProxyFunc func() string
+
+// SetDNSProxy 注入代理取值函数（nil = 直连）
+func SetDNSProxy(fn func() string) {
+	dnsProxyFunc = fn
+}
+
+func currentDNSProxy() string {
+	if dnsProxyFunc == nil {
+		return ""
+	}
+	return dnsProxyFunc()
+}
+
 const (
 	newdnsHost      = "aedns.weixin.qq.com"
 	newdnsBackupIP  = "180.153.202.85"
@@ -87,7 +107,8 @@ func requestNewDNS(ctx context.Context, connectTo string, timeout time.Duration)
 	if host == "" {
 		host = newdnsHost
 	}
-	conn, err := dialDirect(ctx, host, 80, timeout)
+	// fallbackDirect=true：没配代理时仍然直连（和以前行为一致）
+	conn, err := dialTCP(ctx, host, 80, timeout, currentDNSProxy(), true)
 	if err != nil {
 		return 0, nil, "", err
 	}
