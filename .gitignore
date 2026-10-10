@@ -21,3 +21,6 @@ meituan-expert/
 
 # ai产物
 .workbuddy/
+
+# 品赞签到的旧版本（已被 ipzan_code.py 取代，仅本地留存，别入库）
+ipzan.py
