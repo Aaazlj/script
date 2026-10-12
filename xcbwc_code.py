@@ -304,8 +304,10 @@ def xc_headers(servername: str, methodname: str, teemo="0", vayne="0", sivir="",
 
 def anonymous_query(lat, lng, city_code, offset=0, number=20, device_key=None):
     """匿名查附近店铺活动（不需要登录态，只要坐标）"""
+    # 注意：extra 是第 6 个位置参数，这里必须用关键字传，别把 dict 塞到 vayne 位上
     headers = xc_headers("SilkwormRec", "RecService.GetStorePromotionList", "0",
-                         {"x-Vayne": "0", "x-City": str(city_code)}, device_key=device_key)
+                         vayne="0", extra={"x-Vayne": "0", "x-City": str(city_code)},
+                         device_key=device_key)
     payload = {"latitude": lat, "longitude": lng, "promotion_sort": 1, "store_type": 0,
                "offset": offset, "number": number, "silk_id": 0, "promotion_filter": 0,
                "promotion_category": 0, "city_code": int(city_code), "store_category": 0,
@@ -731,19 +733,38 @@ def get_code_via_gateway(ref: str) -> Optional[str]:
 
 
 def app_login(wx_code: str, device_key=None) -> Tuple[Optional[str], Optional[str]]:
-    """code → user_id + access_token"""
-    headers = xc_headers("WechatOpenapi", "WechatOpenapiService.AppLogin", "0",
-                         extra={"appid": "16"}, device_key=device_key)
+    """
+    code → user_id + access_token。
+
+    方法名以反编译的小程序为准：api/core 里 server="mp" 映射到 WechatOpenapi +
+    前缀 WechatOpenapiService.，登录方法叫 **MiniLogin**（不是 AppLogin——
+    那个是别的端在用的，小蚕这边会直接 403/WAF 拦）。
+    """
+    headers = xc_headers("WechatOpenapi", "WechatOpenapiService.MiniLogin", "0",
+                         extra={"appid": "20", "appidNum": "20"}, device_key=device_key)
+    headers["X-App-Sr"] = "20"
+    headers["X-Session-Id"] = ""
+    last = ""
     for _ in range(3):
         try:
-            js = req("POST", RPC_URL, headers=headers,
-                     json={"code": wx_code, "app_id": 16}).json()
+            r = req("POST", RPC_URL, headers=headers, json={"code": wx_code, "app_id": 20})
+            js = r.json()
             if js.get("status", {}).get("code") == 0:
-                ui = js["user_info"]
-                return str(ui["user_id"]), str(ui["token"]["access_token"])
-        except Exception:
-            pass
-        time.sleep(0.6)
+                ui = js.get("user_info") or {}
+                token = ui.get("token") or {}
+                access = token.get("access_token") or ui.get("access_token") or js.get("access_token")
+                user_id = ui.get("user_id") or js.get("user_id")
+                if user_id and access:
+                    return str(user_id), str(access)
+                # 结构变了也别静默失败：把字段名打出来
+                last = f"响应里没有 user_id/access_token，字段={list(ui.keys())} 顶层={list(js.keys())}"
+                print(f"⚠️ [登录] {last}")
+                return None, None
+            last = str(js.get("status", {}).get("msg") or js)[:200]
+        except Exception as exc:
+            last = parse_error(exc)
+        time.sleep(0.8)
+    print(f"❌ [登录] MiniLogin 失败: {last}")
     return None, None
 
 
