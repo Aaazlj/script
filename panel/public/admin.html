@@ -844,7 +844,8 @@ function scriptToggles(a) {
   box.appendChild(node('span', {
     class: 'tag' + (unrestricted ? '' : ' primary'),
     title: '当前生效范围',
-    text: unrestricted ? '全部脚本' : describeTags(tags.join(',')),
+    // 空标记不再是简单的「全部脚本」——有 defaultOff 脚本时要说清「不含谁」
+    text: unrestricted ? describeTags('') : describeTags(tags.join(',')),
   }));
   return box;
 }
