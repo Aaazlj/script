@@ -66,9 +66,10 @@ var dnsCache = struct {
 	entries map[string]dnsCacheEntry
 }{entries: map[string]dnsCacheEntry{}}
 
-// HTTPDNS 最近一次失败时间：失败后短时间内不再重试，
-// 直接走系统 DNS 兜底。否则每次请求都要白等两次探测（约 12s）。
-const dnsFailureTTL = 5 * time.Minute
+// HTTPDNS 最近一次失败时间：失败后短时间内不再重试，直接走系统 DNS 兜底，
+// 否则每次请求都要白等一次探测。原值 5 分钟太狠——一次抖动就把后面 5 分钟内
+// 所有取 code 都按「港/新节点」解析、必然握手失败；改成 90 秒，抖完很快恢复。
+const dnsFailureTTL = 90 * time.Second
 
 var dnsFailure = struct {
 	sync.Mutex
@@ -265,6 +266,11 @@ func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([
 	// 后面的 dial 会拿着已过期的 ctx 秒失败（表现为 dial tcp ...: i/o timeout）。
 	const dnsProbeTimeout = 6 * time.Second
 	probeTimeout := dnsProbeTimeout
+	// 走代理链时（树脂 >> 国内出口，双跳）一次探测要 3s 起步，
+	// 6 秒预算经常不够 —— 一超时就退回系统 DNS，等于白配代理。
+	if currentDNSProxy() != "" {
+		probeTimeout = 15 * time.Second
+	}
 	if timeout > 0 && timeout < probeTimeout {
 		probeTimeout = timeout
 	}
