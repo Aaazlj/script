@@ -196,7 +196,14 @@ func (a *App) Handler() http.Handler {
 		writeError(c.Writer, http.StatusNotFound, "not found")
 	})
 
-	return router
+	// CONNECT 走隧道（gin 路由匹配不到 CONNECT，必须在路由前分流）
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			a.handleConnect(w, r)
+			return
+		}
+		router.ServeHTTP(w, r)
+	})
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
