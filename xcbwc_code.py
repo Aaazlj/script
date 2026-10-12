@@ -24,8 +24,10 @@
   xc_default_on     默认 0 = **所有账号默认不跑**，必须在面板「应用宝账号」里勾选才跑；
                     设 1 则等同于其它脚本（标记为空就跑）
   xc_cookie         手工登录态（可选）：一行一个 vayne#teemo#sivir
-  xc_proxy          业务代理：小蚕接口海外直连不通，必须走国内出口；
-                    未配置时自动回退 ppcs_proxy / sf_proxy
+  xc_proxy          业务代理：小蚕接口海外直连不通、且它的 WAF 会拦普通数据中心 IP，
+                    实测**必须用「网关隧道」**：xc_proxy=http://yyb-go:8000
+                    （网关内部走「树脂 >> 品赞住宅出口」双跳，还能自动轮换出口）
+                    未配置时回退 ppcs_proxy / sf_proxy（那条路会被小蚕 WAF 403 拦掉）
   xc_concurrency    并发数，默认 3
   xc_city/xc_lat/xc_lng   抢单定位；不填用账号记录过的位置，再退到深圳
   xc_monitor_stores 监控店铺，如 mt:123456,elm:234567（平台 mt/elm/jd）
