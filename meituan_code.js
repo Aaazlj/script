@@ -1082,43 +1082,69 @@ async function grabCoupon(ctx, p) {
   };
 }
 
-/** 场次开始时间：各家字段名不统一，做多路兜底，取不到返回 0 */
-function sessionStartMs(s) {
-  for (const v of [s.startTime, s.beginTime, s.sessionStartTime, s.startTimestamp, s.beginTimestamp]) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 1e12) return n;
-    if (Number.isFinite(n) && n > 1e9) return n * 1000;
-  }
-  const t = s.startTimeStr || s.beginTimeStr || s.startTimeText || s.sessionTime || s.time;
-  const m = typeof t === 'string' ? t.match(/(\d{1,2}):(\d{2})/) : null;
+/** 时间字段 → 毫秒时间戳：支持 毫秒/秒 数字，以及 "10:00:00" 这种当天时刻 */
+function toMs(v) {
+  if (v == null || v === '') return 0;
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 1e12) return n;            // 毫秒
+  if (Number.isFinite(n) && n > 1e9) return n * 1000;      // 秒
+  const m = typeof v === 'string' ? v.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/) : null;
   if (m) {
     const d = new Date();
-    d.setHours(Number(m[1]), Number(m[2]), 0, 0);
+    d.setHours(Number(m[1]), Number(m[2]), Number(m[3] || 0), 0);
     return d.getTime();
   }
   return 0;
 }
 
-const sessionStatus = (s) => Number(s.status != null ? s.status : s.sessionStatus);
+/*
+ * 实测返回样例（2026-10-14 抓包）：
+ *   activityList[].sessionList[]  : { sessionCode, startTime:"10:00:00", endTime:"10:59:59" }
+ *   activityList[].currentSession : { sessionCode, startTimestamp:1791946800000,
+ *                                     endTimestamp, grabToken, rightList:[{rightCode,status}] }
+ * 注意两点：① 场次上没有 status 字段，只能按时间推；
+ *          ② grabToken 挂在【场次】上，不是每张券上，同一场次的券共用一个 token。
+ */
+const sessionStartMs = (s) => toMs(s.startTimestamp) || toMs(s.startTime)
+  || toMs(s.beginTimestamp) || toMs(s.beginTime) || toMs(s.sessionStartTime);
+const sessionEndMs = (s) => toMs(s.endTimestamp) || toMs(s.endTime)
+  || toMs(s.finishTimestamp) || toMs(s.sessionOverTime);
 
-/** 把 info 响应摊平成 [{activityId, sessionCode, status, startMs, rights}] */
-function flattenSessions(activityList) {
+/** 场次状态：0 进行中 / 1 未开始 / 2 已结束（接口不给 status 时按时间推） */
+function sessionStatus(s, nowMs) {
+  const raw = s.status != null ? s.status : s.sessionStatus;
+  if (raw != null && Number.isFinite(Number(raw))) return Number(raw);
+  const now = nowMs || Date.now();
+  const st = sessionStartMs(s);
+  const et = sessionEndMs(s);
+  if (!st && !et) return 2;      // 时间都没有 → 当已结束，别去抢
+  if (st && now < st) return 1;
+  if (et && now > et) return 2;
+  return 0;
+}
+
+/** 把 info 响应摊平成 [{activityId, sessionCode, status, startMs, endMs, grabToken, rights}] */
+function flattenSessions(activityList, nowMs) {
   const out = [];
   for (const act of activityList) {
     if (!act) continue;
-    const cur = act.currentSession || null;
-    const rows = [];
-    if (cur && cur.sessionCode != null) rows.push(cur);
+    const byCode = new Map();
     for (const s of (Array.isArray(act.sessionList) ? act.sessionList : [])) {
-      if (cur && s.sessionCode === cur.sessionCode) continue;
-      rows.push(s);
+      if (s && s.sessionCode != null) byCode.set(s.sessionCode, Object.assign({}, s));
     }
-    for (const s of rows) {
+    // currentSession 才有 rightList/grabToken，但没有 startTime 字符串 —— 合并补齐
+    const cur = act.currentSession;
+    if (cur && cur.sessionCode != null) {
+      byCode.set(cur.sessionCode, Object.assign({}, byCode.get(cur.sessionCode) || {}, cur));
+    }
+    for (const s of byCode.values()) {
       out.push({
         activityId: act.activityId,
         sessionCode: s.sessionCode,
-        status: sessionStatus(s),
+        status: sessionStatus(s, nowMs),
         startMs: sessionStartMs(s),
+        endMs: sessionEndMs(s),
+        grabToken: s.grabToken || '',
         rights: Array.isArray(s.rightList) ? s.rightList : [],
       });
     }
@@ -1135,10 +1161,10 @@ function pickGrabSession(sessions) {
   return upcoming[0] || null;
 }
 
-/** 券能不能抢：status=2(AVAILABLE) 且拿到了 grabToken */
+/** 券能不能抢：有 rightCode 且状态为「可领」(2=AVAILABLE；字段缺失时放行，让服务端裁决) */
 function grabbable(rights) {
-  return (rights || []).filter((r) => r && r.grabToken
-    && (r.status == null || Number(r.status) === 2 || Number(r.status) === 0));
+  return (rights || []).filter((r) => r && r.rightCode
+    && (r.status == null || Number(r.status) === 2));
 }
 
 const fmtClock = (ms) => new Date(ms).toTimeString().slice(0, 8);
@@ -1157,9 +1183,7 @@ async function runGrabChain(ctx) {
     $.log(`  ✖ ${first.error}`);
     return { sections: [`[C] 整点抢券：✖ ${first.error}`], step: first.error, coupons: 0, authFail };
   }
-  if (DEBUG) $.log(`  [debug] C/info 原始响应: ${jsonPreview(first.raw, 1500)}`);
-
-  const sessions = flattenSessions(first.activityList);
+  const sessions = flattenSessions(first.activityList, first.currentTime || Date.now());
   if (!sessions.length) {
     $.log('  ℹ️ 当前没有整点抢券场次（接口里 activityList 为空）');
     return { sections: ['[C] 整点抢券：ℹ️ 无场次'], step: '无场次', coupons: 0, authFail };
@@ -1195,8 +1219,7 @@ async function runGrabChain(ctx) {
       $.log(`  ✖ 开场后拉取失败：${fresh.error}`);
       return { sections: [`[C] 整点抢券：✖ ${fresh.error}`], step: fresh.error, coupons: 0, authFail };
     }
-    if (DEBUG) $.log(`  [debug] C/info(开场后) 原始响应: ${jsonPreview(fresh.raw, 1500)}`);
-    const refreshed = flattenSessions(fresh.activityList)
+    const refreshed = flattenSessions(fresh.activityList, fresh.currentTime || Date.now())
       .find((s) => s.sessionCode === target.sessionCode && s.activityId === target.activityId);
     if (refreshed) target = refreshed;
   }
@@ -1207,6 +1230,13 @@ async function runGrabChain(ctx) {
     $.log(`  ℹ️ ${tip}`);
     return { sections: [`[C] 整点抢券：ℹ️ ${tip}`], step: '无可抢券', coupons: 0, authFail };
   }
+  // grabToken 是【场次级】的（不是每张券一个），而且开场后才下发
+  const grabToken = target.grabToken || '';
+  if (!grabToken) {
+    const tip = `场次 ${target.sessionCode} 未下发 grabToken（通常开场后才有），本次跳过`;
+    $.log(`  ℹ️ ${tip}`);
+    return { sections: [`[C] 整点抢券：ℹ️ ${tip}`], step: '无grabToken', coupons: 0, authFail };
+  }
 
   $.log(`  🎯 目标场次 ${target.sessionCode}，可抢券 ${rights.length} 张，开始抢`);
   let got = 0;
@@ -1216,7 +1246,7 @@ async function runGrabChain(ctx) {
     const r = await grabCoupon(ctx, {
       activityId: target.activityId,
       sessionCode: target.sessionCode,
-      grabToken: right.grabToken,
+      grabToken,
       rightCode: right.rightCode,
       unpl: GRAB_UNPL,
     });
