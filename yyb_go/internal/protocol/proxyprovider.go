@@ -39,6 +39,12 @@ type ProxyProviderConfig struct {
 	// 提取接口是按次计费的（品赞 10 分钟档 0.02/次），24 小时无条件预热
 	// 一天要烧 144 次 ≈ 2.88 元，而脚本一天只用几个时间点 —— 空转的九成以上
 	// 都是白花的钱。改成只在活跃期（有请求真的用过出口）才预热。
+	//
+	// 为什么是 3 分钟而不是 10：出口本身能活 10 分钟，窗口设成 10 分钟等于
+	// 「任务结束后还会跨过一个出口到期点」→ 又白提一次（日志里那种
+	// 03:56 → 04:06 → 04:16 连着提）。而一轮任务（脚本约 30s~2min、保活约 30s）
+	// 用不了 3 分钟，所以窗口只要盖住任务本身就够了：
+	// 任务中途出口真的过期了，Current() 自己会按需再提一次，不会掉链子。
 	IdleStopAfter time.Duration
 	// WaitForExit：请求来了但手上没有可用出口时，最多等这么久让后台提取赶上。
 	// 首个请求值得等这一下，否则这一次会退回直连（海外 IP），失去走国内出口的意义。
@@ -100,7 +106,7 @@ func NewProxyProvider(cfg ProxyProviderConfig) *ProxyProvider {
 		cfg.RetryBackoff = 60 * time.Second
 	}
 	if cfg.IdleStopAfter <= 0 {
-		cfg.IdleStopAfter = 10 * time.Minute
+		cfg.IdleStopAfter = 3 * time.Minute
 	}
 	if cfg.WaitForExit <= 0 {
 		cfg.WaitForExit = 3 * time.Second
