@@ -28,14 +28,17 @@
                     实测**必须用「网关隧道」**：xc_proxy=http://yyb-go:8000
                     （网关内部走「树脂 >> 品赞住宅出口」双跳，还能自动轮换出口）
                     未配置时回退 ppcs_proxy / sf_proxy（那条路会被小蚕 WAF 403 拦掉）
-  xc_concurrency    并发数，默认 3
+  xc_concurrency    并发数，**默认 1 = 严格顺序执行**（一个账号跑完再跑下一个，
+                    小蚕对同 IP 并发比较敏感，串行最稳）。想加速可以调大，
+                    但输出顺序仍是按账号排的。
   xc_city/xc_lat/xc_lng   抢单定位；不填用账号记录过的位置，再退到深圳
   xc_monitor_stores 监控店铺，如 mt:123456,elm:234567（平台 mt/elm/jd）
   xc_withdraw_channel  withdraw 模式用：wx（默认）/ zfb
   QYWX_TOKEN / PLUSPLUS_TOKEN   推送（可选）
 
 执行方式
-  - 多账号**并发执行**（xc_concurrency，默认 3；设 1 则严格串行），但输出**按账号顺序整块打印**：
+  - 多账号**默认串行执行**（xc_concurrency=1，一个跑完再跑下一个，最稳）；
+    调大 xc_concurrency 会并发，但输出**依然按账号顺序整块打印**：
     每个账号的日志先进自己的缓冲，轮到它才整块输出，所以日志和汇总永远是 1、2、3… 的顺序，
     不会因为谁先跑完而串行错乱。
   - YYB_SERVER 可以写「地址@1,3,5」只跑指定账号；只写地址则自动拉全部账号、按脚本标记过滤。
@@ -80,7 +83,7 @@ DEFAULT_ON = (os.getenv("xc_default_on") or "0") == "1"
 MANUAL_COOKIES = os.getenv("xc_cookie") or os.getenv("XC_COOKIE") or ""
 PROXY_URL = (os.getenv("xc_proxy") or os.getenv("ppcs_proxy") or os.getenv("sf_proxy") or "").strip()
 PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-CONCURRENCY = max(1, int(os.getenv("xc_concurrency") or "3"))
+CONCURRENCY = max(1, int(os.getenv("xc_concurrency") or "1"))
 GATEWAY_TIMEOUT = 60
 
 QYWX_TOKEN = os.getenv("QYWX_TOKEN", "")
