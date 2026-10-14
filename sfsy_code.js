@@ -20,17 +20,9 @@ new Env('顺丰速运')
                    在扫码面板「应用宝账号」页勾选即可，不用手填。
   yyb_tag_filter   默认 1（按标记过滤）。设 0 则忽略标记跑全部账号
                    —— 只影响「网关自动发现」；显式写了 sf_openid / @ref 时以你写的为准
-  sfsy_login_cache 默认 1。设 0 关闭「登录态复用」，退回每次都去网关取 code
-  SFSY_LOGIN_CACHE_FILE  登录态（Cookie）缓存路径，默认 $QL_DIR/data/sfsy_login_cache.json
-                   ⚠️ 内含 Cookie，写入权限 0600，别外传/别提交
-
-登录态复用（重要）：
-  · 登录成功后会把这串业务 Cookie 缓存到本地，**下次运行先用缓存的登录态**
-    （用一次「查积分」轻量请求验证它是否还被服务端认），有效就不去网关取 code；
-    失效才回退「网关取 code → 重新登录」，并把新 Cookie 覆盖写入缓存。
-  · 好处：① 省掉每轮多跳登录；② 网关里账号授权掉了（status=expired）、取不到 code 时，
-    只要本地缓存 Cookie 还有效，脚本照样能签到 —— 不会因为「没有 alive 账号」整体不跑。
-  · 因此账号发现除了 alive 账号，还会把「非 alive 但本地有登录态缓存」的账号一并尝试。
+  ⚠️ 没有登录态缓存（已移除）：登录态只在本次运行内有效，每轮都重新走网关取 code。
+   实测跨天必然失效——两次运行间隔 9~11 小时，顺丰 Cookie 活不了那么久，
+   复用从未命中、只白费一次探测请求。
 
   代理（可选，海外服务器访问国内接口必配）：
   sf_proxy          静态代理地址，形如 http://user:pass@host:port（也可用 script_proxy，与朴朴脚本共用）
@@ -153,14 +145,6 @@ const TAG_FILTER = (ENV('yyb_tag_filter') || '1') !== '0';
 const RAW_COOKIE_ENV = ENV('sfsyUrl') || ENV('sf');
 
 // 登录态（顺丰业务 Cookie）缓存：下次运行先复用上次的登录态，失效再回网关取 code。
-// 关掉：sfsy_login_cache=0
-// ⚠️ 默认关闭：和朴朴一样，线上实测缓存从未命中（校验不过），白费一次探测。
-// 要重新试：sfsy_login_cache=1
-const LOGIN_CACHE_ON = (ENV('sfsy_login_cache') || '0') === '1';
-const LOGIN_CACHE_FILE = ENV('SFSY_LOGIN_CACHE_FILE')
-  || (process.env.QL_DIR
-    ? path.join(process.env.QL_DIR, 'data', 'sfsy_login_cache.json')
-    : path.join(__dirname, 'data', 'sfsy_login_cache.json'));
 const STATIC_PROXY = ENV('sf_proxy') || ENV('script_proxy');
 // 粘性出口（树脂 Resin 的 Account 特性）：sf_proxy_sticky=1 时给每个账号绑一个固定出口，
 // 代理用户名写成 <平台>.<前缀>_<账号>，而不是「每次连接随机挑节点」——实测成功率与速度都明显更好。
@@ -547,84 +531,6 @@ function jarFromCookieString(str) {
   return jar;
 }
 
-/* ==================== 登录态缓存（跨天复用；失效自动回退网关取 code） ====================
- * 顺丰的「登录态」就是一串业务 Cookie（sessionId / _login_mobile_ / _login_user_id_ ...）。
- * 形状：{ accounts: { <sha256(openid)[0:12]>: {ref, cookie, nickname, obtained_at} } }
- * Cookie 属敏感信息，文件按 0600 写。
- */
-
-function cacheKey(s) {
-  return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 12);
-}
-
-function readLoginCacheAll() {
-  if (!LOGIN_CACHE_ON) return {};
-  try {
-    const all = JSON.parse(fs.readFileSync(LOGIN_CACHE_FILE, 'utf8'));
-    if (all && all.accounts && typeof all.accounts === 'object') return all.accounts;
-  } catch (_) { /* 不存在/损坏 → 当没有 */ }
-  return {};
-}
-
-function writeLoginCacheAll(accounts) {
-  if (!LOGIN_CACHE_ON) return;
-  try {
-    fs.mkdirSync(path.dirname(LOGIN_CACHE_FILE), { recursive: true });
-    fs.writeFileSync(LOGIN_CACHE_FILE, JSON.stringify({
-      note: '顺丰登录态（Cookie）缓存（按网关 openid 索引；含凭证，敏感文件，权限 0600）。'
-        + '失效后由脚本自动回退「网关取 code 重新登录」并覆盖本文件。',
-      accounts,
-    }, null, 2), { encoding: 'utf8', mode: 0o600 });
-    try { fs.chmodSync(LOGIN_CACHE_FILE, 0o600); } catch (_) {}
-  } catch (e) {
-    LOG(`[提示] 登录态缓存写入失败（不影响签到）：${e.message}`);
-  }
-}
-
-/** 取某 ref 的缓存登录态 jar（无则 null） */
-function getCachedJar(ref, all) {
-  if (!LOGIN_CACHE_ON) return null;
-  const rec = (all || {})[cacheKey(ref)];
-  if (!rec || !rec.cookie) return null;
-  return {
-    jar: jarFromCookieString(rec.cookie),
-    obtained_at: Number(rec.obtained_at || 0) || 0,
-    nickname: rec.nickname || '',
-  };
-}
-
-function putCachedJar(all, ref, jar, nickname) {
-  if (!LOGIN_CACHE_ON) return;
-  const cookie = jar && jar.header ? jar.header() : '';
-  if (!cookie) return;
-  all[cacheKey(ref)] = {
-    ref: String(ref),
-    cookie,
-    nickname: nickname || '',
-    obtained_at: Math.floor(Date.now() / 1000),
-  };
-}
-
-function fmtTs(sec) {
-  if (!sec) return '未知时间';
-  try {
-    return new Date(sec * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
-  } catch (_) { return '未知时间'; }
-}
-
-/** 用一次「查积分」轻量请求验证缓存 Cookie 是否仍被服务端接受（成功=有效） */
-async function probeJar(jar, proxyPool) {
-  try {
-    const probeTask = { jar, log: () => {} };
-    const sfPost = sfClient(probeTask, proxyPool);
-    const r = await sfPost(
-      '/mcs-mimp/commonPost/~memberNonactivity~integralTaskStrategyService~queryPointTaskAndSignFromES',
-      { channelType: '1', deviceId: 'login-cache-probe' },
-    );
-    return !!(r && r.success);
-  } catch (_) { return false; }
-}
-
 /* ==================== HTTP 客户端 ==================== */
 
 function rawRequest(opts) {
@@ -789,18 +695,6 @@ async function sfLogin(account, proxyPool) {
     return { ok: true, jar: jarFromCookieString(account.raw), via: 'cookie' };
   }
 
-  // 1) 先试本地缓存的登录态（用一次「查积分」轻量请求验证它是否还被服务端认）
-  if (LOGIN_CACHE_ON && account.openid) {
-    const cached = getCachedJar(account.openid, readLoginCacheAll());
-    if (cached) {
-      if (await probeJar(cached.jar, proxyPool)) {
-        LOG(`   🔐 复用本地登录态缓存（${fmtTs(cached.obtained_at)} 获取），已验证有效，不去网关取 code`);
-        return { ok: true, jar: cached.jar, via: 'cache' };
-      }
-      LOG(`   ♻️ 本地登录态缓存（${fmtTs(cached.obtained_at)} 获取）已失效，改用网关取 code 重新登录`);
-    }
-  }
-
   const result = await withRetry('登录', async () => {
     const jar = new CookieJar();
 
@@ -848,13 +742,6 @@ async function sfLogin(account, proxyPool) {
     return { ok: true, jar, via: 'gateway' };
   }, 4, proxyPool);
 
-  // 2) 网关登录成功 → 回写登录态缓存（下次运行直接复用）
-  if (result && result.ok && result.via === 'gateway' && account.openid && LOGIN_CACHE_ON) {
-    const all = readLoginCacheAll();
-    putCachedJar(all, account.openid, result.jar, account.remark || '');
-    writeLoginCacheAll(all);
-    LOG('   💾 已缓存本次登录态，下次运行可直接复用');
-  }
   return result;
 }
 
@@ -1601,26 +1488,9 @@ async function discoverGatewayAccounts() {
     alive = all.filter((a) => (a.status || '').toLowerCase() === 'alive');
   }
 
-  // 除了 alive 账号，还把「网关里不是 alive、但本地有登录态缓存」的账号一并纳入：
-  // 这类账号虽然取不到新 code，但只要旧 Cookie 还有效就照样能签到
-  // （正是「授权掉了但旧登录态还能抢救」的场景）。
-  const loginCache = readLoginCacheAll();
-  const aliveRefs = new Set(alive.map((a) => String(a.openid || a.id || '')));
-  const revived = all.filter((a) => {
-    const ref = String(a.openid || a.id || '');
-    return ref && !aliveRefs.has(ref) && !!getCachedJar(ref, loginCache);
-  });
-  if (revived.length) {
-    const names = revived.map((a) => {
-      const l = String(a.nickname || a.alias || '').trim();
-      return l && l !== '-' ? l : String(a.openid || a.id || '');
-    });
-    LOG(`🔐 ${revived.length} 个账号在网关里不是 alive，但本地有登录态缓存，一并尝试：${names.join('、')}`);
-  }
-
   const out = [];
   let filtered = 0;
-  for (const a of alive.concat(revived)) {
+  for (const a of alive) {
     const openid = String(a.openid || a.id || '');
     if (!openid) continue;
     const remark = String(a.nickname || a.alias || '');
@@ -1632,7 +1502,7 @@ async function discoverGatewayAccounts() {
     out.push({ openid, remark, raw: openid });
   }
   if (filtered) {
-    LOG(`ℹ️ 按脚本标记过滤掉 ${filtered} 个账号（本脚本 key=${SCRIPT_KEY}，候选 ${alive.length + revived.length} 个）`);
+    LOG(`ℹ️ 按脚本标记过滤掉 ${filtered} 个账号（本脚本 key=${SCRIPT_KEY}，候选 ${alive.length} 个）`);
     LOG('   想让它跑：面板「应用宝账号」页把顺丰勾上；或临时设 yyb_tag_filter=0 忽略标记');
   }
   if (out.length) {
@@ -1773,11 +1643,6 @@ module.exports = {
   // 供测试/排查使用
   discoverGatewayAccounts,
   jarFromCookieString,
-  readLoginCacheAll,
-  writeLoginCacheAll,
-  getCachedJar,
-  putCachedJar,
-  probeJar,
 };
 
 if (require.main === module) {
