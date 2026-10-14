@@ -154,7 +154,9 @@ const RAW_COOKIE_ENV = ENV('sfsyUrl') || ENV('sf');
 
 // 登录态（顺丰业务 Cookie）缓存：下次运行先复用上次的登录态，失效再回网关取 code。
 // 关掉：sfsy_login_cache=0
-const LOGIN_CACHE_ON = (ENV('sfsy_login_cache') || '1') !== '0';
+// ⚠️ 默认关闭：和朴朴一样，线上实测缓存从未命中（校验不过），白费一次探测。
+// 要重新试：sfsy_login_cache=1
+const LOGIN_CACHE_ON = (ENV('sfsy_login_cache') || '0') === '1';
 const LOGIN_CACHE_FILE = ENV('SFSY_LOGIN_CACHE_FILE')
   || (process.env.QL_DIR
     ? path.join(process.env.QL_DIR, 'data', 'sfsy_login_cache.json')
