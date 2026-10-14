@@ -48,7 +48,7 @@ new Env('朴朴超市Code版')
    yyb_auto_refresh     默认 1。账号状态非 alive 时自动 /accounts/refresh 续期
    yyb_skip_expired     默认 1。续期后仍为 expired 的账号直接跳过
                         —— 但若该账号本地有登录态缓存，仍会尝试（见下方「登录态复用」）
-   ppcs_login_cache     默认 1。设 0 关闭「登录态复用」，退回每次都去网关取 code
+   ppcs_login_cache     默认 0（关闭）。线上实测缓存从未命中过；设 1 可重新试
    PPCS_LOGIN_CACHE_FILE  登录态缓存路径，默认 $QL_DIR/data/ppcs_login_cache.json
                         ⚠️ 内含 token，写入权限 0600，别外传/别提交
    yyb_script_key       本脚本在网关账号上的标记 key，默认 ppcs。账号的 scripts 标记里
@@ -115,8 +115,10 @@ const YYB_TAG_FILTER = String(process.env.yyb_tag_filter ?? "1") !== "0";
 // 可选开关
 const AUTO_REFRESH = (process.env.yyb_auto_refresh ?? "1") !== "0";
 const SKIP_EXPIRED = (process.env.yyb_skip_expired ?? "1") !== "0";
-// 登录态复用：下次运行先复用上次的 token，失效再回网关取 code。关掉：ppcs_login_cache=0
-const LOGIN_CACHE_ON = String(process.env.ppcs_login_cache ?? "1") !== "0";
+// 登录态复用：下次运行先复用上次的 token，失效再回网关取 code。
+// ⚠️ 默认关闭：线上实测朴朴的 clientauth token 每次都过不了 cauth.pupuapi.com 的
+// 校验（缓存写了 11 条、一次都没命中），等于白费一次探测请求。要试就 ppcs_login_cache=1。
+const LOGIN_CACHE_ON = String(process.env.ppcs_login_cache ?? "0") === "1";
 const LOGIN_CACHE_FILE = process.env.PPCS_LOGIN_CACHE_FILE
   || (process.env.QL_DIR
     ? path.join(process.env.QL_DIR, "data", "ppcs_login_cache.json")
