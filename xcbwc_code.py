@@ -34,6 +34,12 @@
   xc_withdraw_channel  withdraw 模式用：wx（默认）/ zfb
   QYWX_TOKEN / PLUSPLUS_TOKEN   推送（可选）
 
+执行方式
+  - 多账号**并发执行**（xc_concurrency，默认 3；设 1 则严格串行），但输出**按账号顺序整块打印**：
+    每个账号的日志先进自己的缓冲，轮到它才整块输出，所以日志和汇总永远是 1、2、3… 的顺序，
+    不会因为谁先跑完而串行错乱。
+  - YYB_SERVER 可以写「地址@1,3,5」只跑指定账号；只写地址则自动拉全部账号、按脚本标记过滤。
+
 说明
   - 原插件是「羽化」作者的机器人插件（middleware/Sender/命令菜单/授权收费），
     这里只保留协议与业务逻辑，改造成青龙单体脚本；机器人的菜单、拉群、付费授权、
@@ -147,6 +153,84 @@ def mask(s) -> str:
 
 # ====================== 本地状态（替代原插件的 bucket 存储） ======================
 
+# ====================== 多账号执行：并发跑、按账号顺序输出 ======================
+#
+# 之前用 as_completed，谁先跑完谁先打印 → 日志和汇总都是乱的。
+# 现在：每个账号的日志先写进**本线程缓冲**，主线程按 1、2、3… 的顺序整块打印，
+# 谁快谁慢都不影响阅读顺序；执行本身仍是并发的（快、且一个出口窗口能盖住更多账号）。
+_log_local = threading.local()
+_print_lock = threading.Lock()
+
+
+def emit(*parts) -> None:
+    """所有日志的唯一出口：并发期间写进线程缓冲，由主线程按账号顺序整块输出"""
+    text = " ".join(str(p) for p in parts)
+    buf = getattr(_log_local, "buf", None)
+    if buf is None:
+        with _print_lock:
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+        return
+    buf.append(text)
+
+
+def _take_block() -> List[str]:
+    buf = getattr(_log_local, "buf", None)
+    _log_local.buf = None
+    return buf or []
+
+
+def run_accounts(accounts: List[Dict], worker) -> List[Tuple[bool, str]]:
+    """
+    并发执行账号，但**按账号顺序**输出。
+
+    worker(index, acc) 返回 (是否成功, 汇总行)；它内部用 emit() 记日志，
+    这些日志会被收集成该账号的一块，等轮到它时整块打印。
+    """
+    total = len(accounts)
+    blocks: Dict[int, List[str]] = {}
+    outcome: Dict[int, Tuple[bool, str]] = {}
+    printed = 0
+
+    def flush_in_order() -> None:
+        nonlocal printed
+        while printed in blocks:                      # 只按顺序打印；前面没好就等着
+            i = printed
+            acc = accounts[i]
+            name = acc.get("remark") or acc.get("key") or f"#{i + 1}"
+            good, line = outcome[i]
+            sys.stdout.write("\n" + "─" * 12 + f" 账号 {i + 1}/{total} · {name} " + "─" * 12 + "\n")
+            for entry in blocks[i]:
+                sys.stdout.write(entry + "\n")
+            sys.stdout.write(("✅ " if good else "❌ ") + line + "\n")
+            sys.stdout.flush()
+            printed += 1
+
+    def run_one(i: int, acc: Dict) -> Tuple[int, bool, str, List[str]]:
+        _log_local.buf = []
+        try:
+            good, line = worker(i, acc)
+        except Exception as exc:                       # 单个账号炸了不影响别的
+            emit(f"❌ 执行异常：{parse_error(exc)}")
+            good, line = False, f"{acc.get('remark') or '?'}：{parse_error(exc)}"
+        return i, good, line, _take_block()
+
+    if CONCURRENCY <= 1 or total == 1:
+        for i, acc in enumerate(accounts):
+            idx, good, line, buf = run_one(i, acc)
+            blocks[idx], outcome[idx] = buf, (good, line)
+            flush_in_order()
+    else:
+        with ThreadPoolExecutor(max_workers=min(CONCURRENCY, total)) as pool:
+            futures = [pool.submit(run_one, i, acc) for i, acc in enumerate(accounts)]
+            for fut in as_completed(futures):
+                idx, good, line, buf = fut.result()
+                with _print_lock:
+                    blocks[idx], outcome[idx] = buf, (good, line)
+                    flush_in_order()
+    return [outcome[i] for i in range(total)]
+
+
 def load_state() -> Dict:
     try:
         if os.path.exists(STATE_FILE):
@@ -156,7 +240,7 @@ def load_state() -> Dict:
                     data.setdefault("accounts", {})
                     return data
     except Exception as exc:
-        print(f"⚠️ [状态] 读取失败: {exc}")
+        emit(f"⚠️ [状态] 读取失败: {exc}")
     return {"accounts": {}}
 
 
@@ -166,7 +250,7 @@ def save_state(state: Dict) -> None:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as exc:
-        print(f"❌ [状态] 保存失败: {exc}")
+        emit(f"❌ [状态] 保存失败: {exc}")
 
 
 def acc_of(state: Dict, key: str) -> Dict:
@@ -719,18 +803,18 @@ def gateway_post(path: str, payload: Dict) -> Dict:
 
 
 def get_code_via_gateway(ref: str) -> Optional[str]:
-    print(f"🔐 [登录] 经网关取小蚕 code（ref={ref}，appid={XC_APPID}）")
+    emit(f"🔐 [登录] 经网关取小蚕 code（ref={ref}，appid={XC_APPID}）")
     try:
         body = gateway_post("/wxapp/getCode", {"ref": ref, "app_id": XC_APPID})
         data = body.get("data") or {}
         result = data.get("result") if isinstance(data.get("result"), dict) else {}
         code = result.get("code") or data.get("code")
         if code:
-            print("✅ [登录] code 拿到")
+            emit("✅ [登录] code 拿到")
             return str(code)
-        print(f"❌ [登录] 网关没返回 code: {json.dumps(body, ensure_ascii=False)[:200]}")
+        emit(f"❌ [登录] 网关没返回 code: {json.dumps(body, ensure_ascii=False)[:200]}")
     except Exception as exc:
-        print(f"❌ [登录] 取 code 异常: {exc}")
+        emit(f"❌ [登录] 取 code 异常: {exc}")
     return None
 
 
@@ -760,13 +844,13 @@ def app_login(wx_code: str, device_key=None) -> Tuple[Optional[str], Optional[st
                     return str(user_id), str(access)
                 # 结构变了也别静默失败：把字段名打出来
                 last = f"响应里没有 user_id/access_token，字段={list(ui.keys())} 顶层={list(js.keys())}"
-                print(f"⚠️ [登录] {last}")
+                emit(f"⚠️ [登录] {last}")
                 return None, None
             last = str(js.get("status", {}).get("msg") or js)[:200]
         except Exception as exc:
             last = parse_error(exc)
         time.sleep(0.8)
-    print(f"❌ [登录] MiniLogin 失败: {last}")
+    emit(f"❌ [登录] MiniLogin 失败: {last}")
     return None, None
 
 
@@ -794,13 +878,13 @@ def login_by_yyb(ref: str, device_key=None) -> Optional[Tuple[str, str]]:
         return None
     vayne, sivir = app_login(code, device_key)
     if not vayne:
-        print("❌ [登录] AppLogin 失败（code 可能已过期/被用过）")
+        emit("❌ [登录] AppLogin 失败（code 可能已过期/被用过）")
         return None
     teemo, nickname = user_info_by_scan(vayne, sivir, device_key)
     if not teemo:
-        print("❌ [登录] 取 silk_id 失败")
+        emit("❌ [登录] 取 silk_id 失败")
         return None
-    print(f"✅ [登录] 成功：{nickname or vayne}（silk_id={mask(teemo)}）")
+    emit(f"✅ [登录] 成功：{nickname or vayne}（silk_id={mask(teemo)}）")
     return f"{vayne}#{teemo}#{sivir}", nickname or str(vayne)
 
 
@@ -828,7 +912,7 @@ def gateway_accounts() -> List[Dict]:
         data = body.get("data")
         return data if isinstance(data, list) else []
     except Exception as exc:
-        print(f"⚠️ [网关] 拉取账号失败: {exc}")
+        emit(f"⚠️ [网关] 拉取账号失败: {exc}")
         return []
 
 
@@ -851,16 +935,17 @@ def build_accounts(state: Dict) -> List[Dict]:
 
     # ② yyb 网关 + 账号标记（默认关）
     server_line = YYB_SERVER.strip()
-    explicit_ref = ""
+    # 地址@1,3,5 → 只跑这几个 ref；地址（不带 @）→ 拉全部账号再按脚本标记过滤
+    explicit_refs = set()
     if "@" in server_line:
-        explicit_ref = server_line.split("@", 1)[1].strip()
-    if server_line and (explicit_ref or "accounts" in server_line or True):
+        explicit_refs = {x.strip() for x in server_line.split("@", 1)[1].replace("，", ",").split(",") if x.strip()}
+    if server_line:
         for acc in gateway_accounts():
             ref = str(acc.get("id"))
-            if explicit_ref and ref != explicit_ref:
+            if explicit_refs and ref not in explicit_refs:
                 continue
-            if not explicit_ref and not tag_allows(acc):
-                print(f"⏭️ [网关] 跳过 #{ref} {acc.get('nickname') or ''}："
+            if not explicit_refs and not tag_allows(acc):
+                emit(f"⏭️ [网关] 跳过 #{ref} {acc.get('nickname') or ''}："
                       f"脚本标记 [{str(acc.get('scripts') or '').strip() or '空'}] 未勾选本脚本 [{TAG_KEY}]")
                 continue
             stored = state["accounts"].get(f"yyb:{ref}") or {}
@@ -889,11 +974,11 @@ def ensure_cookie(acc: Dict, state: Dict) -> Optional[str]:
             acc["info"] = info
             return cookie
         except Exception as exc:
-            print(f"⚠️ [{acc['remark']}] 缓存登录态失效（{parse_error(exc)}），尝试重新登录")
+            emit(f"⚠️ [{acc['remark']}] 缓存登录态失效（{parse_error(exc)}），尝试重新登录")
 
     ref = acc.get("ref")
     if not ref:
-        print(f"❌ [{acc['remark']}] 没有可用的登录态，也没有 yyb 账号可重新登录")
+        emit(f"❌ [{acc['remark']}] 没有可用的登录态，也没有 yyb 账号可重新登录")
         return None
 
     result = login_by_yyb(ref, device_key=key)
@@ -916,67 +1001,55 @@ def ensure_cookie(acc: Dict, state: Dict) -> Optional[str]:
 def load_accounts_or_exit(state: Dict) -> List[Dict]:
     accounts = build_accounts(state)
     if not accounts:
-        print("❌ 没有需要执行的账号：")
-        print("   · 本脚本默认关，请在面板「应用宝账号」页把「小蚕霸王餐」勾上（或用 xc_cookie 填登录态）")
-        print("   · 只想临时跑可以先设 xc_default_on=1")
+        emit("❌ 没有需要执行的账号：")
+        emit("   · 本脚本默认关，请在面板「应用宝账号」页把「小蚕霸王餐」勾上（或用 xc_cookie 填登录态）")
+        emit("   · 只想临时跑可以先设 xc_default_on=1")
         return []
     return accounts
 
 
 def mode_run(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]]:
-    ok, fail, details = 0, 0, []
-
-    def work(acc):
+    def work(i: int, acc: Dict) -> Tuple[bool, str]:
         cookie = ensure_cookie(acc, state)
         if not cookie:
             return False, f"{acc['remark']}：登录态不可用"
-        try:
-            api = Yuhua(cookie, city_code=str((state["accounts"].get(acc["key"]) or {}).get("city_code") or 440304))
-            api.get_silk()
-            logs = api.run_all()
-            for line in logs:
-                print(f"   {line}")
-            ok_lines = [l for l in logs if any(k in l for k in ("完成", "成功", "限一次", "已经领取"))]
-            return (len(ok_lines) >= 3), f"{acc['remark']}：{len(ok_lines)} 项完成"
-        except Exception as exc:
-            return False, f"{acc['remark']}：{parse_error(exc)}"
+        entry = state["accounts"].get(acc["key"]) or {}
+        api = Yuhua(cookie, city_code=str(entry.get("city_code") or 440304))
+        api.get_silk()
+        logs = api.run_all()
+        for line in logs:
+            emit("   " + line)
+        done = [l for l in logs if any(k in l for k in ("完成", "成功", "限一次", "已经领取"))]
+        return (len(done) >= 3), f"{acc['remark']}：{len(done)} 项完成"
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = {pool.submit(work, a): a for a in accounts}
-        for fut in as_completed(futures):
-            acc = futures[fut]
-            try:
-                good, line = fut.result()
-            except Exception as exc:
-                good, line = False, f"{acc['remark']}：{parse_error(exc)}"
-            details.append(("✅" if good else "❌") + " " + line)
-            ok += 1 if good else 0
-            fail += 0 if good else 1
-    return ok, fail, details
+    results = run_accounts(accounts, work)
+    ok = sum(1 for good, _ in results if good)
+    return ok, len(results) - ok, [("✅ " if g else "❌ ") + line for g, line in results]
 
 
 def mode_check(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]]:
-    ok, fail, details = 0, 0, []
-    for acc in accounts:
+    def work(i: int, acc: Dict) -> Tuple[bool, str]:
         key = acc["key"]
         cookie = (state["accounts"].get(key) or {}).get("cookie") or acc.get("cookie")
         if not cookie:
-            details.append(f"⏭️ {acc['remark']}：无登录态")
-            continue
+            return False, f"{acc['remark']}：无登录态"
         try:
             info = Yuhua(cookie).get_silk()
-            silk = to_yuan(info.get("silk", 0))
-            details.append(f"✅ {acc['remark']}：正常，蚕豆 {silk:.2f}")
-            ok += 1
         except Exception as exc:
             reason = parse_error(exc)
-            details.append(f"❌ {acc['remark']}：{reason}")
-            fail += 1
+            emit("   " + reason)
             if reason == "CK失效":
                 with _state_lock:
                     acc_of(state, key).pop("cookie", None)
                     save_state(state)
-    return ok, fail, details
+            return False, f"{acc['remark']}：{reason}"
+        silk = to_yuan(info.get("silk", 0))
+        emit(f"   蚕豆 {silk:.2f}")
+        return True, f"{acc['remark']}：正常，蚕豆 {silk:.2f}"
+
+    results = run_accounts(accounts, work)
+    ok = sum(1 for good, _ in results if good)
+    return ok, len(results) - ok, [("✅ " if g else "❌ ") + line for g, line in results]
 
 
 def _rain_event(state: Dict) -> Optional[Dict]:
@@ -1011,44 +1084,35 @@ def mode_rain(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]]:
     start_ts = event.get("time", 0)
     now_ts = china_now().timestamp()
     if abs(start_ts - now_ts) > 600:
-        return 0, len(accounts), [f"⏭️ 不在场次前后 10 分钟内，跳过（开抢时间 {datetime.fromtimestamp(start_ts, CHINA_TZ):%H:%M:%S}）"]
+        when = datetime.fromtimestamp(start_ts, CHINA_TZ).strftime("%H:%M:%S")
+        return 0, len(accounts), [f"⏭️ 不在场次前后 10 分钟内，跳过（本场开抢时间 {when}）"]
+    emit(f"🎯 本场开抢时间 {datetime.fromtimestamp(start_ts, CHINA_TZ):%H:%M:%S}，"
+         f"账号同时报名、准点瓜分")
 
-    ok, fail, details = 0, 0, []
-
-    def work(acc):
+    def work(i: int, acc: Dict) -> Tuple[bool, str]:
         cookie = ensure_cookie(acc, state)
         if not cookie:
             return False, f"{acc['remark']}：无登录态"
         city = (state["accounts"].get(acc["key"]) or {}).get("city_code") or 440304
-        try:
-            api = Yuhua(cookie, city_code=str(city))
-            api.get_silk()
-            wait = start_ts - 0.9 - china_now().timestamp()
-            if wait > 0:
-                time.sleep(wait)
-            joined, msg, verify = api.join_rain(event.get("event_id"), city)
-            if not joined:
-                return False, f"{acc['remark']}：报名失败 {msg}" + ("（需风控验证，青龙里做不了，手动去小程序抢一场即可解除）" if verify else "")
-            wait = start_ts + 0.1 - china_now().timestamp()
-            if wait > 0:
-                time.sleep(wait)
-            time.sleep(random.uniform(0.01, 0.05))
-            good, msg2 = api.grab_rain(event.get("event_id"), city)
-            return good, f"{acc['remark']}：{msg2}"
-        except Exception as exc:
-            return False, f"{acc['remark']}：{parse_error(exc)}"
+        api = Yuhua(cookie, city_code=str(city))
+        api.get_silk()
+        wait = start_ts - 0.9 - china_now().timestamp()
+        if wait > 0:
+            time.sleep(wait)
+        joined, msg, verify = api.join_rain(event.get("event_id"), city)
+        if not joined:
+            hint = "（需风控验证，青龙里做不了，去小程序手动瓜分一场即可解除）" if verify else ""
+            return False, f"{acc['remark']}：报名失败 {msg}{hint}"
+        wait = start_ts + 0.1 - china_now().timestamp()
+        if wait > 0:
+            time.sleep(wait)
+        time.sleep(random.uniform(0.01, 0.05))
+        good, msg2 = api.grab_rain(event.get("event_id"), city)
+        return good, f"{acc['remark']}：{msg2}"
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(work, a) for a in accounts]
-        for fut in as_completed(futures):
-            try:
-                good, line = fut.result()
-            except Exception as exc:
-                good, line = False, parse_error(exc)
-            details.append(("✅" if good else "❌") + " " + line)
-            ok += 1 if good else 0
-            fail += 0 if good else 1
-    return ok, fail, details
+    results = run_accounts(accounts, work)
+    ok = sum(1 for good, _ in results if good)
+    return ok, len(results) - ok, [("✅ " if g else "❌ ") + line for g, line in results]
 
 
 def monitor_stores_from_env() -> Dict[int, List[str]]:
@@ -1073,22 +1137,20 @@ def mode_monitor(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]
     stores = monitor_stores_from_env()
     if not any(stores.values()):
         return 0, 0, ["⏭️ 未配置 xc_monitor_stores（如 mt:123456,elm:234567），监控抢单跳过"]
-    details: List[str] = []
-    grabbed = 0
-    for acc in accounts:
-        cookie = acc["key"] and ((state["accounts"].get(acc["key"]) or {}).get("cookie") or acc.get("cookie"))
-        if not cookie:
-            continue
+    wanted = sum(len(ids) for ids in stores.values())
+    emit(f"🎯 监控 {wanted} 个店铺（" +
+         "、".join(f"{PLATFORM_NAME[pf]}{len(ids)}个" for pf, ids in stores.items() if ids) + "）")
+
+    def work(i: int, acc: Dict) -> Tuple[bool, str]:
         entry = state["accounts"].get(acc["key"]) or {}
+        cookie = entry.get("cookie") or acc.get("cookie")
+        if not cookie:
+            return False, f"{acc['remark']}：无登录态"
         lat = float(os.getenv("xc_lat") or entry.get("lat") or 22.5455)
         lng = float(os.getenv("xc_lng") or entry.get("lng") or 114.0545)
         city = int(os.getenv("xc_city") or entry.get("city_code") or 440304)
-        try:
-            api = XcClient(cookie, city_code=str(city))
-            api.get_silk()
-        except Exception as exc:
-            details.append(f"❌ {acc['remark']}：{parse_error(exc)}")
-            continue
+        api = XcClient(cookie, city_code=str(city))
+        api.get_silk()
 
         promos, offset = [], 0
         while True:
@@ -1100,79 +1162,84 @@ def mode_monitor(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]
                 break
             offset += 20
             time.sleep(random.uniform(0.5, 1.0))
+        emit(f"   附近活动 {len(promos)} 条（{lat},{lng} 城市 {city}）")
         if not promos:
-            details.append(f"⏭️ {acc['remark']}：附近没有活动")
-            continue
+            return False, f"{acc['remark']}：附近没有活动"
 
+        hit, missed = [], []
         for pf, ids in stores.items():
             for sid in ids:
                 if sid in today_set(entry, "grabbed"):
+                    missed.append(f"{sid}(今日已抢)")
                     continue
-                candidates = [p for p in promos
-                              if str(p["store"]["store_id"]) == sid and platform_of(p) == pf]
+                candidates = [x for x in promos
+                              if str(x["store"]["store_id"]) == sid and platform_of(x) == pf]
                 if not candidates:
+                    missed.append(f"{sid}(不在附近)")
                     continue
                 best = best_promotion(candidates)
                 if not best:
+                    missed.append(f"{sid}(无可用活动)")
                     continue
                 good, msg = api.grab_promotion(best["promotion_id"], pf, city, lat, lng)
                 if good:
-                    grabbed += 1
-                    details.append(f"✅ {acc['remark']}：抢到 {best['store']['name']}（{PLATFORM_NAME[pf]}）")
+                    hit.append(best["store"]["name"])
                     with _state_lock:
                         today_add(entry, "grabbed", sid)
                         save_state(state)
                 else:
-                    details.append(f"❌ {acc['remark']}：{best['store']['name']} {msg}")
+                    missed.append(f"{best['store']['name']}({msg})")
                     if "超过店铺限制" in msg:
                         with _state_lock:
                             today_add(entry, "overlimit", sid)
                             save_state(state)
-    return grabbed, 0, details
+        if missed:
+            emit("   未抢到：" + "、".join(missed[:6]))
+        if not hit:
+            return False, f"{acc['remark']}：0 个店铺抢到"
+        return True, f"{acc['remark']}：抢到 {len(hit)} 个（" + "、".join(hit) + "）"
+
+    results = run_accounts(accounts, work)
+    ok = sum(1 for good, _ in results if good)
+    return ok, len(results) - ok, [("✅ " if g else "❌ ") + line for g, line in results]
 
 
 def mode_list(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]]:
-    ok, fail, details = 0, 0, []
-    for acc in accounts:
+    def work(i: int, acc: Dict) -> Tuple[bool, str]:
         cookie = ensure_cookie(acc, state)
         if not cookie:
-            details.append(f"❌ {acc['remark']}：无登录态")
-            fail += 1
-            continue
-        try:
-            api = Yuhua(cookie)
-            info = api.get_silk(force=True)
-            register_ts = info.get("register_time", 0)
-            join_days = ((china_now().replace(tzinfo=None) - datetime.fromtimestamp(register_ts)).days
-                         if register_ts else 0)
-            details.append(
-                f"✅ {acc['remark']}：累计已返 {to_yuan(info.get('withdraw_total', 0)):.2f} 元 / "
-                f"加入 {join_days} 天 / 完成 {info.get('completed_number', 0)} 单 / "
-                f"蚕豆 {to_yuan(info.get('silk', 0)):.2f} / 卡券 {api.get_all_cards()}")
-            ok += 1
-        except Exception as exc:
-            details.append(f"❌ {acc['remark']}：{parse_error(exc)}")
-            fail += 1
-    return ok, fail, details
+            return False, f"{acc['remark']}：无登录态"
+        api = Yuhua(cookie)
+        info = api.get_silk(force=True)
+        register_ts = info.get("register_time", 0)
+        join_days = ((china_now().replace(tzinfo=None) - datetime.fromtimestamp(register_ts)).days
+                     if register_ts else 0)
+        cards = api.get_all_cards()
+        emit(f"   累计已返 {to_yuan(info.get('withdraw_total', 0)):.2f} 元 / "
+             f"加入 {join_days} 天 / 完成 {info.get('completed_number', 0)} 单")
+        emit(f"   蚕豆 {to_yuan(info.get('silk', 0)):.2f} / 卡券 {cards}")
+        return True, (f"{acc['remark']}：蚕豆 {to_yuan(info.get('silk', 0)):.2f}"
+                      f"（累计已返 {to_yuan(info.get('withdraw_total', 0)):.2f} 元）")
+
+    results = run_accounts(accounts, work)
+    ok = sum(1 for good, _ in results if good)
+    return ok, len(results) - ok, [("✅ " if g else "❌ ") + line for g, line in results]
 
 
 def mode_withdraw(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]]:
     channel = 1 if (os.getenv("xc_withdraw_channel") or "wx").lower() in ("zfb", "2", "支付宝") else 0
-    ok, fail, details = 0, 0, []
-    for acc in accounts:
+    emit(f"💸 提现渠道：{'支付宝' if channel == 1 else '微信'}")
+
+    def work(i: int, acc: Dict) -> Tuple[bool, str]:
         cookie = ensure_cookie(acc, state)
         if not cookie:
-            details.append(f"❌ {acc['remark']}：无登录态")
-            fail += 1
-            continue
-        try:
-            good, msg = Yuhua(cookie).withdraw(channel)
-        except Exception as exc:
-            good, msg = False, parse_error(exc)
-        details.append(("✅ " if good else "❌ ") + f"{acc['remark']}：{msg}")
-        ok += 1 if good else 0
-        fail += 0 if good else 1
-    return ok, fail, details
+            return False, f"{acc['remark']}：无登录态"
+        good, msg = Yuhua(cookie).withdraw(channel)
+        return good, f"{acc['remark']}：{msg}"
+
+    results = run_accounts(accounts, work)
+    ok = sum(1 for good, _ in results if good)
+    return ok, len(results) - ok, [("✅ " if g else "❌ ") + line for g, line in results]
 
 
 # ====================== 作者服务端校验（海外访问不通 → 探测不通就放行） ======================
@@ -1191,14 +1258,14 @@ def author_service_ok() -> bool:
             resp.encoding = "utf-8"
         text = resp.text or ""
         if "服务正常中" in text:
-            print("ℹ️ [作者服务] 状态正常")
+            emit("ℹ️ [作者服务] 状态正常")
             return True
         # 能打开页面但没有「服务正常中」→ 作者那边主动停了
         if resp.status_code == 200:
-            print("❌ [作者服务] 页面提示服务异常，按作者状态停止运行")
+            emit("❌ [作者服务] 页面提示服务异常，按作者状态停止运行")
             return False
     except Exception as exc:
-        print(f"ℹ️ [作者服务] 校验页访问不了（{str(exc)[:60]}），海外环境下按放行处理")
+        emit(f"ℹ️ [作者服务] 校验页访问不了（{str(exc)[:60]}），海外环境下按放行处理")
         return True
     return True
 
@@ -1215,17 +1282,17 @@ def notify(title: str, content: str) -> None:
             payload = json.dumps({"msgtype": "text", "text": {"content": text}}).encode()
             r = requests.post("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + key,
                               data=payload, headers={"Content-Type": "application/json"}, timeout=10)
-            print(f"[企业微信] 推送 {r.json().get('errcode')}")
+            emit(f"[企业微信] 推送 {r.json().get('errcode')}")
         except Exception as exc:
-            print(f"[企业微信] 推送异常: {exc}")
+            emit(f"[企业微信] 推送异常: {exc}")
     if PLUSPLUS_TOKEN:
         try:
             requests.post("https://www.pushplus.plus/send",
                           json={"token": PLUSPLUS_TOKEN, "title": title, "content": content,
                                 "template": "txt"}, timeout=10)
-            print("[PushPlus] 推送成功")
+            emit("[PushPlus] 推送成功")
         except Exception as exc:
-            print(f"[PushPlus] 推送异常: {exc}")
+            emit(f"[PushPlus] 推送异常: {exc}")
     for extra in ("/ql/data/scripts", "/ql/scripts"):
         if extra not in sys.path:
             sys.path.insert(0, extra)
@@ -1249,18 +1316,18 @@ MODES = {
 def main() -> int:
     mode = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("xc_mode") or "run").strip().lower()
     if mode not in MODES:
-        print(f"❌ 未知模式 '{mode}'，可用：{', '.join(MODES)}")
+        emit(f"❌ 未知模式 '{mode}'，可用：{', '.join(MODES)}")
         return 1
     mode_name, handler = MODES[mode]
 
-    print("=" * 52)
-    print(f"🐛 {APP_NAME} · {mode_name}")
-    print(f"🕒 {now_text()}")
+    emit("=" * 52)
+    emit(f"🐛 {APP_NAME} · {mode_name}")
+    emit(f"🕒 {now_text()}")
     if PROXIES:
-        print(f"🔌 代理 {PROXY_URL.split('@')[-1]}")
+        emit(f"🔌 代理 {PROXY_URL.split('@')[-1]}")
     else:
-        print("⚠️ 未配置 xc_proxy/ppcs_proxy/sf_proxy：小蚕接口海外直连不通，很可能整轮失败")
-    print("=" * 52)
+        emit("⚠️ 未配置 xc_proxy/ppcs_proxy/sf_proxy：小蚕接口海外直连不通，很可能整轮失败")
+    emit("=" * 52)
 
     if not author_service_ok():
         notify(f"🐛 {APP_NAME} 已停止", "作者服务端提示服务异常，本轮未执行")
@@ -1271,18 +1338,18 @@ def main() -> int:
     if not accounts:
         return 1
 
-    print(f"📱 本次处理 {len(accounts)} 个账号")
+    emit(f"📱 本次处理 {len(accounts)} 个账号")
     try:
         ok, fail, details = handler(state, accounts)
     finally:
         with _state_lock:
             save_state(state)
 
-    print("\n" + "-" * 52)
+    emit("\n" + "-" * 52)
     for line in details:
-        print(line)
-    print("-" * 52)
-    print(f"🏁 {mode_name}：成功 {ok} / 失败 {fail}")
+        emit(line)
+    emit("-" * 52)
+    emit(f"🏁 {mode_name}：成功 {ok} / 失败 {fail}")
 
     notified = "\n".join(details[:20])
     notify(f"🐛 {APP_NAME} {mode_name}（{ok}成功/{fail}失败）", notified or "无详情")
