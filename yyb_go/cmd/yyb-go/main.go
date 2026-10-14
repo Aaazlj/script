@@ -61,8 +61,8 @@ func main() {
 		"扫码流程（建会话/取二维码/轮询/换登录态）是否也走动态出口，默认是")
 	keepAlive := flag.Duration("keepalive-interval", envDurationOr("YYB_KEEPALIVE_INTERVAL", 6*time.Hour),
 		"后台保活间隔（<=0 关闭）：定时刷新所有存活账号的登录态")
-	ipzanIdleStop := flag.Duration("ipzan-idle-stop", envDurationOr("YYB_IPZAN_IDLE_STOP", 10*time.Minute),
-		"按需提取：距最后一次用到出口超过这么久就停止后台提取（闲置不花钱）")
+	ipzanIdleStop := flag.Duration("ipzan-idle-stop", envDurationOr("YYB_IPZAN_IDLE_STOP", 3*time.Minute),
+		"按需提取：距最后一次用到出口超过这么久就停止后台提取（闲置不花钱）；默认 3m，够盖住一轮任务即可")
 	ipzanWaitExit := flag.Duration("ipzan-wait-exit", envDurationOr("YYB_IPZAN_WAIT_EXIT", 3*time.Second),
 		"手上没有可用出口时，首个请求最多等这么久让提取赶上（超时则本次直连）")
 	flag.Parse()
