@@ -866,9 +866,12 @@ function fulisheBase(ctx) {
   };
 }
 
-async function fulishePost(ctx, apiPath, bodyObj) {
+async function fulishePost(ctx, apiPath, bodyObj, postOpts) {
+  const opts = postOpts || {};
   const rawBody = Buffer.from(JSON.stringify(bodyObj), 'utf8');
-  const url = `${MEDIA_BASE}${apiPath}?${WEB_QUERY}`;
+  // 注意：个别接口（整点抢券的 limitTimeGrabInfo）不能带那串通用 query，
+  // 带了会被 media.meituan.com 的 openresty 直接 403；实测去掉 query 才是它认的形态。
+  const url = opts.noQuery ? `${MEDIA_BASE}${apiPath}` : `${MEDIA_BASE}${apiPath}?${WEB_QUERY}`;
   const headers = wallHeaders(ctx);
   headers['Content-Length'] = rawBody.length;
   const sig = await resolveSignature('POST', url, rawBody);
@@ -877,11 +880,23 @@ async function fulishePost(ctx, apiPath, bodyObj) {
   const r = await request('POST', sig.url || url, {
     body: rawBody, headers, timeout: REQUEST_TIMEOUT, proxy: true,
   });
+  const tag = opts.tag || apiPath.split('/').pop();
   if (DEBUG) {
-    $.log(`  [debug] B${apiPath.split('/').pop()}/原始响应: `
-      + `${r.json ? jsonPreview(r.json, 500) : (r.text || r.error || '-').slice(0, 500)}`);
+    $.log(`  [debug] ${tag}/原始响应: `
+      + `${r.json ? jsonPreview(r.json, 500) : (r.text || r.error || '-').slice(0, 300)}`);
   }
-  if (!r.json) return { ok: false, error: r.error || (r.text || '').slice(0, 200) || '响应非 JSON' };
+  if (!r.json) {
+    const text = String(r.text || '') + String(r.error || '');
+    // openresty 的 403 是 WAF 拦截（HTML 页面），跟业务错误不是一回事，要区分出来
+    if (/403 Forbidden|openresty/i.test(text)) {
+      return {
+        ok: false,
+        blocked: true,
+        error: `${tag} 被 openresty 拦截（403 WAF）——该接口对请求形态敏感，可稍后重试`,
+      };
+    }
+    return { ok: false, error: r.error || (r.text || '').slice(0, 200) || '响应非 JSON' };
+  }
   return { ok: true, json: r.json, signMode: sig.mode };
 }
 
@@ -984,8 +999,8 @@ async function fulisheGrant(ctx, cfg) {
  * 结果码：1 成功；8001 券抢完；8003 红包互斥；8000/8002 失败；8004 需刷新。
  */
 
-/** 拉场次信息；带 target 时是「切到指定场次」（H5 前端切 tab 也是这么干的） */
-async function grabInfo(ctx, target) {
+/** 单次拉场次（内部用） */
+async function grabInfoOnce(ctx, target) {
   const body = Object.assign(fulisheBase(ctx), {
     identityScene: GRAB_IDENTITY_SCENE,
     osType: 'Windows',
@@ -994,8 +1009,8 @@ async function grabInfo(ctx, target) {
     body.activityId = target.activityId;
     body.sessionCode = target.sessionCode;
   }
-  const r = await fulishePost(ctx, GRAB_INFO_PATH, body);
-  if (!r.ok) return { ok: false, error: r.error };
+  const r = await fulishePost(ctx, GRAB_INFO_PATH, body, { noQuery: true, tag: 'C/limitTimeGrabInfo' });
+  if (!r.ok) return { ok: false, error: r.error, blocked: !!r.blocked };
   const code = r.json.code;
   if (![0, 200, '0', '200'].includes(code)) {
     return {
@@ -1012,6 +1027,28 @@ async function grabInfo(ctx, target) {
   };
 }
 
+/**
+ * 拉场次（带退避重试）。
+ * 该接口的 WAF 是概率性拦截（同样请求有时 200 有时 403），所以退避重试是刚需。
+ */
+async function grabInfo(ctx, target, tries) {
+  const n = Math.max(1, tries || 3);
+  let last = { ok: false, error: '未执行' };
+  for (let i = 0; i < n; i += 1) {
+    if (i) {
+      const wait = 1200 * i;
+      $.log(`  ↻ 场次接口被拦，${wait}ms 后重试（第 ${i + 1}/${n} 次）`);
+      await sleep(wait);
+    }
+    const r = await grabInfoOnce(ctx, target);
+    if (r.ok) return r;
+    last = r;
+    // 非 WAF 拦截（比如 token 被拒）就没必要重试了
+    if (!r.blocked) break;
+  }
+  return last;
+}
+
 /** 抢一张券 */
 async function grabCoupon(ctx, p) {
   const body = Object.assign(fulisheBase(ctx), {
@@ -1026,7 +1063,7 @@ async function grabCoupon(ctx, p) {
     unpl: p.unpl || GRAB_UNPL,
     osType: 'Windows',
   });
-  const r = await fulishePost(ctx, GRAB_PATH, body);
+  const r = await fulishePost(ctx, GRAB_PATH, body, { noQuery: true, tag: 'C/limitTimeGrab' });
   if (!r.ok) return { ok: false, error: r.error };
   const code = r.json.code;
   if (![0, 200, '0', '200'].includes(code)) {
