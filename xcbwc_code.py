@@ -163,15 +163,20 @@ _print_lock = threading.Lock()
 
 
 def emit(*parts) -> None:
-    """所有日志的唯一出口：并发期间写进线程缓冲，由主线程按账号顺序整块输出"""
-    text = " ".join(str(p) for p in parts)
+    """所有日志的唯一出口：并发期间写进线程缓冲，由主线程按账号顺序整块输出。
+
+    多行文本会按行拆开（有的接口一次返回好几行，比如「奖励状态: …」，不拆的话
+    第二行会跑出账号的缩进/缓冲之外）。
+    """
+    lines = " ".join(str(p) for p in parts).split("\n")
     buf = getattr(_log_local, "buf", None)
     if buf is None:
         with _print_lock:
-            sys.stdout.write(text + "\n")
+            for line in lines:
+                sys.stdout.write(line + "\n")
             sys.stdout.flush()
         return
-    buf.append(text)
+    buf.extend(lines)
 
 
 def _take_block() -> List[str]:
@@ -1017,8 +1022,9 @@ def mode_run(state: Dict, accounts: List[Dict]) -> Tuple[int, int, List[str]]:
         api = Yuhua(cookie, city_code=str(entry.get("city_code") or 440304))
         api.get_silk()
         logs = api.run_all()
-        for line in logs:
-            emit("   " + line)
+        for line in logs:                       # 可能含多行结果，逐行加缩进
+            for sub in str(line).split("\n"):
+                emit("   " + sub)
         done = [l for l in logs if any(k in l for k in ("完成", "成功", "限一次", "已经领取"))]
         return (len(done) >= 3), f"{acc['remark']}：{len(done)} 项完成"
 
