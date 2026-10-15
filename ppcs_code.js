@@ -1,28 +1,17 @@
 /*
 Author: anonymous
 Date: 2026.08.21
-Adapted: YYB-Go-Enhanced edition
-Description: 朴朴超市签到code本（YYB-Go-Enhanced 适配版）
+Description: 朴朴超市签到（应用宝网关取 code）
 cron: 20 8,12,20 * * *
 new Env('朴朴超市Code版')
 ----------------------------------------------------------------------------------------------
-朴朴超市签到 code 本 v1.2.0 (YYB-Go-Enhanced 适配版)
-
-功能：自动执行朴朴超市小程序每日签到和互相助力任务，支持多账号执行。
-登录 code 通过 YYB-Go-Enhanced 的 /wxapp/getCode 获取，无需手动填 ck。
-
-本次完善（对齐 yyb_go 真实接口）：
-  1. 修正 getCode 响应解析：网关统一返回信封 {code,msg,data}，数据在 data.result.code
-  2. 识别网关 HTTP 语义：400 参数缺失 / 404 账号不存在 / 409 登录态过期 / 502 调用失败
-  3. 409 自动调用 /accounts/refresh 续期后重试一次
-  4. 502 / 网络错误自动重试，避免网关首次登录握手耗时被误判为失败
-  5. 支持只填网关地址（不带 @）自动拉取 /accounts 全部账号
-  6. 账号备注名取自网关 nickname/alias，日志带 [账号n/m] 前缀
-  7. 开跑前 /health 探活，网关挂掉直接跳过，不再每个账号干等超时
-  8. got 缺失时自动降级到 Node 内置 http/https，青龙裸环境也能跑
+功能：朴朴超市小程序每日签到 + 互相助力，支持多账号。
+登录 code 走应用宝网关 /wxapp/getCode，无需手填 ck。
+网关响应统一是信封 {code,msg,data}，code 在 data.result.code；
+400 参数缺失 / 404 账号不存在 / 409 登录态过期（自动续期后重试一次）/ 502 调用失败。
 
 配置说明：
-1. 微信 code 网关（YYB-Go-Enhanced）：
+1. 微信 code 网关（应用宝网关）：
    yyb_server                                      必填，网关地址（支持多条）
    - 多条之间用 &、英文逗号、中文逗号或换行分隔
    - 写法一：{网关地址}@{账号ref}      指定单个账号，ref 可为 账号ID / UIN / OpenID
@@ -411,11 +400,8 @@ class BaseRequest {
     if (!got) {
       let options = CommonUtils.copy(requestOptions);
       options.method = options?.method?.toUpperCase() || "GET";
-      // 关键：把全局默认头并进来。
-      // 登录后设置的 Authorization / pp-userid / open-id / pp-suid / pp-version /
-      // User-Agent 全都存在 this.defaultHeaders 里，而降级实现原先只看
-      // options.headers，导致所有需要鉴权的接口都返回 403「签名不存在」
-      //（pupuapi 的"签名"指的就是 Authorization 令牌）。
+      // 必须并进全局默认头：登录后的 Authorization / pp-userid / open-id 等都在
+      // this.defaultHeaders 里，只带 options.headers 会让鉴权接口 403「签名不存在」。
       options.headers = Object.assign({}, this.defaultHeaders, options.headers || {});
       let last = { statusCode: -1, headers: null, result: null };
       for (let i = 0; i < MAX_RETRY_COUNT; i++) {

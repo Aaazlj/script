@@ -1,6 +1,6 @@
 /*
 ------------------------------------------
-@Description: 噜皮生图 每日签到（青龙版，替代 image2api 容器的常驻签到）
+@Description: 噜皮生图 每日签到
 cron: 5 8 * * *
 new Env('噜皮生图签到')
 ------------------------------------------
@@ -8,9 +8,7 @@ new Env('噜皮生图签到')
   · 零外部依赖，只用 Node 内置 https
   · 签到接口只认「网页会话 Cookie」，个人 API Key 会被 401/403 拒绝
   · 多账号：lupi_cookie 每行一个
-  · 完整复刻 image2api/src/image2api/checkin.py 的核心流程：
-      GET  /api/me          查积分 / 连签天数 / 今日是否已签
-      未签则 POST /api/me/checkin   领取积分（已签会直接跳过）
+  · 流程：GET /api/me 查积分/连签/是否已签 → 未签则 POST /api/me/checkin（已签自动跳过）
 
 环境变量：
   lupi_cookie   必填。网页会话 Cookie，形如 chatgpt2api_session=xxxxx

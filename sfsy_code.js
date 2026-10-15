@@ -1,13 +1,12 @@
 /*
 ------------------------------------------
-@Description: 顺丰速运 全任务版（应用宝网关取 code + 日常积分 / 会员日 / 红包大派送 / 优惠券 / 中秋博饼集礼盒）
+@Description: 顺丰速运 全任务版（网关取 code + 积分 / 会员日 / 红包大派送 / 优惠券 / 集礼盒）
 cron: 20 8,12,20 * * *
 new Env('顺丰速运')
 ------------------------------------------
 设计说明：
-  · 零外部依赖：只用 Node 内置 https/http/net/tls/crypto/fs/path，
-    不再依赖 axios / ../tools/env.js / ./wcs.js（那几个文件仓库里并不存在，脚本原先根本加载不起来）
-  · 自带 Cookie Jar、重定向跟随、超时重试、CONNECT 隧道代理，可直接在青龙裸环境跑
+  · 零外部依赖：只用 Node 内置 https/http/net/tls/crypto/fs/path，青龙裸环境可直接跑
+  · 自带 Cookie Jar、重定向跟随、超时重试、CONNECT 隧道代理
 
 环境变量：
   sf_openid        顺丰账号（微信 openid），多账号用 & 、逗号 、或换行分隔，可加 #备注
@@ -20,9 +19,8 @@ new Env('顺丰速运')
                    在扫码面板「应用宝账号」页勾选即可，不用手填。
   yyb_tag_filter   默认 1（按标记过滤）。设 0 则忽略标记跑全部账号
                    —— 只影响「网关自动发现」；显式写了 sf_openid / @ref 时以你写的为准
-  ⚠️ 没有登录态缓存（已移除）：登录态只在本次运行内有效，每轮都重新走网关取 code。
-   实测跨天必然失效——两次运行间隔 9~11 小时，顺丰 Cookie 活不了那么久，
-   复用从未命中、只白费一次探测请求。
+  ⚠️ 登录态不做缓存：只在本次运行内有效，每轮重新走网关取 code
+   （两次运行间隔 9~11 小时，顺丰 Cookie 活不了那么久）。
 
   代理（可选，海外服务器访问国内接口必配）：
   sf_proxy          静态代理地址，形如 http://user:pass@host:port（也可用 script_proxy，与朴朴脚本共用）
@@ -1345,7 +1343,7 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
 
   LOG(`\n${prefix} 开始处理（${mask(account.openid || account.raw)}）`);
 
-  // 每个账号一个粘性出口（未开 sf_proxy_sticky 时就是原来的共享池）
+  // 每个账号一个粘性出口（未开 sf_proxy_sticky 时是共享池）
   const accountPool = proxyPool.forAccount(account, index);
   let login = await sfLogin(account, accountPool);
   // 登录被目标重置（TLS 断连 / 出口被 WAF 拉黑）时，换个出口重试——这是最常见的失败原因
