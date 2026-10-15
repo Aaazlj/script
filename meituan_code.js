@@ -2,29 +2,14 @@
 ------------------------------------------
 @Author: Aaa
 @Date: 2026.10.03
-@Description: 美团优惠券自动领取（合并版 · 只走应用宝网关登录）
+@Description: 美团优惠券自动领取（只走应用宝网关登录）
 cron: 0 10 * * *
 ------------------------------------------
-本脚本合并了原来的两个脚本：
-  · mt_code.py            —— 福利社动态 code 版（listActivityCoupon / grantActivityCoupon）
-  · meituan_coupon.js     —— 一键领券版（sendCouponWork）
-合并后：
-  · 账号与 token **只走应用宝网关**（微信 code → open.meituan.com/weapplogin），
-    不再需要美团 App 扫码、不再需要 MT_TOKEN / pt-passport 那一套；
-  · 一个账号会把**两条链路**都跑一遍，能领的券一起领；
-  · 零外部依赖，只用 Node 内置模块（http/https/net/tls/crypto/fs/path）。
-
-为什么可以合并（实测依据）：
-  网关换出来的 token 与扫码换出来的 token 格式不同（152 vs 174 字符），但都打同一个
-  域名族 media.meituan.com/fulishemini。拿网关联路的 token 打 sendCouponWork：
-  垃圾 token 得到 401「请重新登录」，而它得到 1014「发券失败」—— 档位不同，
-  说明它通过了鉴权。所以一条登录路可以同时喂两条领券链路。
-
-各条链路领不同的券（互不替代）：
-  A. sendCouponWork                    —— WorkBuddy 渠道券（数量多，几十张）
+功能：自动领取美团优惠券，三条链路都会跑一遍（各领各的券，互不替代）：
+  A. sendCouponWork                          —— WorkBuddy 渠道券（数量最多，几十张）
   B. listActivityCoupon + grantActivityCoupon —— 福利社红包墙券（外卖专享神券等）
-  C. limitTimeGrabInfo + limitTimeGrab —— 美团联盟「红包天天领」H5 的整点抢券
-                                          （满38-18 那类限量券），默认关闭，见 mt_claim_grab
+  C. limitTimeGrabInfo + limitTimeGrab       —— 美团联盟「红包天天领」整点抢券
+                                                （满38-18 那类限量券，默认关闭，见 mt_claim_grab）
 
 环境变量：
 1. 应用宝网关（必需，与朴朴/顺丰/撸批脚本共用同一个变量）：
@@ -1782,8 +1767,7 @@ function watchdog(ms, onFire) {
 }
 
 !(async () => {
-  // 保活：运行期间不让事件循环被抽空导致的静默退出
-  // （历史上踩过坑：兜底定时器 unref 之后，卡死时 Node 直接 beforeExit，日志戛然而止）
+  // 保活：撑住事件循环，别 unref —— unref 后一旦卡死，它来不及 fire，Node 会静默退出
   const keepAlive = setInterval(() => { /* 仅用于撑住事件循环 */ }, KEEPALIVE_MS);
 
   let exitCode = 0;
