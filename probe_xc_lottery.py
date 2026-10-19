@@ -3,6 +3,7 @@
 """临时探测：小蚕元宝抽奖（YbLottery）—— 验完即删"""
 import json
 import sys
+import time
 
 sys.path.insert(0, "/ql/data/repo/Aaazlj_script_master")
 import xcbwc_code as xc  # noqa: E402
@@ -39,8 +40,15 @@ task = task_js.get("data") if "data" in task_js else task_js.get("content")
 yb_point = (task or {}).get("yb_point")
 out(f"元宝余额: {yb_point}")
 
-lot_js = call("YbLotteryInfo")
-lot = lot_js.get("lottery_info") or {}
+lot_js, lot = {}, {}
+for attempt in range(4):                     # info 接口有节流，隔几秒重试
+    lot_js = call("YbLotteryInfo")
+    lot = lot_js.get("lottery_info") or {}
+    if lot.get("activity_id"):
+        out(f"info 第 {attempt + 1} 次拿到")
+        break
+    out(f"info 第 {attempt + 1} 次为空，等 6 秒重试")
+    time.sleep(6)
 out("抽奖信息: " + json.dumps(lot, ensure_ascii=False))
 cost = lot.get("cost") or 200
 aid = lot.get("activity_id")
