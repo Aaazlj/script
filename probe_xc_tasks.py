@@ -42,10 +42,16 @@ def call(service, method, extra=None):
 SERVICE, PREFIX = "ActivityTask", "ActivityTaskMobileService."
 out(f"\n== 用映射表里的真名：{SERVICE} / {PREFIX} ==")
 
-out(f"\n== 2) 元宝相关接口 ==")
-for m in ("WaitClaimedPoints", "GetUnReceivedPointRecords", "YbLotteryInfo", "CollectPoints",
-          "GetPointTaskAwardProgress", "UserTaskV2"):
-    code, msg, js = call(SERVICE, f"{PREFIX}{m}")
-    body = js.get("content") if "content" in js else js.get("data")
-    out(f"\n--- {m} → code={code} msg={str(msg)[:70]}")
-    out("    " + (json.dumps(body, ensure_ascii=False)[:700] if body is not None else "(无 content)"))
+out("\n== 2) 元宝/任务接口明细 ==")
+PROBES = [
+    ("GetDailyTask", {}),
+    ("GetUnReceivedPointRecords", {"page": 1}),
+    ("YbLotteryInfo", {}),
+    ("GetLotteryProgress", {}),
+    ("UserTaskV2", {}),
+    ("UserClaimPoints", {}),
+]
+for m, extra in PROBES:
+    code, msg, js = call(SERVICE, f"{PREFIX}{m}", extra)
+    out(f"\n--- {m}{extra if extra else ''} → code={code} msg={str(msg)[:80]}")
+    out("    " + json.dumps(js, ensure_ascii=False)[:900])
