@@ -36,6 +36,8 @@
   xc_withdraw_channel  withdraw 模式用：wx（默认）/ zfb
   xc_cumulative_steps  累计抽奖奖励领哪几档，默认 1（第 2 档要求抽奖次数更多，
                        实测每天都是「未达到抽奖次数」；想都试就填 1,2）
+  xc_yb_lottery        元宝抽奖，默认 1=开：花 200 抽一次，「参与元宝抽奖」任务返 200（净零，
+                       奖品是白赚的）。余额不足/接口节流/超时都不会重试，避免重复扣元宝。
   xc_daily_task_ids    日常福利里自动完成的任务 id，默认 57（抖音电商浏览，500 元宝/天）；
                        下单/邀请/入群/关注/晒图/兑换这类要真实操作的，脚本只报告不做
   QYWX_TOKEN / PLUSPLUS_TOKEN   推送（可选）
@@ -88,6 +90,10 @@ CUMULATIVE_STEPS = [x.strip() for x in (os.getenv("xc_cumulative_steps") or "1")
 # 日常福利里「能自动完成」的任务 id（逗号分隔）：57=抖音电商浏览(500元宝/天)
 # 其余任务（下单/邀请/入群/关注/晒图/兑换）需要真实操作，脚本只报告不做。
 DAILY_TASK_IDS = [x.strip() for x in (os.getenv("xc_daily_task_ids") or "57").split(",") if x.strip()]
+# 元宝抽奖：花 cost(默认200) 元宝抽一次，「参与元宝抽奖」任务返 200 → 净零，靠抽中的奖品赚。
+# 只抽 1 次（多抽纯亏）；余额不足、拿不到活动信息、请求超时都不重试（每次重试都要再扣 200）。
+YB_LOTTERY = (os.getenv("xc_yb_lottery") or "1") != "0"
+YB_LOTTERY_TIMES = max(1, int(os.getenv("xc_yb_lottery_times") or "1"))
 GATEWAY_TIMEOUT = 60
 
 QYWX_TOKEN = os.getenv("QYWX_TOKEN", "")
@@ -567,6 +573,7 @@ class Yuhua(BaseApiClient):
             time.sleep(random.uniform(2.0, 4.0))
         logs.append(self.receive_cumulative_reward())
         logs.append(self.daily_task_step())
+        logs.append(self.yb_lottery_step())
         return logs
 
     # ---------- 日常福利任务（任务中心 → 元宝） ----------
@@ -589,6 +596,70 @@ class Yuhua(BaseApiClient):
             return int(st.get("code") or 0), str(st.get("msg") or "")
         except Exception as exc:
             return -1, parse_error(exc)
+
+    def yb_lottery_info(self, retries: int = 3) -> Dict:
+        """抽奖活动信息（该接口有节流，返回空就等几秒再试）"""
+        for _ in range(retries):
+            js = self.call(self.TASK_SERVICE, f"{self.TASK_PREFIX}YbLotteryInfo",
+                           {"silk_id": int(self.teemo), "app_id": 20}).json()
+            info = js.get("lottery_info") or {}
+            if info.get("activity_id"):
+                return info
+            time.sleep(5)
+        return {}
+
+    def yb_point(self) -> int:
+        js = self.call(self.TASK_SERVICE, f"{self.TASK_PREFIX}UserTaskV2",
+                       {"silk_id": int(self.teemo), "app_id": 20}).json()
+        data = js.get("data") or js.get("content") or {}
+        return int(data.get("yb_point") or 0)
+
+    def yb_lottery_step(self) -> str:
+        """
+        元宝抽奖：花 cost 抽一次，「参与元宝抽奖」任务返 200 → 净零，奖品是白赚的。
+        防亏：余额不够不抽；请求超时**不重试**（重试要再扣一次）。
+        """
+        if not YB_LOTTERY:
+            return "元宝抽奖: 已关闭（xc_yb_lottery=0）"
+        info = self.yb_lottery_info()
+        if not info:
+            return "元宝抽奖: 拿不到活动信息（接口节流），跳过"
+        cost = int(info.get("cost") or 200)
+        balance = self.yb_point()
+        if balance < cost:
+            return f"元宝抽奖: 元宝不足（{balance} < {cost}/次），跳过"
+        logs = []
+        for i in range(YB_LOTTERY_TIMES):
+            try:
+                js = self.call(self.TASK_SERVICE, f"{self.TASK_PREFIX}YbLottery",
+                               {"silk_id": int(self.teemo), "activity_id": info["activity_id"],
+                                "box_id": info.get("box_id"), "app_id": 20}).json()
+            except Exception as exc:
+                logs.append(f"元宝抽奖: 请求超时（{parse_error(exc)}），结果未知、已扣 {cost}，不重试")
+                break
+            st = js.get("status") or {}
+            if st.get("code") != 0:
+                logs.append(f"元宝抽奖: 失败（{st.get('msg') or '无返回'}），已扣 {cost}")
+                break
+            prize = ""
+            for key in ("prize", "prize_info", "items"):
+                v = js.get(key)
+                if isinstance(v, dict):
+                    prize = str(v.get("name") or v.get("prize_name") or "")
+                elif isinstance(v, list) and v and isinstance(v[0], dict):
+                    prize = str(v[0].get("name") or v[0].get("prize_name") or "")
+                if prize:
+                    break
+            logs.append(f"元宝抽奖: 抽到[{prize or '未知奖品'}]（花 {cost}）")
+            # 抽完把「参与元宝抽奖」任务领掉，把 200 拿回来
+            code, msg = self.complete_task(46)
+            if code == 0:
+                logs.append("元宝抽奖: ✅ 已领回任务奖励 200")
+            elif "重复" in msg:
+                logs.append("元宝抽奖: 任务奖励已领过")
+            else:
+                logs.append(f"元宝抽奖: 任务奖励未领到（{msg}）")
+        return "\n".join(logs)
 
     def daily_task_step(self) -> str:
         """
