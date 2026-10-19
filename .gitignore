@@ -22,3 +22,9 @@ meituan-expert/
 # ai产物
 .workbuddy/
 
+# 淘宝闪购/饿了么逆向（本地工作用，未完成，不入库）
+elm_risk.js
+elmck.js
+elmck_code.js
+淘宝闪购*
+淘宝闪购-逆向工具/
