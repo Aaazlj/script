@@ -56,23 +56,12 @@ def raw_call(method, payload):
         return {"_error": xc.parse_error(exc)}
 
 
-KEY = {"GetDailyTask": "daily_task", "GetUnReceivedPointRecords": "point",
-       "UserClaimPoints": "point", "GetLotteryProgress": "progress"}
-
-PROBES = [
-    ("GetDailyTask", {"user_id": USER_ID}),
-    ("GetUnReceivedPointRecords", {"page": 1, "page_size": 20}),
-    ("GetLotteryProgress", {}),
-    ("UserClaimPoints", {}),
-]
-for m, extra in PROBES:
-    js = raw_call(m, extra)
-    st = js.get("status") or {}
-    out(f"\n--- {m} {extra} → code={st.get('code')} msg={st.get('msg')}")
-    if st.get("code") == 0:
-        keys = [k for k in js if k not in ("status",)]
-        out("    返回字段: " + ", ".join(keys))
-        for k in keys:
-            out(f"    {k}: " + json.dumps(js[k], ensure_ascii=False)[:800])
-    else:
-        out("    " + json.dumps(js, ensure_ascii=False)[:400])
+js = raw_call("GetDailyTask", {"user_id": USER_ID})
+data = js.get("data") or {}
+out(f"\n== 日常福利：{data.get('title')} / {data.get('sub_title')} ==")
+rows = data.get("list") or []
+out(f"共 {len(rows)} 个任务")
+out(f"{'id':>4} {'元宝':>6} {'状态':>4} {'上限':>4} {'动作':>4}  标题")
+for t in rows:
+    out(f"{t.get('id'):>4} {t.get('point'):>6} {str(t.get('completed')):>4} {str(t.get('limit_num')):>4} "
+        f"{str(t.get('action_type')):>4}  {t.get('title')}｜{t.get('sub_title')}｜btn={t.get('btn_text')}")
