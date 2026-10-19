@@ -40,18 +40,39 @@ def call(service, method, extra=None):
 
 
 SERVICE, PREFIX = "ActivityTask", "ActivityTaskMobileService."
-out(f"\n== 用映射表里的真名：{SERVICE} / {PREFIX} ==")
+USER_ID = int(api.vayne)          # 网关登录返回的 user_id
+out(f"\n== 探测（service={SERVICE}, user_id={USER_ID}, silk_id={api.teemo}）==")
 
-out("\n== 2) 元宝/任务接口明细 ==")
+
+def raw_call(method, payload):
+    """单次请求，不重试，避免探测被卡住"""
+    body = {"silk_id": int(api.teemo), "app_id": 20}
+    body.update(payload or {})
+    try:
+        headers = api._headers(SERVICE, f"{PREFIX}{method}")
+        r = xc.req("POST", xc.RPC_URL, headers=headers, json=body, max_retries=1)
+        return r.json()
+    except Exception as exc:
+        return {"_error": xc.parse_error(exc)}
+
+
+KEY = {"GetDailyTask": "daily_task", "GetUnReceivedPointRecords": "point",
+       "UserClaimPoints": "point", "GetLotteryProgress": "progress"}
+
 PROBES = [
-    ("GetDailyTask", {}),
-    ("GetUnReceivedPointRecords", {"page": 1}),
-    ("YbLotteryInfo", {}),
+    ("GetDailyTask", {"user_id": USER_ID}),
+    ("GetUnReceivedPointRecords", {"page": 1, "page_size": 20}),
     ("GetLotteryProgress", {}),
-    ("UserTaskV2", {}),
     ("UserClaimPoints", {}),
 ]
 for m, extra in PROBES:
-    code, msg, js = call(SERVICE, f"{PREFIX}{m}", extra)
-    out(f"\n--- {m}{extra if extra else ''} → code={code} msg={str(msg)[:80]}")
-    out("    " + json.dumps(js, ensure_ascii=False)[:900])
+    js = raw_call(m, extra)
+    st = js.get("status") or {}
+    out(f"\n--- {m} {extra} → code={st.get('code')} msg={st.get('msg')}")
+    if st.get("code") == 0:
+        keys = [k for k in js if k not in ("status",)]
+        out("    返回字段: " + ", ".join(keys))
+        for k in keys:
+            out(f"    {k}: " + json.dumps(js[k], ensure_ascii=False)[:800])
+    else:
+        out("    " + json.dumps(js, ensure_ascii=False)[:400])
