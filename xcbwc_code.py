@@ -34,6 +34,10 @@
   xc_city/xc_lat/xc_lng   抢单定位；不填用账号记录过的位置，再退到深圳
   xc_monitor_stores 监控店铺，如 mt:123456,elm:234567（平台 mt/elm/jd）
   xc_withdraw_channel  withdraw 模式用：wx（默认）/ zfb
+  xc_cumulative_steps  累计抽奖奖励领哪几档，默认 1（第 2 档要求抽奖次数更多，
+                       实测每天都是「未达到抽奖次数」；想都试就填 1,2）
+  xc_daily_task_ids    日常福利里自动完成的任务 id，默认 57（抖音电商浏览，500 元宝/天）；
+                       下单/邀请/入群/关注/晒图/兑换这类要真实操作的，脚本只报告不做
   QYWX_TOKEN / PLUSPLUS_TOKEN   推送（可选）
 
 执行方式
@@ -78,6 +82,12 @@ MANUAL_COOKIES = os.getenv("xc_cookie") or os.getenv("XC_COOKIE") or ""
 PROXY_URL = (os.getenv("xc_proxy") or os.getenv("ppcs_proxy") or os.getenv("sf_proxy") or "").strip()
 PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 CONCURRENCY = max(1, int(os.getenv("xc_concurrency") or "1"))
+# 累计抽奖奖励：只领第 1 档（第 2 档要求更多抽奖次数，实测每天都「未达到抽奖次数」）。
+# 想两档都试：xc_cumulative_steps=1,2
+CUMULATIVE_STEPS = [x.strip() for x in (os.getenv("xc_cumulative_steps") or "1").split(",") if x.strip()]
+# 日常福利里「能自动完成」的任务 id（逗号分隔）：57=抖音电商浏览(500元宝/天)
+# 其余任务（下单/邀请/入群/关注/晒图/兑换）需要真实操作，脚本只报告不做。
+DAILY_TASK_IDS = [x.strip() for x in (os.getenv("xc_daily_task_ids") or "57").split(",") if x.strip()]
 GATEWAY_TIMEOUT = 60
 
 QYWX_TOKEN = os.getenv("QYWX_TOKEN", "")
@@ -506,7 +516,7 @@ class Yuhua(BaseApiClient):
 
     def receive_cumulative_reward(self) -> str:
         logs = []
-        for stp in (1, 2):
+        for stp in CUMULATIVE_STEPS:
             time.sleep(random.uniform(2.0, 3.0))
             try:
                 resp = self.call("SilkwormLottery", "SilkwormLotteryMobile.ReceiveExtraLottery",
@@ -514,7 +524,11 @@ class Yuhua(BaseApiClient):
                 if resp["status"]["code"] == 0:
                     logs.append(f"奖励状态: 领取奖励[{stp}]成功, 获得[{resp['prize']['name']}]")
                 else:
-                    logs.append(f"奖励状态: 领取奖励[{stp}]失败, {resp['status']['msg']}")
+                    msg = str(resp["status"].get("msg") or "")
+                    if "未达到" in msg or "不在领取范围" in msg:
+                        logs.append(f"奖励状态: 领取奖励[{stp}]跳过（{msg}）")
+                    else:
+                        logs.append(f"奖励状态: 领取奖励[{stp}]失败, {msg}")
             except Exception as exc:
                 logs.append(f"奖励状态: 领取奖励[{stp}]异常: {parse_error(exc)}")
         return "\n".join(logs)
@@ -552,7 +566,65 @@ class Yuhua(BaseApiClient):
                 break
             time.sleep(random.uniform(2.0, 4.0))
         logs.append(self.receive_cumulative_reward())
+        logs.append(self.daily_task_step())
         return logs
+
+    # ---------- 日常福利任务（任务中心 → 元宝） ----------
+    TASK_SERVICE = "ActivityTask"
+    TASK_PREFIX = "ActivityTaskMobileService."
+
+    def daily_tasks(self) -> Dict:
+        """拉日常福利任务列表（需要 user_id，不是 silk_id）"""
+        payload = {"silk_id": int(self.teemo), "user_id": int(self.vayne), "app_id": 20}
+        js = self.call(self.TASK_SERVICE, f"{self.TASK_PREFIX}GetDailyTask", payload).json()
+        if js.get("status", {}).get("code") != 0:
+            raise RuntimeError(js.get("status", {}).get("msg") or "拉日常任务失败")
+        return js.get("data") or {}
+
+    def complete_task(self, task_id) -> Tuple[int, str]:
+        payload = {"silk_id": int(self.teemo), "task_id": int(task_id), "app_id": 20}
+        try:
+            js = self.call(self.TASK_SERVICE, f"{self.TASK_PREFIX}CompleteTask", payload).json()
+            st = js.get("status") or {}
+            return int(st.get("code") or 0), str(st.get("msg") or "")
+        except Exception as exc:
+            return -1, parse_error(exc)
+
+    def daily_task_step(self) -> str:
+        """
+        日常福利：自动完成能自动做的任务（默认只有「抖音电商浏览」），
+        其余（下单/邀请/入群/关注/晒图/兑换）需要真实操作，只报告不尝试。
+        """
+        try:
+            data = self.daily_tasks()
+        except Exception as exc:
+            return f"日常福利: 拉取失败 {parse_error(exc)}"
+        tasks = data.get("list") or []
+        auto = {}
+        manual = []
+        for t in tasks:
+            done = t.get("completed") == 1            # 1=今天已完成，2=待做
+            line = f"{t.get('title')}({t.get('point')})"
+            if done:
+                auto.setdefault("done", []).append(line)
+            elif str(t.get("id")) in DAILY_TASK_IDS:
+                auto.setdefault("todo", []).append(t)
+            else:
+                manual.append(line)
+        logs = []
+        for t in auto.get("todo", []):
+            code, msg = self.complete_task(t["id"])
+            if code == 0:
+                logs.append(f"日常福利: ✅ {t['title']} +{t['point']} 元宝")
+            elif "重复" in msg:
+                logs.append(f"日常福利: {t['title']} 已完成")
+            else:
+                logs.append(f"日常福利: {t['title']} 未完成（{msg}）")
+        if auto.get("done"):
+            logs.append("日常福利: 已完成 " + "、".join(auto["done"][:6]))
+        if manual:
+            logs.append("日常福利: 需真实操作跳过 → " + "、".join(manual[:6]))
+        return "\n".join(logs) if logs else "日常福利: 没有可做任务"
 
     def get_all_cards(self) -> str:
         time.sleep(random.uniform(1.0, 1.5))
