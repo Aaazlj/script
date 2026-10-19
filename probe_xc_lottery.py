@@ -50,8 +50,21 @@ if yb_point is None or int(yb_point) < int(cost):
     out(f"元宝不足（{yb_point} < {cost}），不抽")
     sys.exit(0)
 
-# 2) 只打印 info 原始响应与余额，先不抽
-out("\n== YbLotteryInfo 原始响应 ==")
-out("  " + json.dumps(lot_js, ensure_ascii=False)[:700])
-out("\n== UserTaskV2 原始响应 ==")
-out("  " + json.dumps(task_js, ensure_ascii=False)[:700])
+# 2) 用 info 里的真实 id 抽一次
+if not lot.get("activity_id"):
+    out("info 没有 activity_id，跳过（不抽，避免白扣元宝）")
+    sys.exit(0)
+aid, bid, cost = lot["activity_id"], lot["box_id"], lot.get("cost", 200)
+out(f"\n== 抽一次：activity_id={aid} box_id={bid} cost={cost}（抽前余额 {yb_point}）==")
+js = call("YbLottery", {"activity_id": aid, "box_id": bid})
+st = js.get("status") or {}
+out(f"  code={st.get('code')} msg={st.get('msg')} verify_method={js.get('verify_method')}")
+out("  返回: " + json.dumps(js, ensure_ascii=False)[:800])
+
+after = call("UserTaskV2")
+t2 = after.get("data") if "data" in after else after.get("content")
+out(f"\n抽后余额: {(t2 or {}).get('yb_point')}")
+daily = call("GetDailyTask", {"user_id": int(api.vayne)})
+for t in ((daily.get("data") or {}).get("list") or []):
+    if t.get("id") == 46:
+        out(f"  任务46 参与元宝抽奖 状态={t['completed']}（1=已完成 2=待做）")
