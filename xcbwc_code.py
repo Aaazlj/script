@@ -636,11 +636,12 @@ class Yuhua(BaseApiClient):
                                {"silk_id": int(self.teemo), "activity_id": info["activity_id"],
                                 "box_id": info.get("box_id"), "app_id": 20}).json()
             except Exception as exc:
-                logs.append(f"元宝抽奖: 请求超时（{parse_error(exc)}），结果未知、已扣 {cost}，不重试")
+                logs.append(f"元宝抽奖: 请求超时（{parse_error(exc)}），结果未知，不重试（以余额为准）")
                 break
             st = js.get("status") or {}
             if st.get("code") != 0:
-                logs.append(f"元宝抽奖: 失败（{st.get('msg') or '无返回'}），已扣 {cost}")
+                # 实测 20004「服务内部错误」并不会扣元宝，别吓唬人
+                logs.append(f"元宝抽奖: 失败（{st.get('msg') or '无返回'}），未扣费")
                 break
             prize = ""
             for key in ("prize", "prize_info", "items"):
