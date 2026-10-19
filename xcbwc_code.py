@@ -36,8 +36,8 @@
   xc_withdraw_channel  withdraw 模式用：wx（默认）/ zfb
   xc_cumulative_steps  累计抽奖奖励领哪几档，默认 1（第 2 档要求抽奖次数更多，
                        实测每天都是「未达到抽奖次数」；想都试就填 1,2）
-  xc_yb_lottery        元宝抽奖，默认 1=开：花 200 抽一次，「参与元宝抽奖」任务返 200（净零，
-                       奖品是白赚的）。余额不足/接口节流/超时都不会重试，避免重复扣元宝。
+  xc_yb_lottery        元宝抽奖，**默认 0=关**：该接口只传 activity_id/box_id 会报「服务内部错误」
+                       但仍扣 200 元宝（缺 App 端验证 token），摸清参数前别开。
   xc_daily_task_ids    日常福利里自动完成的任务 id，默认 57（抖音电商浏览，500 元宝/天）；
                        下单/邀请/入群/关注/晒图/兑换这类要真实操作的，脚本只报告不做
   QYWX_TOKEN / PLUSPLUS_TOKEN   推送（可选）
@@ -90,9 +90,10 @@ CUMULATIVE_STEPS = [x.strip() for x in (os.getenv("xc_cumulative_steps") or "1")
 # 日常福利里「能自动完成」的任务 id（逗号分隔）：57=抖音电商浏览(500元宝/天)
 # 其余任务（下单/邀请/入群/关注/晒图/兑换）需要真实操作，脚本只报告不做。
 DAILY_TASK_IDS = [x.strip() for x in (os.getenv("xc_daily_task_ids") or "57").split(",") if x.strip()]
-# 元宝抽奖：花 cost(默认200) 元宝抽一次，「参与元宝抽奖」任务返 200 → 净零，靠抽中的奖品赚。
-# 只抽 1 次（多抽纯亏）；余额不足、拿不到活动信息、请求超时都不重试（每次重试都要再扣 200）。
-YB_LOTTERY = (os.getenv("xc_yb_lottery") or "1") != "0"
+# 元宝抽奖：⚠️ 默认关闭。实测 YbLottery 只传 activity_id/box_id 会返回「服务内部错误」，
+# 但元宝照扣 200（疑似还需要 App 端的验证 token，抓不到）。在摸清参数前别开：每次失败都白扣 200。
+# 想继续试：xc_yb_lottery=1
+YB_LOTTERY = (os.getenv("xc_yb_lottery") or "0") != "0"
 YB_LOTTERY_TIMES = max(1, int(os.getenv("xc_yb_lottery_times") or "1"))
 GATEWAY_TIMEOUT = 60
 
