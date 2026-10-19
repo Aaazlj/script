@@ -88,7 +88,7 @@ const PUBLIC_ID = 'gh_f9d9fca26a50';
 const PAGE_VERSION = '663';
 // 会员日活动用的 app 级 token（不是账号凭据）。为免硬编码进公开仓库，改从环境变量读：
 // 青龙里设 sfsy_token 即可；不设则跳过会员日相关任务。
-const TOKEN = ENV('sfsy_token') || '';
+const TOKEN = String(process.env.sfsy_token || '').trim();   // ENV() 定义在后面，这里直接读 process.env
 const SYS_CODE = 'MCS-MIMP-CORE';
 const UCMP_BASE = 'https://ucmp.sf-express.com';
 const MCS_BASE = 'https://mcs-mimp-web.sf-express.com';
