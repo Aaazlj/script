@@ -248,11 +248,11 @@ func TestDialTCPFallsBackToDirect(t *testing.T) {
 
 func TestParseExtractBody(t *testing.T) {
 	// 品赞默认的纯文本：ip:port 账号 密码
-	e, err := parseExtractBody([]byte("218.95.39.53:10174 THET0AUNQ0O REDACTED"))
+	e, err := parseExtractBody([]byte("218.95.39.53:10174 TESTACCOUNT test-password"))
 	if err != nil {
 		t.Fatalf("纯文本解析失败: %v", err)
 	}
-	if e.IP != "218.95.39.53" || e.Port != "10174" || e.Account != "THET0AUNQ0O" || e.Password != "REDACTED" {
+	if e.IP != "218.95.39.53" || e.Port != "10174" || e.Account != "TESTACCOUNT" || e.Password != "test-password" {
 		t.Fatalf("纯文本解析结果不对: %+v", e)
 	}
 

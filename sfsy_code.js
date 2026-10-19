@@ -86,7 +86,9 @@ const VLOG = (msg) => { if (VERBOSE) $.log(msg); };
 const APPID = 'wxd4185d00bf7e08ac';
 const PUBLIC_ID = 'gh_f9d9fca26a50';
 const PAGE_VERSION = '663';
-const TOKEN = 'REDACTED';
+// 会员日活动用的 app 级 token（不是账号凭据）。为免硬编码进公开仓库，改从环境变量读：
+// 青龙里设 sfsy_token 即可；不设则跳过会员日相关任务。
+const TOKEN = ENV('sfsy_token') || '';
 const SYS_CODE = 'MCS-MIMP-CORE';
 const UCMP_BASE = 'https://ucmp.sf-express.com';
 const MCS_BASE = 'https://mcs-mimp-web.sf-express.com';
@@ -1531,6 +1533,12 @@ function tagAllows(acc) {
 /* ==================== 主流程 ==================== */
 
 async function main() {
+  if (!TOKEN) {
+    LOG('❌ 缺少环境变量 sfsy_token（顺丰业务接口签名必需）');
+    LOG('   青龙里加一条 sfsy_token=你的值 即可；这个值是 app 级常量，不在仓库里硬编码了。');
+    $.done();
+    return;
+  }
   let accounts = loadAccounts();
   if (!accounts.length && YYB_SERVER) {
     accounts = await discoverGatewayAccounts();
