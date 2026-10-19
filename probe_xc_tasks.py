@@ -56,12 +56,20 @@ def raw_call(method, payload):
         return {"_error": xc.parse_error(exc)}
 
 
+out("\n== 试 CompleteTask 字段名（任务 57 抖音浏览 500 分）==")
+for payload in ({"task_id": 57}, {"id": 57}, {"taskId": 57}, {"task_id": 57, "source": 1}):
+    js = raw_call("CompleteTask", payload)
+    st = js.get("status") or {}
+    out(f"  {payload} → code={st.get('code')} msg={str(st.get('msg'))[:80]}")
+    if st.get("code") == 0:
+        out("    ✅ 返回: " + json.dumps(js, ensure_ascii=False)[:400])
+        break
+
+out("\n== CollectPoints 完整响应 ==")
+out("  " + json.dumps(raw_call("CollectPoints", {}), ensure_ascii=False)[:500])
+
+out("\n== 任务 57 之后的状态 ==")
 js = raw_call("GetDailyTask", {"user_id": USER_ID})
-data = js.get("data") or {}
-out(f"\n== 日常福利：{data.get('title')} / {data.get('sub_title')} ==")
-rows = data.get("list") or []
-out(f"共 {len(rows)} 个任务")
-out(f"{'id':>4} {'元宝':>6} {'状态':>4} {'上限':>4} {'动作':>4}  标题")
-for t in rows:
-    out(f"{t.get('id'):>4} {t.get('point'):>6} {str(t.get('completed')):>4} {str(t.get('limit_num')):>4} "
-        f"{str(t.get('action_type')):>4}  {t.get('title')}｜{t.get('sub_title')}｜btn={t.get('btn_text')}")
+for t in ((js.get("data") or {}).get("list") or []):
+    if t.get("id") in (57, 1, 46):
+        out(f"  id={t['id']} {t['title']} 状态={t['completed']} 元宝={t['point']}")
