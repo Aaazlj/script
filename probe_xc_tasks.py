@@ -39,30 +39,13 @@ def call(service, method, extra=None):
         return "ERR", xc.parse_error(exc), {}
 
 
-out("\n== 1) 找 task 服务的命名 ==")
-prefix, service = None, "SilkwormTask"
-for p in ("SilkwormTaskMobile", "TaskService", "SilkwormTaskService", "SilkwormTask"):
-    code, msg, js = call("SilkwormTask", f"{p}.GetDailyTask")
-    out(f"   SilkwormTask/{p} → code={code} msg={str(msg)[:70]}")
-    if code == 0:
-        prefix = p
-        out("   ↳ 命中：" + json.dumps(js, ensure_ascii=False)[:600])
-        break
-if not prefix:
-    for svc in ("SilkwormTaskCenter", "SilkwormTaskServer"):
-        code, msg, js = call(svc, "TaskService.GetDailyTask")
-        out(f"   {svc}/TaskService → code={code} msg={str(msg)[:70]}")
-        if code == 0:
-            prefix, service = "TaskService", svc
-            out("   ↳ 命中：" + json.dumps(js, ensure_ascii=False)[:600])
-            break
-if not prefix:
-    sys.exit("没找到 task 服务命名")
+SERVICE, PREFIX = "ActivityTask", "ActivityTaskMobileService."
+out(f"\n== 用映射表里的真名：{SERVICE} / {PREFIX} ==")
 
-out(f"\n== 2) 元宝相关接口（service={service}, prefix={prefix}）==")
+out(f"\n== 2) 元宝相关接口 ==")
 for m in ("WaitClaimedPoints", "GetUnReceivedPointRecords", "YbLotteryInfo", "CollectPoints",
           "GetPointTaskAwardProgress", "UserTaskV2"):
-    code, msg, js = call(service, f"{prefix}.{m}")
+    code, msg, js = call(SERVICE, f"{PREFIX}{m}")
     body = js.get("content") if "content" in js else js.get("data")
     out(f"\n--- {m} → code={code} msg={str(msg)[:70]}")
     out("    " + (json.dumps(body, ensure_ascii=False)[:700] if body is not None else "(无 content)"))
