@@ -130,6 +130,7 @@ const TAG_FILTER = (env('yyb_tag_filter') || '1').toLowerCase() !== '0';
 const DATA_DIR = process.env.QL_DIR ? path.join(process.env.QL_DIR, 'data') : path.join(__dirname, 'data');
 const STATE_FILE = env('mt_grab_state_file') || path.join(DATA_DIR, 'mt_grab_state.json');
 const LOGIN_CACHE_FILE = env('mt_grab_login_cache') || path.join(DATA_DIR, 'mt_grab_login_cache.json');
+const MAIN_LOGIN_CACHE = path.join(DATA_DIR, 'mt_login_cache.json');
 
 if (!GATEWAY) {
   $.log('❌ [配置] 缺少 yyb_server（应用宝网关地址），脚本未执行');
@@ -318,8 +319,20 @@ async function loginByCode(code) {
 /* ============ 登录态缓存 ============ */
 
 function readLoginCache() {
-  try { return JSON.parse(fs.readFileSync(LOGIN_CACHE_FILE, 'utf8')).accounts || {}; }
-  catch (_) { return {}; }
+  try {
+    const mine = JSON.parse(fs.readFileSync(LOGIN_CACHE_FILE, 'utf8')).accounts || {};
+    if (Object.keys(mine).length) return mine;
+  } catch (_) { /* 自己还没写过 */ }
+  // 首次运行：继承主脚本的登录态。否则要现场给每个号取 code（一个号就好几秒，
+  // 开场前 1 分钟根本来不及），而且网关经常先回 409 再续期，更慢。
+  try {
+    const main = JSON.parse(fs.readFileSync(MAIN_LOGIN_CACHE, 'utf8')).accounts || {};
+    if (Object.keys(main).length) {
+      $.log(`🔐 [登录] 继承 meituan_code.js 的 ${Object.keys(main).length} 个登录态`);
+      return Object.assign({}, main);
+    }
+  } catch (_) { /* 主脚本缓存也没有 */ }
+  return {};
 }
 function writeLoginCache(accounts) {
   try {
@@ -388,8 +401,10 @@ async function setCronSchedule(schedule) {
     return false;
   }
   const list = await qlApi('GET', `/open/crons?searchValue=${encodeURIComponent(CRON_NAME)}`);
-  const tasks = (list && list.data) || [];
-  const task = tasks.find((t) => t && t.name === CRON_NAME);
+  // 青龙 /open/crons 返回的是分页对象 {data:[...], total:n}，不是裸数组
+  const arr = Array.isArray(list && list.data) ? list.data
+    : ((list && list.data && Array.isArray(list.data.data)) ? list.data.data : []);
+  const task = arr.find((t) => t && t.name === CRON_NAME);
   if (!task) {
     $.log(`⚠️ [调度] 青龙里没找到名为「${CRON_NAME}」的任务（可用 mt_grab_cron_name 指定）`);
     return false;
