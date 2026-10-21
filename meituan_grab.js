@@ -10,17 +10,17 @@ cron: 0 9 * * *
   在同一秒并发下单才有意义。放在 meituan_code.js 里会按账号串行，实测只有
   排第一个的号能抢到，第二个号拉场次时券已经光了。
 
-工作方式（同一个脚本，按当前时间自动分两种模式）：
-  ① 探测模式（每天 9:00 由 cron 触发）
+工作方式：**两个任务**，职责分开（关键：探测任务的 9 点永远不动）
+  ①「美团整点抢券」cron 0 9 * * * —— `task meituan_grab.js probe`
      只用【1 个号】拉一次场次（场次是活动级的，所有号看到的一样；
-     实测未登录拿不到，会 401 passport，所以必须带一个号的 token）
-     → 有场次：把【本任务】的 cron 改到「开场前 1 分钟」，退出
-     → 无场次：把 cron 保持/改回 0 9 * * *，退出
-  ② 抢券模式（开场前 1 分钟被 cron 叫醒）
-     这时才把全部账号拉起来 → 各自拉 grabToken → 等到开场前 LEAD_MS
+     实测未登录拿不到，会 401 passport，所以必须带一个号的 token）。
+     有场次 → 把【执行任务】的 cron 改到「开场前 1 分钟」；没场次 → 执行任务置休眠。
+     **它自己的时间谁都不许改**：这样即使执行任务那边出任何岔子，
+     第二天 9 点照样会探测，不会「断了链条」。
+  ②「美团整点抢券-执行」cron 0 0 1 1 *（休眠）—— `task meituan_grab.js grab`
+     被叫醒后：把全部账号拉起来 → 各自拉 grabToken → 等到开场前 LEAD_MS
      → 全账号【并发】抢（串行只有第一个号能抢到）
-     → 写当日状态 → 若还有后续场次且仍有号没抢到，改到下一场前 1 分钟；
-       否则改回 0 9 * * *（明天继续探测）
+     → 写当日状态 → 抢完把自己置为休眠（或下一场前 1 分钟，如果还有号没抢到）。
 
 风控注意：探测只打 1 次请求；抢券阶段每号只有「拉 token（最多几次短轮询）+ 抢 1 次」，
 不做无意义的重试；白天不会常驻轮询。
@@ -30,7 +30,8 @@ cron: 0 9 * * *
   ql_url                青龙地址，默认 http://127.0.0.1:5700
   ql_client_id          青龙应用 client_id（要 envs/crons 权限），改 cron 必需
   ql_client_secret      青龙应用 client_secret
-  mt_grab_cron_name     本任务在青龙里的名字，默认「美团整点抢券」
+  mt_grab_cron_name     探测任务在青龙里的名字，默认「美团整点抢券」（脚本不改它）
+  mt_grab_exec_cron_name 执行任务名，默认「美团整点抢券-执行」（脚本改它的时间）
   mt_grab_lead_ms       开场前多少毫秒开抢，默认 300
   mt_grab_enter_sec     距开场多少秒内算「抢券模式」，默认 90
   mt_sign_url           美团签名服务，默认 http://panel:5180/api/meituan/sign
@@ -119,9 +120,22 @@ const GATEWAY = (() => {
 const QL_URL = (env('ql_url') || 'http://127.0.0.1:5700').replace(/\/+$/, '');
 const QL_CLIENT_ID = env('ql_client_id');
 const QL_CLIENT_SECRET = env('ql_client_secret');
-const CRON_NAME = env('mt_grab_cron_name') || '美团整点抢券';
 
-const START_CRON = '0 9 * * *';
+/*
+ * 两个任务，职责分开（关键：探测任务的 9 点永远不动，改时间只改执行任务）
+ *   ① 「美团整点抢券」      cron 0 9 * * *      跑 `task meituan_grab.js probe`
+ *      —— 只探测场次，有场次就把【执行任务】的时间改到开场前 1 分钟。
+ *         它自己的时间谁都不许改，这样即便执行任务那边出任何岔子，
+ *         第二天 9 点照样会探测，不会「断了链条」。
+ *   ② 「美团整点抢券-执行」 cron 0 0 1 1 *（休眠）  跑 `task meituan_grab.js grab`
+ *      —— 被叫醒后抢券，抢完把自己改回休眠（或下一场前 1 分钟）。
+ */
+const CRON_NAME = env('mt_grab_cron_name') || '美团整点抢券';
+const EXEC_CRON_NAME = env('mt_grab_exec_cron_name') || '美团整点抢券-执行';
+const IDLE_CRON = '0 0 1 1 *';
+const MODE = (process.argv[2] || '').toLowerCase();   // probe | grab
+
+// 探测任务在青龙里固定 0 9 * * *，脚本永远不改它（断了链条第二天就不跑了）
 const LEAD_MS = Math.max(0, Number(env('mt_grab_lead_ms') || 300));
 const ENTER_SEC = Math.max(10, Number(env('mt_grab_enter_sec') || 90));
 const SIGN_URL = (env('mt_sign_url', 'MT_SIGN_URL')
@@ -399,23 +413,23 @@ async function qlApi(method, apiPath, body) {
   return r.json || null;
 }
 
-/** 把本任务的 cron 改成 schedule；成功返回 true */
-async function setCronSchedule(schedule) {
+/** 把指定任务的 cron 改成 schedule；成功返回 true */
+async function setCronSchedule(name, schedule) {
   if (!QL_CLIENT_ID || !QL_CLIENT_SECRET) {
     $.log('⚠️ [调度] 未配置 ql_client_id / ql_client_secret，无法自动改任务时间');
     return false;
   }
-  const list = await qlApi('GET', `/open/crons?searchValue=${encodeURIComponent(CRON_NAME)}`);
+  const list = await qlApi('GET', `/open/crons?searchValue=${encodeURIComponent(name)}`);
   // 青龙 /open/crons 返回的是分页对象 {data:[...], total:n}，不是裸数组
   const arr = Array.isArray(list && list.data) ? list.data
     : ((list && list.data && Array.isArray(list.data.data)) ? list.data.data : []);
-  const task = arr.find((t) => t && t.name === CRON_NAME);
+  const task = arr.find((t) => t && t.name === name);
   if (!task) {
-    $.log(`⚠️ [调度] 青龙里没找到名为「${CRON_NAME}」的任务（可用 mt_grab_cron_name 指定）`);
+    $.log(`⚠️ [调度] 青龙里没找到名为「${name}」的任务`);
     return false;
   }
   if (task.schedule === schedule) {
-    $.log(`  ℹ️ [调度] 任务时间已经是 ${schedule}，不用改`);
+    $.log(`  ℹ️ [调度] 「${name}」的时间已经是 ${schedule}，不用改`);
     return true;
   }
   const detail = await qlApi('GET', `/open/crons/${task.id}`);
@@ -434,7 +448,7 @@ async function setCronSchedule(schedule) {
   };
   const r = await qlApi('PUT', '/open/crons', body);
   if (r && r.code === 200) {
-    $.log(`  ✅ [调度] 任务「${CRON_NAME}」时间已改为 ${schedule}`);
+    $.log(`  ✅ [调度] 「${name}」时间已改为 ${schedule}`);
     return true;
   }
   $.log(`  ✖ [调度] 改任务时间失败：${jsonPreview(r, 200)}`);
@@ -735,8 +749,8 @@ async function main() {
   const nowMs = Date.now();
   const sessions = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
   if (!sessions.length) {
-    $.log('ℹ️ 今天没有整点场次');
-    await setCronSchedule(START_CRON);
+    $.log('ℹ️ 今天没有整点场次，把执行任务置为休眠');
+    await setCronSchedule(EXEC_CRON_NAME, IDLE_CRON);
     return;
   }
   $.log('🕐 场次：' + sessions.map((s) =>
@@ -747,21 +761,22 @@ async function main() {
   const alive = sessions.filter((s) => s.status !== 2 && s.startMs)
     .sort((a, b) => a.startMs - b.startMs);
   if (!alive.length) {
-    $.log('ℹ️ 今天的场次都结束了');
-    await setCronSchedule(START_CRON);
+    $.log('ℹ️ 今天的场次都结束了，把执行任务置为休眠');
+    await setCronSchedule(EXEC_CRON_NAME, IDLE_CRON);
     return;
   }
   const target = alive[0];
   const untilStart = target.startMs - nowMs;
 
-  // 5) 判断模式
-  if (untilStart > ENTER_SEC * 1000) {
-    // 探测模式：把任务改到开场前 1 分钟
+  // 5) 探测任务（probe）永远不抢，只负责调执行任务的时间；
+  //    grab 模式如果发现离得还远（误触发），也按探测处理
+  if (MODE !== 'grab' || untilStart > ENTER_SEC * 1000) {
     const cron = cronForSession(target.startMs);
     const mins = Math.round(untilStart / 60000);
-    $.log(`🧭 探测模式：最近场次 ${new Date(target.startMs).toTimeString().slice(0, 5)}`
-      + `（约 ${mins} 分钟后），把任务改到 ${cron}`);
-    await setCronSchedule(cron);
+    $.log(`🧭 只探测（mode=${MODE || '未指定'}）：最近场次 `
+      + `${new Date(target.startMs).toTimeString().slice(0, 5)}（约 ${mins} 分钟后）`
+      + `，把执行任务「${EXEC_CRON_NAME}」改到 ${cron}`);
+    await setCronSchedule(EXEC_CRON_NAME, cron);
     return;
   }
 
@@ -875,12 +890,12 @@ async function main() {
   await planNext(state, sessions, Date.now(), ready.length);
 }
 
-/** 决定下一次触发时间 */
-async function planNext(state, sessions, nowMs, totalAccounts, justGot = 0) {
+/** 决定执行任务下一次什么时候被唤醒 */
+async function planNext(state, sessions, nowMs, totalAccounts) {
   const doneCount = Object.keys(state.accounts).length;
   if (doneCount >= totalAccounts) {
-    $.log(`🔁 今天 ${doneCount} 个号都已抢到，任务改回 ${START_CRON}`);
-    await setCronSchedule(START_CRON);
+    $.log(`🔁 今天 ${doneCount} 个号都已抢到，执行任务置为休眠（探测任务照常 9 点跑）`);
+    await setCronSchedule(EXEC_CRON_NAME, IDLE_CRON);
     return;
   }
   const next = sessions.filter((s) => s.status !== 2 && s.startMs > nowMs)
@@ -888,12 +903,12 @@ async function planNext(state, sessions, nowMs, totalAccounts, justGot = 0) {
   if (next) {
     const cron = cronForSession(next.startMs);
     $.log(`🔁 还有 ${totalAccounts - doneCount} 个号没抢到，下一场 `
-      + `${new Date(next.startMs).toTimeString().slice(0, 5)}，任务改到 ${cron}`);
-    await setCronSchedule(cron);
+      + `${new Date(next.startMs).toTimeString().slice(0, 5)}，执行任务改到 ${cron}`);
+    await setCronSchedule(EXEC_CRON_NAME, cron);
     return;
   }
-  $.log(`🔁 今天没有后续场次了，任务改回 ${START_CRON}`);
-  await setCronSchedule(START_CRON);
+  $.log('🔁 今天没有后续场次了，执行任务置为休眠');
+  await setCronSchedule(EXEC_CRON_NAME, IDLE_CRON);
 }
 
 // 兜底：整体 10 分钟还没跑完就收尾，别把青龙任务挂住
