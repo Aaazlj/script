@@ -5,11 +5,13 @@
 @Description: 美团优惠券自动领取（只走应用宝网关登录）
 cron: 0 10 * * *
 ------------------------------------------
-功能：自动领取美团优惠券，三条链路都会跑一遍（各领各的券，互不替代）：
+功能：自动领取美团优惠券，两条链路都会跑一遍（各领各的券，互不替代）：
   A. sendCouponWork                          —— WorkBuddy 渠道券（数量最多，几十张）
   B. listActivityCoupon + grantActivityCoupon —— 福利社红包墙券（外卖专享神券等）
-  C. limitTimeGrabInfo + limitTimeGrab       —— 美团联盟「红包天天领」整点抢券
-                                                （满38-18 那类限量券，默认关闭，见 mt_claim_grab）
+
+整点抢券（limitTimeGrab）已拆到独立脚本 **meituan_grab.js**：
+它必须所有账号【并发】才有意义，留在本脚本里会被逐账号串行拖死
+（2026-10-21 实测：只有排第一个的号抢到，后面的号拉场次时券已经光了）。
 
 环境变量：
 1. 应用宝网关（必需，与朴朴/顺丰/撸批脚本共用同一个变量）：
@@ -51,14 +53,7 @@ cron: 0 10 * * *
 4. 领取开关（可选，默认两条都开）：
    mt_claim_work                                   设 0 则不跑链路 A（sendCouponWork）
    mt_claim_fulishe                                设 0 则不跑链路 B（福利社红包墙）
-   mt_claim_grab                                   默认 0（关闭）。设 1 才跑链路 C：整点抢券。
-                                                   ⚠️ 限量秒杀，会按场次等待开场后立刻打接口，
-                                                   单账号耗时可能顶到 mt_account_timeout，
-                                                   抢券期间建议把它调到 300 以上
-   mt_grab_wait                                    链路 C 最多等多久开场（秒），默认 120。
-                                                   场次距现在超过这个值就不等、直接跳过
-   mt_grab_lead_ms                                 链路 C 提前量（毫秒），默认 300（即开场前 0.3s 开抢）
-   MT_GRAB_UNPL                                    链路 C 的 unpl 字段，一般不用改
+   （整点抢券及其 mt_grab_* 变量已移到独立脚本 meituan_grab.js）
 
 5. 其它（可选）：
    MT_AI_SCENE                                     接口 aiScene 渠道标识，默认官方渠道值
@@ -133,27 +128,6 @@ const MEDIA_BASE = 'https://media.meituan.com';
 const WORK_PATH = '/fulishemini/couponActivity/sendCouponWork';
 const LIST_PATH = '/fulishemini/couponActivity/listActivityCoupon';
 const GRANT_PATH = '/fulishemini/couponActivity/grantActivityCoupon';
-
-/* ---- 链路 C：整点抢券（美团联盟「红包天天领」H5 / distribution-center）
-   页面入口 https://mtunion.meituan.com/fx/center（SSR，title=美团红包天天领），
-   抢券接口却在 media.meituan.com，与链路 B 同域同 token，故直接复用 fulishePost。*/
-const GRAB_INFO_PATH = '/fulishemini/couponActivity/limitTimeGrabInfo';
-const GRAB_PATH = '/fulishemini/couponActivity/limitTimeGrab';
-// 分销场地身份（03-lib 里 DISTRIBUTION_VENUE：identity=4、scene=13）
-const GRAB_IDENTITY_SCENE = { sendCouponIdentity: 4, sendCouponScene: 13 };
-const GRAB_MODULE_ID = 'b_waimai_jayhgcnt_mv';   // 页面埋点用的 moduleId，原样带上
-const GRAB_UNPL = env('MT_GRAB_UNPL')
-  || 'v1_4AHi-LokTshbKe0CTLVFiRfpi2gcMVypu2V3bcBL-lxh8gsU0RWoDhMxZHRdAilG';
-// subCode → 人话
-const GRAB_SUBCODE = {
-  1: '抢券成功！',
-  8000: '抢券失败，稍后重试',
-  8001: '来晚了，券抢完了',
-  8002: '抢券失败，稍后重试',
-  8003: '红包互斥（请到美团App-我的红包卡券查看）',
-  8004: '抢券失败，请刷新页面后重试',
-};
-const GRAB_STATUS_TEXT = { 0: '进行中', 1: '未开始', 2: '已结束' };
 
 const WEB_QUERY = 'yodaReady=wx&csecappid=wx0b42a347aafbe0d0&csecplatform=3'
   + '&csecversionname=1.47.0&csecversion=1.3.0';
@@ -234,10 +208,6 @@ const AI_SCENE = env('MT_AI_SCENE') || DEFAULT_AI_SCENE;
 const MAX_COUPONS = Number(env('MT_MAX_COUPONS') || 8) || 8;
 const CLAIM_WORK = (env('mt_claim_work') || '1') !== '0';
 const CLAIM_FULISHE = (env('mt_claim_fulishe') || '1') !== '0';
-// 链路 C（整点抢券）默认关闭：整点场次是限量秒杀，建议确认参数无误后再开
-const CLAIM_GRAB = (env('mt_claim_grab') || '0') !== '0';
-const GRAB_WAIT_MAX = Math.max(0, Number(env('mt_grab_wait') || 120)) * 1000;   // 最多等多久开场
-const GRAB_LEAD_MS = Math.max(0, Number(env('mt_grab_lead_ms') || 300));        // 提前多少毫秒开抢
 const DEBUG = process.env.MT_DEBUG === '1';
 
 const CACHE_FILE = process.env.MT_CACHE_FILE
@@ -975,290 +945,6 @@ async function fulisheGrant(ctx, cfg) {
   };
 }
 
-/* ============ 链路 C：整点抢券（limitTimeGrabInfo + limitTimeGrab） ============ */
-/*
- * 流程（与 H5 前端 distribution-center 逐字对齐）：
- *   ① limitTimeGrabInfo  → 拿场次列表 + 当前场次每张券的 grabToken
- *   ② 若选中场次还没开始 → 等到开场（-300ms），再拉一次 info 拿新鲜 grabToken
- *   ③ limitTimeGrab      → 带 activityId/sessionCode/grabToken/rightCode 抢
- * 结果码：1 成功；8001 券抢完；8003 红包互斥；8000/8002 失败；8004 需刷新。
- */
-
-/** 单次拉场次（内部用） */
-async function grabInfoOnce(ctx, target) {
-  const body = Object.assign(fulisheBase(ctx), {
-    identityScene: GRAB_IDENTITY_SCENE,
-    osType: 'Windows',
-  });
-  if (target && target.activityId && target.sessionCode) {
-    body.activityId = target.activityId;
-    body.sessionCode = target.sessionCode;
-  }
-  const r = await fulishePost(ctx, GRAB_INFO_PATH, body, { noQuery: true, tag: 'C/limitTimeGrabInfo' });
-  if (!r.ok) return { ok: false, error: r.error, blocked: !!r.blocked };
-  const code = r.json.code;
-  if (![0, 200, '0', '200'].includes(code)) {
-    return {
-      ok: false,
-      error: `抢券场次获取失败 code=${code} ${r.json.message || r.json.msg || jsonPreview(r.json)}`,
-    };
-  }
-  const data = r.json.data || {};
-  return {
-    ok: true,
-    currentTime: Number(data.currentTime || 0),
-    activityList: Array.isArray(data.activityList) ? data.activityList : [],
-    raw: r.json,
-  };
-}
-
-/**
- * 拉场次（带退避重试）。
- * 该接口的 WAF 是概率性拦截（同样请求有时 200 有时 403），所以退避重试是刚需。
- */
-async function grabInfo(ctx, target, tries) {
-  const n = Math.max(1, tries || 3);
-  let last = { ok: false, error: '未执行' };
-  for (let i = 0; i < n; i += 1) {
-    if (i) {
-      const wait = 1200 * i;
-      $.log(`  ↻ 场次接口被拦，${wait}ms 后重试（第 ${i + 1}/${n} 次）`);
-      await sleep(wait);
-    }
-    const r = await grabInfoOnce(ctx, target);
-    if (r.ok) return r;
-    last = r;
-    // 非 WAF 拦截（比如 token 被拒）就没必要重试了
-    if (!r.blocked) break;
-  }
-  return last;
-}
-
-/** 抢一张券 */
-async function grabCoupon(ctx, p) {
-  const body = Object.assign(fulisheBase(ctx), {
-    identityScene: GRAB_IDENTITY_SCENE,
-    activityId: p.activityId,
-    sessionCode: p.sessionCode,
-    grabToken: p.grabToken,
-    rightCode: p.rightCode,
-    pageId: p.pageId || '',
-    moduleId: GRAB_MODULE_ID,
-    sessionId: p.sessionId || '',
-    unpl: p.unpl || GRAB_UNPL,
-    osType: 'Windows',
-  });
-  const r = await fulishePost(ctx, GRAB_PATH, body, { noQuery: true, tag: 'C/limitTimeGrab' });
-  if (!r.ok) return { ok: false, error: r.error };
-  const code = r.json.code;
-  if (![0, 200, '0', '200'].includes(code)) {
-    return {
-      ok: false,
-      error: `抢券请求失败 code=${code} ${r.json.message || r.json.msg || jsonPreview(r.json)}`,
-    };
-  }
-  const data = r.json.data || {};
-  const subCode = data.subCode;
-  return {
-    ok: true,
-    subCode,
-    couponInfo: data.couponInfo || null,
-    text: GRAB_SUBCODE[subCode] || `未知结果 subCode=${subCode}`,
-  };
-}
-
-/** 时间字段 → 毫秒时间戳：支持 毫秒/秒 数字，以及 "10:00:00" 这种当天时刻 */
-function toMs(v) {
-  if (v == null || v === '') return 0;
-  const n = Number(v);
-  if (Number.isFinite(n) && n > 1e12) return n;            // 毫秒
-  if (Number.isFinite(n) && n > 1e9) return n * 1000;      // 秒
-  const m = typeof v === 'string' ? v.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/) : null;
-  if (m) {
-    const d = new Date();
-    d.setHours(Number(m[1]), Number(m[2]), Number(m[3] || 0), 0);
-    return d.getTime();
-  }
-  return 0;
-}
-
-/*
- * 实测返回样例（2026-10-14 抓包）：
- *   activityList[].sessionList[]  : { sessionCode, startTime:"10:00:00", endTime:"10:59:59" }
- *   activityList[].currentSession : { sessionCode, startTimestamp:1791946800000,
- *                                     endTimestamp, grabToken, rightList:[{rightCode,status}] }
- * 注意两点：① 场次上没有 status 字段，只能按时间推；
- *          ② grabToken 挂在【场次】上，不是每张券上，同一场次的券共用一个 token。
- */
-const sessionStartMs = (s) => toMs(s.startTimestamp) || toMs(s.startTime)
-  || toMs(s.beginTimestamp) || toMs(s.beginTime) || toMs(s.sessionStartTime);
-const sessionEndMs = (s) => toMs(s.endTimestamp) || toMs(s.endTime)
-  || toMs(s.finishTimestamp) || toMs(s.sessionOverTime);
-
-/** 场次状态：0 进行中 / 1 未开始 / 2 已结束（接口不给 status 时按时间推） */
-function sessionStatus(s, nowMs) {
-  const raw = s.status != null ? s.status : s.sessionStatus;
-  if (raw != null && Number.isFinite(Number(raw))) return Number(raw);
-  const now = nowMs || Date.now();
-  const st = sessionStartMs(s);
-  const et = sessionEndMs(s);
-  if (!st && !et) return 2;      // 时间都没有 → 当已结束，别去抢
-  if (st && now < st) return 1;
-  if (et && now > et) return 2;
-  return 0;
-}
-
-/** 把 info 响应摊平成 [{activityId, sessionCode, status, startMs, endMs, grabToken, rights}] */
-function flattenSessions(activityList, nowMs) {
-  const out = [];
-  for (const act of activityList) {
-    if (!act) continue;
-    const byCode = new Map();
-    for (const s of (Array.isArray(act.sessionList) ? act.sessionList : [])) {
-      if (s && s.sessionCode != null) byCode.set(s.sessionCode, Object.assign({}, s));
-    }
-    // currentSession 才有 rightList/grabToken，但没有 startTime 字符串 —— 合并补齐
-    const cur = act.currentSession;
-    if (cur && cur.sessionCode != null) {
-      byCode.set(cur.sessionCode, Object.assign({}, byCode.get(cur.sessionCode) || {}, cur));
-    }
-    for (const s of byCode.values()) {
-      out.push({
-        activityId: act.activityId,
-        sessionCode: s.sessionCode,
-        status: sessionStatus(s, nowMs),
-        startMs: sessionStartMs(s),
-        endMs: sessionEndMs(s),
-        grabToken: s.grabToken || '',
-        rights: Array.isArray(s.rightList) ? s.rightList : [],
-      });
-    }
-  }
-  return out;
-}
-
-/** 选出该抢的场次：优先进行中，其次最近一个未开场的 */
-function pickGrabSession(sessions) {
-  const live = sessions.filter((s) => s.status === 0);
-  if (live.length) return live[0];
-  const upcoming = sessions.filter((s) => s.status === 1 && s.startMs > 0)
-    .sort((a, b) => a.startMs - b.startMs);
-  return upcoming[0] || null;
-}
-
-/** 券能不能抢：有 rightCode 且状态为「可领」(2=AVAILABLE；字段缺失时放行，让服务端裁决) */
-function grabbable(rights) {
-  return (rights || []).filter((r) => r && r.rightCode
-    && (r.status == null || Number(r.status) === 2));
-}
-
-const fmtClock = (ms) => new Date(ms).toTimeString().slice(0, 8);
-
-/**
- * 链路 C 主流程。返回 { sections, step, coupons, authFail }
- */
-async function runGrabChain(ctx) {
-  $.log('━ [C] 整点抢券（红包天天领 H5）');
-  const sections = [];
-  let authFail = false;
-
-  const first = await grabInfo(ctx);
-  if (!first.ok) {
-    if (looksLikeAuthError(first.error)) authFail = true;
-    $.log(`  ✖ ${first.error}`);
-    return { sections: [`[C] 整点抢券：✖ ${first.error}`], step: first.error, coupons: 0, authFail };
-  }
-  const sessions = flattenSessions(first.activityList, first.currentTime || Date.now());
-  if (!sessions.length) {
-    $.log('  ℹ️ 当前没有整点抢券场次（接口里 activityList 为空）');
-    return { sections: ['[C] 整点抢券：ℹ️ 无场次'], step: '无场次', coupons: 0, authFail };
-  }
-  $.log(`  🕐 场次共 ${sessions.length} 个：` + sessions.map((s) =>
-    `${s.sessionCode}[${GRAB_STATUS_TEXT[s.status] || s.status}`
-    + `${s.startMs ? ' ' + fmtClock(s.startMs).slice(0, 5) : ''}]`).join('、'));
-
-  let target = pickGrabSession(sessions);
-  if (!target) {
-    $.log('  ℹ️ 没有进行中或未开场的场次，跳过');
-    return { sections: ['[C] 整点抢券：ℹ️ 本场次已结束'], step: '已结束', coupons: 0, authFail };
-  }
-
-  // 还没开场 → 等到点；等太久就不等（避免拖垮整只脚本）
-  if (target.status === 1 && target.startMs > 0) {
-    const now = first.currentTime || Date.now();
-    const wait = target.startMs - GRAB_LEAD_MS - now;
-    if (wait > GRAB_WAIT_MAX) {
-      const mins = Math.round(wait / 60000);
-      const tip = `场次 ${target.sessionCode} 还有约 ${mins} 分钟开场，超过 mt_grab_wait(${GRAB_WAIT_MAX / 1000}s) 上限，本次不等待`;
-      $.log(`  ℹ️ ${tip}`);
-      return { sections: [`[C] 整点抢券：ℹ️ ${tip}`], step: '未等待', coupons: 0, authFail };
-    }
-    if (wait > 0) {
-      $.log(`  ⏳ 等待开场：${fmtClock(target.startMs)}（${(wait / 1000).toFixed(2)}s 后开抢，提前 ${GRAB_LEAD_MS}ms）`);
-      await sleep(wait);
-    }
-    // 开场瞬间重新拉一次，拿最新 grabToken（首发 token 往往是开场后才下发）
-    const fresh = await grabInfo(ctx, target);
-    if (!fresh.ok) {
-      if (looksLikeAuthError(fresh.error)) authFail = true;
-      $.log(`  ✖ 开场后拉取失败：${fresh.error}`);
-      return { sections: [`[C] 整点抢券：✖ ${fresh.error}`], step: fresh.error, coupons: 0, authFail };
-    }
-    const refreshed = flattenSessions(fresh.activityList, fresh.currentTime || Date.now())
-      .find((s) => s.sessionCode === target.sessionCode && s.activityId === target.activityId);
-    if (refreshed) target = refreshed;
-  }
-
-  const rights = grabbable(target.rights);
-  if (!rights.length) {
-    const tip = `场次 ${target.sessionCode} 里没有可抢的券（可能未发放或已抢完）`;
-    $.log(`  ℹ️ ${tip}`);
-    return { sections: [`[C] 整点抢券：ℹ️ ${tip}`], step: '无可抢券', coupons: 0, authFail };
-  }
-  // grabToken 是【场次级】的（不是每张券一个），而且开场后才下发
-  const grabToken = target.grabToken || '';
-  if (!grabToken) {
-    const tip = `场次 ${target.sessionCode} 未下发 grabToken（通常开场后才有），本次跳过`;
-    $.log(`  ℹ️ ${tip}`);
-    return { sections: [`[C] 整点抢券：ℹ️ ${tip}`], step: '无grabToken', coupons: 0, authFail };
-  }
-
-  $.log(`  🎯 目标场次 ${target.sessionCode}，可抢券 ${rights.length} 张，开始抢`);
-  let got = 0;
-  const lines = [];
-  for (const right of rights) {
-    const label = right.rightCode;
-    const r = await grabCoupon(ctx, {
-      activityId: target.activityId,
-      sessionCode: target.sessionCode,
-      grabToken,
-      rightCode: right.rightCode,
-      unpl: GRAB_UNPL,
-    });
-    if (!r.ok) {
-      if (looksLikeAuthError(r.error)) authFail = true;
-      $.log(`     ✖ ${label}：${r.error}`);
-      lines.push(`${label}：✖ ${r.error}`);
-    } else if (r.subCode === 1) {
-      got += 1;
-      const info = r.couponInfo || {};
-      const name = info.couponName || info.name || label;
-      const val = info.couponValue != null ? `（${(Number(info.couponValue) / 100).toFixed(0)}元）` : '';
-      $.log(`     ✅ ${name}${val}：${r.text}`);
-      lines.push(`${name}${val}：✅ ${r.text}`);
-    } else {
-      $.log(`     ⚠️ ${label}：${r.text}`);
-      lines.push(`${label}：⚠️ ${r.text}`);
-      // 券抢完就没必要继续打后面的了（同场次库存共享）
-      if (r.subCode === 8001) break;
-    }
-  }
-
-  const head = `[C] 整点抢券（场次 ${target.sessionCode}）：${got ? `✅ 抢到 ${got} 张` : 'ℹ️ 没抢到'}`;
-  sections.push(`${head}\n  ${lines.join('\n  ') || '（无券可抢）'}`);
-  return { sections, step: got ? `抢到 ${got} 张` : '未抢到', coupons: got, authFail };
-}
-
 /* ============ 券展示 ============ */
 
 const TAB_ORDER = ['外卖', '美食团购', '美团闪购', '休闲娱乐', '生活服务', '丽人医疗', '更多福利'];
@@ -1646,18 +1332,6 @@ async function runChains(ctx, cache, step) {
     }
   }
 
-  /* ---- 链路 C：整点抢券（红包天天领 H5） ---- */
-  if (CLAIM_GRAB) {
-    const grab = await runGrabChain(ctx);
-    if (grab.authFail) authFail = true;
-    if (grab.sections && grab.sections.length) sections.push(...grab.sections);
-    if (grab.coupons > 0) {
-      result.coupons += grab.coupons;
-      result.ok = true;
-    }
-    step.C = grab.step;
-  }
-
   return { sections, result, authFail };
 }
 
@@ -1680,8 +1354,7 @@ async function runAccount(index, total, account, cache, loginCache) {
   const step = {};
   const needA = CLAIM_WORK && !cache.work;
   const needB = CLAIM_FULISHE && !cache.fulishe;
-  // 链路 C 不做当日缓存（整点场次一天多场，每次都要现抢），所以它开着就一定要登录
-  const needLogin = needA || needB || CLAIM_GRAB;
+  const needLogin = needA || needB;
 
   let ctx = null;
   let fromCache = false;
@@ -1737,7 +1410,6 @@ async function runAccount(index, total, account, cache, loginCache) {
     Object.assign(cache, JSON.parse(cacheSnapshot));
     delete step.A;
     delete step.B;
-    delete step.C;
     const fresh = await freshLogin('本地登录态被服务端拒绝');
     if (!fresh.ok) {
       $.log(`  ✖ 回退登录也失败：${fresh.error}`);
@@ -1808,8 +1480,7 @@ function watchdog(ms, onFire) {
 
     logTitle(accounts.length);
     $.log(`📋 领取范围：${CLAIM_WORK ? 'A=WorkBuddy 渠道券' : 'A=关闭'}`
-      + ` ｜ ${CLAIM_FULISHE ? 'B=福利社红包墙' : 'B=关闭'}`
-      + ` ｜ ${CLAIM_GRAB ? 'C=整点抢券' : 'C=关闭'}`);
+      + ` ｜ ${CLAIM_FULISHE ? 'B=福利社红包墙' : 'B=关闭'}`);
 
     const cacheAll = readCacheAll();
     const loginCache = readLoginCacheAll();

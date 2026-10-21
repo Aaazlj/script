@@ -1,0 +1,899 @@
+/*
+------------------------------------------
+@Author: Aaa
+@Date: 2026.10.21
+@Description: 美团「红包天天领」整点抢券（全账号并发）
+cron: 0 9 * * *
+------------------------------------------
+为什么单独拆一个脚本：
+  整点场次的券是限量的（如周三外卖节 18 元券全国 2 万张），必须所有账号
+  在同一秒并发下单才有意义。放在 meituan_code.js 里会按账号串行，实测只有
+  排第一个的号能抢到，第二个号拉场次时券已经光了。
+
+工作方式（同一个脚本，按当前时间自动分两种模式）：
+  ① 探测模式（每天 9:00 由 cron 触发）
+     登录 → 并发拉场次 → 找到今天最近的未结束场次
+     → 有场次：把【本任务】的 cron 改到「开场前 1 分钟」，退出
+     → 无场次：把 cron 保持/改回 0 9 * * *，退出
+  ② 抢券模式（开场前 1 分钟被 cron 叫醒）
+     登录 + 并发拉 grabToken → 等到开场前 LEAD_MS → 全账号【并发】抢
+     → 写当日状态 → 若还有后续场次且仍有号没抢到，改到下一场前 1 分钟；
+       否则改回 0 9 * * *（明天继续探测）
+
+环境变量：
+  yyb_server            应用宝网关地址（与其它脚本共用），必需
+  ql_url                青龙地址，默认 http://127.0.0.1:5700
+  ql_client_id          青龙应用 client_id（要 envs/crons 权限），改 cron 必需
+  ql_client_secret      青龙应用 client_secret
+  mt_grab_cron_name     本任务在青龙里的名字，默认「美团整点抢券」
+  mt_grab_lead_ms       开场前多少毫秒开抢，默认 300
+  mt_grab_enter_sec     距开场多少秒内算「抢券模式」，默认 90
+  mt_sign_url           美团签名服务，默认 http://panel:5180/api/meituan/sign
+  mt_grab_state_file    当日状态文件，默认 $QL_DIR/data/mt_grab_state.json
+  mt_grab_login_cache   登录态缓存，默认 $QL_DIR/data/mt_grab_login_cache.json
+  mt_openid             可选，只跑指定账号（同 meituan_code.js 的写法）
+  MT_DEBUG              设 1 打印原始响应
+------------------------------------------
+*/
+
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+/* ============ 常量 ============ */
+
+const APPID = 'wxde8ac0a21135c07d';
+const MT_APP_NAME = 'group';
+const OPEN_BASE = 'https://open.meituan.com';
+const WECHAT_LOGIN_URL = `${OPEN_BASE}/user/v1/weapplogin`;
+const MEDIA_BASE = 'https://media.meituan.com';
+const GRAB_INFO_PATH = '/fulishemini/couponActivity/limitTimeGrabInfo';
+const GRAB_PATH = '/fulishemini/couponActivity/limitTimeGrab';
+// 分销场地身份（H5 distribution-center 里 DISTRIBUTION_VENUE：identity=4、scene=13）
+const IDENTITY_SCENE = { sendCouponIdentity: 4, sendCouponScene: 13 };
+const MODULE_ID = 'b_waimai_jayhgcnt_mv';
+const UNPL = 'v1_4AHi-LokTshbKe0CTLVFiRfpi2gcMVypu2V3bcBL-lxh8gsU0RWoDhMxZHRdAilG';
+
+const SUBCODE_TEXT = {
+  1: '抢券成功！',
+  8000: '抢券失败，稍后重试',
+  8001: '来晚了，券抢完了',
+  8002: '抢券失败，稍后重试',
+  8003: '红包互斥（去美团App-我的红包卡券看）',
+  8004: '抢券失败，请刷新页面后重试',
+};
+const STATUS_TEXT = { 0: '进行中', 1: '未开始', 2: '已结束' };
+
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 '
+  + 'MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI '
+  + 'MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) '
+  + 'UnifiedPCWindowsWechat(0xf2541c37) XWEB/25364';
+
+const REQUEST_TIMEOUT = 20000;
+
+/* ============ 运行环境 ============ */
+
+const IN_QINGLONG = typeof Env === 'function';
+
+const $ = (() => {
+  if (IN_QINGLONG) {
+    try {
+      // 青龙靠扫描 Env 构造参数里的字符串字面量取任务名，必须写字面量
+      return new Env('美团整点抢券');
+    } catch (_) { /* 降级到本地实现 */ }
+  }
+  return {
+    log: (...a) => console.log(...a),
+    msg: null,
+    done: () => {},
+    getdata: () => '',
+    setdata: () => {},
+  };
+})();
+
+function env(...names) {
+  for (const n of names) {
+    const v = (process.env[n] || '').trim();
+    if (v) return v;
+  }
+  return '';
+}
+
+const GATEWAY = (() => {
+  const raw = env('yyb_server', 'wx_server_url');
+  const at = raw.lastIndexOf('@');
+  let base = at > 0 ? raw.slice(0, at) : raw;
+  base = base.replace(/\/+$/, '');
+  if (base && !/:\/\//.test(base)) base = 'http://' + base;
+  return base;
+})();
+
+const QL_URL = (env('ql_url') || 'http://127.0.0.1:5700').replace(/\/+$/, '');
+const QL_CLIENT_ID = env('ql_client_id');
+const QL_CLIENT_SECRET = env('ql_client_secret');
+const CRON_NAME = env('mt_grab_cron_name') || '美团整点抢券';
+
+const START_CRON = '0 9 * * *';
+const LEAD_MS = Math.max(0, Number(env('mt_grab_lead_ms') || 300));
+const ENTER_SEC = Math.max(10, Number(env('mt_grab_enter_sec') || 90));
+const SIGN_URL = (env('mt_sign_url', 'MT_SIGN_URL')
+  || (process.env.QL_DIR ? 'http://panel:5180/api/meituan/sign' : '')).replace(/\/+$/, '');
+const DEBUG = process.env.MT_DEBUG === '1';
+const MT_OPENIDS = env('mt_openid').split(/[&,，\s]+/).map((s) => s.trim()).filter(Boolean);
+// 账号的 scripts 标记：默认和 meituan_code.js 共用 'mt'，面板勾一次两个脚本都认
+const SCRIPT_KEY = (env('yyb_script_key') || 'mt').toLowerCase();
+const TAG_FILTER = (env('yyb_tag_filter') || '1').toLowerCase() !== '0';
+
+const DATA_DIR = process.env.QL_DIR ? path.join(process.env.QL_DIR, 'data') : path.join(__dirname, 'data');
+const STATE_FILE = env('mt_grab_state_file') || path.join(DATA_DIR, 'mt_grab_state.json');
+const LOGIN_CACHE_FILE = env('mt_grab_login_cache') || path.join(DATA_DIR, 'mt_grab_login_cache.json');
+
+if (!GATEWAY) {
+  $.log('❌ [配置] 缺少 yyb_server（应用宝网关地址），脚本未执行');
+  $.done();
+  process.exit(1);
+}
+
+/* ============ 工具 ============ */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const nowText = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+const mask = (s, h = 6, t = 6) => {
+  s = String(s || '');
+  return s.length <= h + t ? s : `${s.slice(0, h)}****${s.slice(-t)}`;
+};
+const jsonPreview = (o, n = 300) => {
+  try { return JSON.stringify(o).slice(0, n); } catch (_) { return String(o).slice(0, n); }
+};
+const tokenKey = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 12);
+
+/* ============ HTTP ============ */
+
+function request(method, url, opts = {}) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(url); } catch (e) { return resolve({ status: 0, error: 'bad url', text: '' }); }
+    const isHttps = u.protocol === 'https:';
+    const mod = isHttps ? https : http;
+
+    const headers = Object.assign({}, opts.headers || {});
+    const hasCT = () => Object.keys(headers).some((k) => k.toLowerCase() === 'content-type');
+    let payload = null;
+    if (opts.json != null) {
+      payload = Buffer.from(JSON.stringify(opts.json), 'utf8');
+      if (!hasCT()) headers['Content-Type'] = 'application/json';
+    } else if (opts.form != null) {
+      payload = Buffer.from(new URLSearchParams(opts.form).toString(), 'utf8');
+      if (!hasCT()) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    } else if (opts.body != null) {
+      payload = Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(opts.body, 'utf8');
+      if (!hasCT()) headers['Content-Type'] = 'application/json';
+    }
+    if (payload) headers['Content-Length'] = payload.length;
+
+    const req = mod.request({
+      method,
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search,
+      headers,
+      timeout: opts.timeout || REQUEST_TIMEOUT,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch (_) { /* 非 JSON（比如 403 的 HTML） */ }
+        resolve({ status: res.statusCode, text, json });
+      });
+    });
+    req.on('error', (e) => resolve({ status: 0, error: e.message, text: '' }));
+    req.on('timeout', () => { req.destroy(); resolve({ status: 0, error: 'TIMEOUT', text: '' }); });
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+/* ============ 美团签名（panel 的 cliguard） ============ */
+
+async function resolveSignature(method, rawUrl, bodyBuf) {
+  if (!SIGN_URL) return { url: rawUrl, headers: {} };
+  const bodyHash = bodyBuf
+    ? crypto.createHash('md5').update(bodyBuf.slice(0, 16200)).digest('hex') : '';
+  const data = JSON.stringify({ method, url: rawUrl, bodyHash });
+  const r = await request('POST', SIGN_URL, {
+    body: Buffer.from(data, 'utf8'),
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 10000,
+  });
+  if (r.json && r.json.ok && r.json.data && r.json.data.url) {
+    return { url: r.json.data.url, headers: r.json.data.headers || {} };
+  }
+  $.log(`⚠️ [签名] 签名服务不可用（${SIGN_URL}）：${r.error || jsonPreview(r.json || r.text, 120)}`);
+  return { url: rawUrl, headers: {} };
+}
+
+/* ============ 网关：账号 / 取 code / 换 token ============ */
+
+const gwHeaders = () => ({ 'User-Agent': USER_AGENT, Accept: '*/*' });
+
+/** scripts 标记：空=允许；含本 key=允许；否则跳过（yyb_tag_filter=0 可关掉过滤） */
+function tagAllows(acc) {
+  if (!TAG_FILTER) return true;
+  const tags = String((acc && acc.scripts) || '')
+    .split(/[,，;；\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!tags.length) return true;
+  return tags.includes(SCRIPT_KEY);
+}
+
+async function fetchGatewayAccounts() {
+  const r = await request('GET', `${GATEWAY}/accounts`, { headers: gwHeaders(), timeout: 20000 });
+  if (!r.json || r.json.code !== 0) {
+    throw new Error(`网关返回异常：${r.error || jsonPreview(r.json || r.text, 200)}`);
+  }
+  return (Array.isArray(r.json.data) ? r.json.data : []).filter((a) => a && typeof a === 'object');
+}
+
+async function refreshGatewayAccount(ref) {
+  try {
+    const r = await request('POST', `${GATEWAY}/accounts/refresh`, {
+      json: { ref }, headers: gwHeaders(), timeout: 120000,
+    });
+    $.log(`♻️ [授权] 已请求网关续期 ${mask(ref)}（HTTP ${r.status}）`);
+  } catch (e) {
+    $.log(`⚠️ [授权] 请求网关续期失败：${e.message}`);
+  }
+}
+
+/** 网关取微信 code（409 = 登录态失效，续期后重试） */
+async function fetchCode(ref) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const r = await request('POST', `${GATEWAY}/wxapp/getCode`, {
+      json: { app_id: APPID, ref }, headers: gwHeaders(), timeout: 40000,
+    });
+    if (r.status === 409) {
+      $.log('⚠️ [授权] 网关返回 409（登录态失效），续期后重试');
+      await refreshGatewayAccount(ref);
+      if (attempt < 3) await sleep(3000);
+      continue;
+    }
+    if (r.json && r.json.code === 0) {
+      const inner = r.json.data || {};
+      const code = ((inner.result || {}).code) || inner.code;
+      if (code && code !== 'null') return String(code);
+    }
+    if (attempt < 3) await sleep(2000);
+  }
+  return '';
+}
+
+function pickToken(data) {
+  if (!data || typeof data !== 'object') return '';
+  const inner = (data.data && typeof data.data === 'object') ? data.data : {};
+  const user = (inner.user && typeof inner.user === 'object') ? inner.user : {};
+  const cands = [
+    data.token, data.wm_logintoken, data.accessToken, data.access_token, data.jwt,
+    inner.token, inner.wm_logintoken, inner.accessToken, inner.access_token, inner.jwt,
+    user.token, user.wm_logintoken, user.accessToken, user.access_token, user.jwt,
+  ];
+  for (const c of cands) if (c && c !== 'null') return String(c);
+  return '';
+}
+
+/** 用微信 code 换美团登录态（注意是 form 表单，不是 JSON） */
+async function loginByCode(code) {
+  const r = await request('POST', WECHAT_LOGIN_URL, {
+    form: { code, appName: MT_APP_NAME },
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept: '*/*',
+      xweb_xhr: '1',
+      Referer: `https://servicewechat.com/${APPID}/270/page-frame.html`,
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+    },
+    timeout: 30000,
+  });
+  const data = r.json;
+  if (!data) return { ok: false, error: `登录响应非 JSON（HTTP ${r.status}）` };
+  const token = pickToken(data);
+  if (!token) return { ok: false, error: `未识别到 token：${jsonPreview(data, 200)}` };
+  const inner = (data.data && typeof data.data === 'object') ? data.data : {};
+  return {
+    ok: true,
+    token,
+    openId: data.openId || inner.openId || inner.open_id || '',
+    openIdCipher: data.openIdCipher || inner.openIdCipher || '',
+    userId: inner.userId || inner.userid || '',
+  };
+}
+
+/* ============ 登录态缓存 ============ */
+
+function readLoginCache() {
+  try { return JSON.parse(fs.readFileSync(LOGIN_CACHE_FILE, 'utf8')).accounts || {}; }
+  catch (_) { return {}; }
+}
+function writeLoginCache(accounts) {
+  try {
+    fs.mkdirSync(path.dirname(LOGIN_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(LOGIN_CACHE_FILE,
+      JSON.stringify({ note: '美团整点抢券登录态缓存（含 token，别外传）', accounts }, null, 1), 'utf8');
+  } catch (_) { /* 写不了不影响主流程 */ }
+}
+
+/* ============ 当日状态（抢到过就不再抢） ============ */
+
+const today = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+function readState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (s && s.date === today()) return s;
+  } catch (_) { /* 不存在或跨天 */ }
+  return { date: today(), accounts: {} };
+}
+function writeState(s) {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 1), 'utf8');
+  } catch (_) { /* 忽略 */ }
+}
+
+/* ============ 青龙 API（改自己的定时任务时间） ============ */
+
+let qlToken = '';
+
+async function qlAuth() {
+  if (qlToken) return true;
+  if (!QL_CLIENT_ID || !QL_CLIENT_SECRET) return false;
+  const url = `${QL_URL}/open/auth/token?client_id=${encodeURIComponent(QL_CLIENT_ID)}`
+    + `&client_secret=${encodeURIComponent(QL_CLIENT_SECRET)}`;
+  const r = await request('GET', url, { timeout: 15000 });
+  if (r.json && r.json.code === 200 && r.json.data && r.json.data.token) {
+    qlToken = r.json.data.token;
+    return true;
+  }
+  $.log(`⚠️ [调度] 青龙鉴权失败：${jsonPreview(r.json || r.text, 150)}`);
+  return false;
+}
+
+async function qlApi(method, apiPath, body) {
+  if (!(await qlAuth())) return null;
+  const data = body ? JSON.stringify(body) : '';
+  const r = await request(method, QL_URL + apiPath, {
+    body: data ? Buffer.from(data, 'utf8') : null,
+    headers: Object.assign({ 'Content-Type': 'application/json' },
+      { Authorization: `Bearer ${qlToken}` }),
+    timeout: 20000,
+  });
+  return r.json || null;
+}
+
+/** 把本任务的 cron 改成 schedule；成功返回 true */
+async function setCronSchedule(schedule) {
+  if (!QL_CLIENT_ID || !QL_CLIENT_SECRET) {
+    $.log('⚠️ [调度] 未配置 ql_client_id / ql_client_secret，无法自动改任务时间');
+    return false;
+  }
+  const list = await qlApi('GET', `/open/crons?searchValue=${encodeURIComponent(CRON_NAME)}`);
+  const tasks = (list && list.data) || [];
+  const task = tasks.find((t) => t && t.name === CRON_NAME);
+  if (!task) {
+    $.log(`⚠️ [调度] 青龙里没找到名为「${CRON_NAME}」的任务（可用 mt_grab_cron_name 指定）`);
+    return false;
+  }
+  if (task.schedule === schedule) {
+    $.log(`  ℹ️ [调度] 任务时间已经是 ${schedule}，不用改`);
+    return true;
+  }
+  const detail = await qlApi('GET', `/open/crons/${task.id}`);
+  const d = (detail && detail.data) || task;
+  const body = {
+    id: d.id,
+    name: d.name,
+    command: d.command,
+    schedule,
+    task_before: d.task_before || '',
+    task_after: d.task_after || '',
+    labels: Array.isArray(d.labels) ? d.labels : [],
+    log_name: d.log_name || '',
+    work_dir: d.work_dir || '',
+    allow_multiple_instances: d.allow_multiple_instances || 0,
+  };
+  const r = await qlApi('PUT', '/open/crons', body);
+  if (r && r.code === 200) {
+    $.log(`  ✅ [调度] 任务「${CRON_NAME}」时间已改为 ${schedule}`);
+    return true;
+  }
+  $.log(`  ✖ [调度] 改任务时间失败：${jsonPreview(r, 200)}`);
+  return false;
+}
+
+/** 场次时间 → cron 表达式（开场前 1 分钟） */
+function cronForSession(startMs) {
+  const d = new Date(startMs - 60 * 1000);
+  const mm = d.getMinutes();
+  const hh = d.getHours();
+  return `${mm} ${hh} * * *`;
+}
+
+/* ============ 抢券接口 ============ */
+
+function baseBody(ctx) {
+  return {
+    wm_did: '', wm_mac: '', waimai_sign: '/', wm_ctype: 'fulishe_wxapp', wm_dtype: 'microsoft',
+    wm_dversion: '4.1.12.55', wm_dplatform: 'windows', wm_uuid: '1457266102798364772',
+    wm_visitid: '90357da0-9471-4a38-af91-bb7338fb81b7', wm_appversion: '1.47.0',
+    wm_logintoken: ctx.token, req_time: Date.now(),
+    userid: ctx.userId, user_id: ctx.userId, lch: 1260,
+    wm_uuid_source: 'server', hostAppVersion: '',
+    open_id: ctx.openId, unionid: 'oNQu9t2M2aGnZbGGda83ER7Oxweo',
+    finger_applets: '', fp_platform: 13, appId: APPID, expoId: ctx.openIdCipher,
+    cPosition: 1005, pBizLine: 9000, distributorChannel: 0,
+    wm_latitude: 23083309, wm_longitude: 113317200,
+    wm_actual_latitude: 23083309, wm_actual_longitude: 113317200,
+    actual_city_id_level2: '440100', actual_city_id_level3: '440105',
+    city_id_level2: '440100', city_id_level3: '440105',
+  };
+}
+
+function headersFor(ctx, bodyLen) {
+  return {
+    geographyInfo: '%7B%7D',
+    openIdCipher: ctx.openIdCipher,
+    xweb_xhr: '1',
+    csecuuid: '1457266102798364772',
+    swimlane: '',
+    'x-env': 'online',
+    csecuserid: String(ctx.userId || ''),
+    openId: ctx.openId,
+    'X-Requested-With': 'XMLHttpRequest',
+    'User-Agent': USER_AGENT,
+    'Content-Type': 'application/json',
+    token: ctx.token,
+    Accept: '*/*',
+    'Sec-Fetch-Site': 'cross-site',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    Referer: `https://servicewechat.com/${APPID}/270/page-frame.html`,
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Content-Length': bodyLen,
+  };
+}
+
+/**
+ * 调 fulishemini 接口。
+ * ⚠️ 关键坑：limitTimeGrabInfo / limitTimeGrab 这两个接口【不能带】那串通用 query
+ * （yodaReady=wx&csecappid=...），带了会被 media.meituan.com 的 openresty 直接 403。
+ * 且该 path 的 WAF 是概率性放行（同请求有时 200 有时 403），所以必须退避重试。
+ */
+async function grabPost(ctx, apiPath, bodyObj, tag) {
+  const rawBody = Buffer.from(JSON.stringify(bodyObj), 'utf8');
+  const url = `${MEDIA_BASE}${apiPath}`;
+  const headers = headersFor(ctx, rawBody.length);
+  const sig = await resolveSignature('POST', url, rawBody);
+  Object.assign(headers, sig.headers || {});
+
+  const r = await request('POST', sig.url || url, { body: rawBody, headers, timeout: REQUEST_TIMEOUT });
+  if (DEBUG) {
+    $.log(`  [debug] ${tag}: ${r.json ? jsonPreview(r.json, 400) : (r.text || r.error || '-').slice(0, 200)}`);
+  }
+  if (!r.json) {
+    const text = String(r.text || '') + String(r.error || '');
+    const blocked = /403 Forbidden|openresty/i.test(text);
+    return {
+      ok: false, blocked,
+      error: blocked ? `${tag} 被 openresty 拦截（403 WAF）` : (r.error || (r.text || '').slice(0, 150)),
+    };
+  }
+  if (![0, 200, '0', '200'].includes(r.json.code)) {
+    return { ok: false, error: `${tag} code=${r.json.code} ${r.json.message || r.json.msg || ''}` };
+  }
+  return { ok: true, data: r.json.data || {}, raw: r.json };
+}
+
+/** 拉场次（不传 target 拿全部；传 activityId+sessionCode 切到指定场次） */
+async function grabInfoOnce(ctx, target) {
+  const body = Object.assign(baseBody(ctx), { identityScene: IDENTITY_SCENE, osType: 'Windows' });
+  if (target && target.activityId && target.sessionCode) {
+    body.activityId = target.activityId;
+    body.sessionCode = target.sessionCode;
+  }
+  return grabPost(ctx, GRAB_INFO_PATH, body, 'limitTimeGrabInfo');
+}
+
+async function grabInfo(ctx, target, tries = 4) {
+  let last = { ok: false, error: '未执行' };
+  for (let i = 0; i < tries; i += 1) {
+    if (i) await sleep(800 * i);
+    const r = await grabInfoOnce(ctx, target);
+    if (r.ok) return r;
+    last = r;
+    if (!r.blocked) break;   // 不是 WAF 拦截就没必要重试
+  }
+  return last;
+}
+
+async function grabCoupon(ctx, p) {
+  const body = Object.assign(baseBody(ctx), {
+    identityScene: IDENTITY_SCENE,
+    activityId: p.activityId,
+    sessionCode: p.sessionCode,
+    grabToken: p.grabToken,
+    rightCode: p.rightCode,
+    pageId: '',
+    moduleId: MODULE_ID,
+    sessionId: p.sessionId || '',
+    unpl: UNPL,
+    osType: 'Windows',
+  });
+  const r = await grabPost(ctx, GRAB_PATH, body, 'limitTimeGrab');
+  if (!r.ok) return r;
+  const d = r.data;
+  return {
+    ok: true,
+    subCode: d.subCode,
+    couponInfo: d.couponInfo || null,
+    text: SUBCODE_TEXT[d.subCode] || `未知结果 subCode=${d.subCode}`,
+  };
+}
+
+/* ============ 场次解析 ============ */
+
+/** 兼容 毫秒/秒 时间戳 与 "10:00:00" 这种当天时刻 */
+function toMs(v) {
+  if (v == null || v === '') return 0;
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 1e12) return n;
+  if (Number.isFinite(n) && n > 1e9) return n * 1000;
+  const m = typeof v === 'string' ? v.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/) : null;
+  if (m) {
+    const d = new Date();
+    d.setHours(Number(m[1]), Number(m[2]), Number(m[3] || 0), 0);
+    return d.getTime();
+  }
+  return 0;
+}
+
+const startMsOf = (s) => toMs(s.startTimestamp) || toMs(s.startTime)
+  || toMs(s.beginTimestamp) || toMs(s.beginTime);
+const endMsOf = (s) => toMs(s.endTimestamp) || toMs(s.endTime) || toMs(s.finishTimestamp);
+
+function statusOf(s, nowMs) {
+  const raw = s.status != null ? s.status : s.sessionStatus;
+  if (raw != null && Number.isFinite(Number(raw))) return Number(raw);
+  const st = startMsOf(s);
+  const et = endMsOf(s);
+  if (!st && !et) return 2;
+  if (st && nowMs < st) return 1;
+  if (et && nowMs > et) return 2;
+  return 0;
+}
+
+/**
+ * 摊平场次。真实结构（2026-10-14 抓包）：
+ *   sessionList[] : { sessionCode, startTime:"10:00:00", endTime:"10:59:59" }（没有 status）
+ *   currentSession: { sessionCode, startTimestamp, endTimestamp, grabToken, rightList[] }
+ * 注意 grabToken 挂在【场次】上，不是每张券上。
+ */
+function flatten(activityList, nowMs) {
+  const out = [];
+  for (const act of activityList) {
+    if (!act) continue;
+    const byCode = new Map();
+    for (const s of (Array.isArray(act.sessionList) ? act.sessionList : [])) {
+      if (s && s.sessionCode != null) byCode.set(s.sessionCode, Object.assign({}, s));
+    }
+    const cur = act.currentSession;
+    if (cur && cur.sessionCode != null) {
+      byCode.set(cur.sessionCode, Object.assign({}, byCode.get(cur.sessionCode) || {}, cur));
+    }
+    for (const s of byCode.values()) {
+      out.push({
+        activityId: act.activityId,
+        sessionCode: s.sessionCode,
+        status: statusOf(s, nowMs),
+        startMs: startMsOf(s),
+        endMs: endMsOf(s),
+        grabToken: s.grabToken || '',
+        rights: Array.isArray(s.rightList) ? s.rightList : [],
+      });
+    }
+  }
+  return out;
+}
+
+/** 券能不能抢：状态 2=AVAILABLE（字段缺失时放行，让服务端裁决） */
+const grabbable = (rights) => (rights || []).filter((r) => r && r.rightCode
+  && (r.status == null || Number(r.status) === 2));
+
+/* ============ 账号准备 ============ */
+
+async function resolveAccounts(loginCache) {
+  if (MT_OPENIDS.length) return MT_OPENIDS.map((ref) => ({ ref, label: mask(ref, 4, 4) }));
+
+  const accounts = await fetchGatewayAccounts();
+  const alive = accounts.filter((a) => String(a.status || '').toLowerCase() === 'alive');
+  // 非 alive 但本地有登录态缓存的也试一把：token 还有效就照样能抢
+  const aliveRefs = new Set(alive.map((a) => String(a.openid || a.id || '')));
+  const revived = accounts.filter((a) => {
+    const ref = String(a.openid || a.id || '');
+    return ref && !aliveRefs.has(ref) && !!loginCache[tokenKey(ref)];
+  });
+  if (revived.length) {
+    $.log(`🔐 [账号] ${revived.length} 个非 alive 但本地有登录态，一并尝试`);
+  }
+
+  const out = [];
+  let skipped = 0;
+  for (const a of alive.concat(revived)) {
+    const ref = String(a.openid || a.id || '');
+    if (!ref) continue;
+    const nickname = String(a.nickname || a.alias || '').trim();
+    const label = nickname && nickname !== '-' ? nickname : ref;
+    if (!tagAllows(a)) {
+      skipped += 1;
+      $.log(`⏭️ [账号] 跳过「${label}」：标记 [${String(a.scripts || '').trim()}] 不含 [${SCRIPT_KEY}]`);
+      continue;
+    }
+    out.push({ ref, label });
+  }
+  if (skipped) $.log(`ℹ️ [账号] 按标记过滤掉 ${skipped} 个（yyb_tag_filter=0 可关闭）`);
+  return out;
+}
+
+/** 拿 ctx：优先登录态缓存；缓存被拒再去网关取 code */
+async function prepareAccount(acc, loginCache) {
+  const key = tokenKey(acc.ref);
+  const cached = loginCache[key];
+  if (cached && cached.token) {
+    return { ok: true, ctx: cached, fromCache: true };
+  }
+  const code = await fetchCode(acc.ref);
+  if (!code) return { ok: false, error: '网关取 code 失败' };
+  const login = await loginByCode(code);
+  if (!login.ok) return { ok: false, error: login.error };
+  const ctx = {
+    token: login.token, openId: login.openId,
+    openIdCipher: login.openIdCipher, userId: login.userId,
+  };
+  loginCache[key] = ctx;
+  return { ok: true, ctx, fromCache: false };
+}
+
+/* ============ 主流程 ============ */
+
+async function main() {
+  const t0 = Date.now();
+  $.log('');
+  $.log('════════ 美团整点抢券（全账号并发） ════════');
+  $.log(`🕒 ${nowText()}`);
+
+  // 1) 账号
+  const loginCache = readLoginCache();
+  const accounts = await resolveAccounts(loginCache).catch((e) => {
+    $.log(`❌ [账号] 获取失败：${e.message}`);
+    return [];
+  });
+  if (!accounts.length) {
+    $.log('❌ [账号] 没有可用账号');
+    return;
+  }
+  $.log(`👥 账号数：${accounts.length}`);
+
+  // 2) 登录（并发；缓存优先）
+  const prepared = await Promise.all(accounts.map(async (acc) => {
+    const r = await prepareAccount(acc, loginCache).catch((e) => ({ ok: false, error: e.message }));
+    return Object.assign({ acc }, r);
+  }));
+  writeLoginCache(loginCache);
+
+  const ready = prepared.filter((p) => p.ok);
+  for (const p of prepared) {
+    if (!p.ok) $.log(`  ✖ ${p.acc.label}：登录失败（${p.error}）`);
+  }
+  if (!ready.length) {
+    $.log('❌ [登录] 没有账号登录成功');
+    return;
+  }
+  $.log(`🔐 登录就绪：${ready.length} / ${accounts.length}`
+    + `（缓存命中 ${ready.filter((p) => p.fromCache).length}）`);
+
+  // 3) 并发拉场次（每个号各自一份：grabToken 是按账号下发的）
+  const infos = await Promise.all(ready.map(async (p) => {
+    const r = await grabInfo(p.ctx);
+    return { p, r };
+  }));
+
+  const okInfos = infos.filter((x) => x.r.ok);
+  for (const x of infos) {
+    if (!x.r.ok) $.log(`  ✖ ${x.p.acc.label} 拉场次失败：${x.r.error}`);
+  }
+  if (!okInfos.length) {
+    $.log('❌ [场次] 所有账号都拉不到场次（WAF 拦截或接口异常）');
+    return;
+  }
+
+  const nowMs = Date.now();
+  const first = okInfos[0].r.data;
+  const sessions = flatten(Array.isArray(first.activityList) ? first.activityList : [], nowMs);
+  if (!sessions.length) {
+    $.log('ℹ️ 今天没有整点场次');
+    await setCronSchedule(START_CRON);
+    return;
+  }
+  $.log('🕐 场次：' + sessions.map((s) =>
+    `${s.sessionCode}[${STATUS_TEXT[s.status] || s.status}`
+    + `${s.startMs ? ' ' + new Date(s.startMs).toTimeString().slice(0, 5) : ''}]`).join('、'));
+
+  // 4) 选目标：最近的「未开始或进行中」场次
+  const alive = sessions.filter((s) => s.status !== 2 && s.startMs)
+    .sort((a, b) => a.startMs - b.startMs);
+  if (!alive.length) {
+    $.log('ℹ️ 今天的场次都结束了');
+    await setCronSchedule(START_CRON);
+    return;
+  }
+  const target = alive[0];
+  const untilStart = target.startMs - nowMs;
+
+  // 5) 判断模式
+  if (untilStart > ENTER_SEC * 1000) {
+    // 探测模式：把任务改到开场前 1 分钟
+    const cron = cronForSession(target.startMs);
+    const mins = Math.round(untilStart / 60000);
+    $.log(`🧭 探测模式：最近场次 ${new Date(target.startMs).toTimeString().slice(0, 5)}`
+      + `（约 ${mins} 分钟后），把任务改到 ${cron}`);
+    await setCronSchedule(cron);
+    return;
+  }
+
+  // 6) 抢券模式
+  const state = readState();
+  const pending = okInfos.filter((x) => {
+    const done = state.accounts[tokenKey(x.p.acc.ref)];
+    return !done;
+  });
+  $.log(`🚀 抢券模式：目标场次 ${target.sessionCode}，开抢账号 ${pending.length}/${okInfos.length}`
+    + `（今日已抢到的跳过）`);
+  if (!pending.length) {
+    $.log('ℹ️ 今天所有账号都已抢到过，不再抢');
+    await planNext(state, sessions, nowMs, okInfos.length);
+    return;
+  }
+
+  // 等到开场前 LEAD_MS
+  const wait = target.startMs - LEAD_MS - Date.now();
+  if (wait > 0) {
+    $.log(`⏳ 等待开场：${new Date(target.startMs).toTimeString().slice(0, 8)}`
+      + `（${(wait / 1000).toFixed(2)}s 后开抢）`);
+    await sleep(wait);
+  }
+
+  // 开场瞬间拉 grabToken（开场后才下发）；没拿到就快速轮询，最多 2 秒
+  const tokenDeadline = Date.now() + 2000;
+  const tokens = await Promise.all(pending.map(async (x) => {
+    let lastErr = '未拿到 grabToken';
+    while (Date.now() < tokenDeadline) {
+      const r = await grabInfoOnce(x.p.ctx, target);
+      if (!r.ok) {
+        lastErr = r.error;
+        if (!r.blocked) break;          // 非 WAF 错误（如 token 失效）就别重试了
+      } else {
+        const list = flatten(Array.isArray(r.data.activityList) ? r.data.activityList : [], Date.now());
+        const sess = list.find((s) => s.sessionCode === target.sessionCode);
+        if (sess && sess.grabToken) return { x, sess };
+        lastErr = sess ? '该场次还没下发 grabToken' : '找不到该场次';
+      }
+      await sleep(180);
+    }
+    return { x, error: lastErr };
+  }));
+
+  const shooters = tokens.filter((t) => t.sess && t.sess.grabToken);
+  if (!shooters.length) {
+    $.log('❌ [抢券] 没有任何账号拿到 grabToken');
+    for (const t of tokens) $.log(`   ✖ ${t.x.p.acc.label}：${t.error}`);
+    await planNext(state, sessions, Date.now(), okInfos.length);
+    return;
+  }
+
+  // 7) 全账号【并发】抢
+  $.log(`🎯 ${nowText()} 并发开抢（${shooters.length} 个号同时发请求）`);
+  const results = await Promise.all(shooters.map(async (t) => {
+    const { x, sess } = t;
+    const rights = grabbable(sess.rights);
+    if (!rights.length) return { x, ok: false, text: '本场次没有可抢的券' };
+    const right = rights[0];   // 一场只抢一张（同面额当天限一次）
+    const req = {
+      activityId: target.activityId,
+      sessionCode: sess.sessionCode,
+      grabToken: sess.grabToken,
+      rightCode: right.rightCode,
+    };
+    let r = await grabCoupon(x.p.ctx, req);
+    // 8000/8002/8004 是可重试失败，立刻补一枪（8001=券抢完就别浪费请求了）
+    if (r.ok && [8000, 8002, 8004].includes(r.subCode)) {
+      await sleep(120);
+      r = await grabCoupon(x.p.ctx, req);
+    }
+    if (r.ok && r.subCode === 1) {
+      const info = r.couponInfo || {};
+      const name = info.couponName || info.name || right.rightCode;
+      const val = info.couponValue != null ? `（${(Number(info.couponValue) / 100).toFixed(0)}元）` : '';
+      return { x, ok: true, text: `${name}${val} 抢到了` };
+    }
+    return { x, ok: false, subCode: r.subCode, text: r.ok ? r.text : r.error };
+  }));
+
+  let got = 0;
+  for (const r of results) {
+    if (r.ok) {
+      got += 1;
+      state.accounts[tokenKey(r.x.p.acc.ref)] = {
+        rightCode: 'ok', sessionCode: target.sessionCode, at: Date.now(),
+      };
+      $.log(`  ✅ ${r.x.p.acc.label}：${r.text}`);
+    } else {
+      $.log(`  ✖ ${r.x.p.acc.label}：${r.text}`);
+    }
+  }
+  writeState(state);
+  $.log(`🏁 本轮结果：${got}/${results.length} 个号抢到`
+    + `（耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s）`);
+
+  // 8) 收尾：还有没抢到的 + 后面还有场次 → 定到下一场；否则回 9:00
+  await planNext(state, sessions, Date.now(), okInfos.length, got);
+}
+
+/** 决定下一次触发时间 */
+async function planNext(state, sessions, nowMs, totalAccounts, justGot = 0) {
+  const doneCount = Object.keys(state.accounts).length;
+  if (doneCount >= totalAccounts) {
+    $.log(`🔁 今天 ${doneCount} 个号都已抢到，任务改回 ${START_CRON}`);
+    await setCronSchedule(START_CRON);
+    return;
+  }
+  const next = sessions.filter((s) => s.status !== 2 && s.startMs > nowMs)
+    .sort((a, b) => a.startMs - b.startMs)[0];
+  if (next) {
+    const cron = cronForSession(next.startMs);
+    $.log(`🔁 还有 ${totalAccounts - doneCount} 个号没抢到，下一场 `
+      + `${new Date(next.startMs).toTimeString().slice(0, 5)}，任务改到 ${cron}`);
+    await setCronSchedule(cron);
+    return;
+  }
+  $.log(`🔁 今天没有后续场次了，任务改回 ${START_CRON}`);
+  await setCronSchedule(START_CRON);
+}
+
+// 兜底：整体 10 分钟还没跑完就收尾，别把青龙任务挂住
+const watchdog = setTimeout(() => {
+  $.log('⛔ 看门狗：运行超过 10 分钟，强制退出');
+  try { $.done(); } catch (_) {}
+  process.exit(0);
+}, 10 * 60 * 1000);
+
+(async () => {
+  try {
+    await main();
+  } catch (e) {
+    $.log(`❌ [主流程] 异常：${e && e.message ? e.message : e}`);
+    $.log(e && e.stack ? e.stack : '');
+  } finally {
+    clearTimeout(watchdog);
+    try { $.done(); } catch (_) {}
+  }
+})();
