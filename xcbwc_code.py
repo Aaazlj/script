@@ -86,7 +86,7 @@ PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 CONCURRENCY = max(1, int(os.getenv("xc_concurrency") or "1"))
 # 累计抽奖奖励：只领第 1 档（第 2 档要求更多抽奖次数，实测每天都「未达到抽奖次数」）。
 # 想两档都试：xc_cumulative_steps=1,2
-CUMULATIVE_STEPS = [x.strip() for x in (os.getenv("xc_cumulative_steps") or "1").split(",") if x.strip()]
+CUMULATIVE_STEPS = [x.strip() for x in (os.getenv("xc_cumulative_steps") or "1,2").split(",") if x.strip()]
 # 日常福利里「能自动完成」的任务 id（逗号分隔）：57=抖音电商浏览(500元宝/天)
 # 其余任务（下单/邀请/入群/关注/晒图/兑换）需要真实操作，脚本只报告不做。
 DAILY_TASK_IDS = [x.strip() for x in (os.getenv("xc_daily_task_ids") or "57").split(",") if x.strip()]
@@ -472,16 +472,6 @@ class Yuhua(BaseApiClient):
             return js["user_info"]
         raise RuntimeError(f"CK失效，服务器响应：{js.get('status', {}).get('msg', '未知')}")
 
-    def get_lottery_info(self):
-        try:
-            self.call("SilkwormLottery", "SilkwormLotteryMobile.LotteryInfo",
-                      {"silk_id": int(self.teemo), "app_id": 20})
-            time.sleep(random.uniform(0.1, 0.4))
-            self.call("SilkwormLottery", "SilkwormLotteryMobile.GetLotteryProgress",
-                      {"silk_id": int(self.teemo), "app_id": 20})
-        except Exception:
-            pass
-
     def sign_in(self) -> str:
         time.sleep(random.uniform(1.0, 3.0))
         try:
@@ -489,11 +479,13 @@ class Yuhua(BaseApiClient):
                              {"silk_id": int(self.teemo), "app_id": 20}).json()
             code = resp.get("status", {}).get("code")
             if code == 0:
-                self.get_lottery_info()
                 return f"会员签到: 获得{resp.get('point', 0)}"
             if code == 200001:
                 return "会员签到: 触发风控"
-            return f"会员签到: {resp.get('status', {}).get('msg')}"
+            msg = str(resp.get("status", {}).get("msg") or "")
+            if "重复" in msg or "限一次" in msg:
+                return "会员签到: 今天已签"
+            return f"会员签到: {msg}"
         except Exception as exc:
             return f"会员签到: {parse_error(exc)}"
 
@@ -503,7 +495,6 @@ class Yuhua(BaseApiClient):
             resp = self.call("SilkwormLottery", "SilkwormLotteryMobile.AddLotteryTimes",
                              {"silk_id": int(self.teemo), "type": t, "app_id": 20}).json()
             if resp["status"]["code"] == 0:
-                self.get_lottery_info()
                 return f"任务[{t}]完成, 抽奖次数+1"
             return f"任务[{t}]失败, {resp['status']['msg']}"
         except Exception as exc:
@@ -515,67 +506,63 @@ class Yuhua(BaseApiClient):
             rr = self.call("SilkwormLottery", "SilkwormLotteryMobile.Lottery",
                            {"silk_id": int(self.teemo), "prize_type": 1, "app_id": 20}).json()
             if rr["status"]["code"] == 0:
-                self.get_lottery_info()
                 return f"抽奖成功, 获得[{rr['prize']['name']}]"
             return f"抽奖状态: {rr['status']['msg']}"
         except Exception as exc:
             return f"抽奖异常: {parse_error(exc)}"
 
+    def lottery_progress(self) -> Dict:
+        """抽奖进度：{first_step_count, second_step_count, lottery_count, has_got_*_step_prize}"""
+        js = self.call("SilkwormLottery", "SilkwormLotteryMobile.GetLotteryProgress",
+                       {"silk_id": int(self.teemo), "app_id": 20}).json()
+        return js.get("lottery_progress") or {}
+
     def receive_cumulative_reward(self) -> str:
-        logs = []
-        for stp in CUMULATIVE_STEPS:
-            time.sleep(random.uniform(2.0, 3.0))
-            try:
-                resp = self.call("SilkwormLottery", "SilkwormLotteryMobile.ReceiveExtraLottery",
-                                 {"silk_id": int(self.teemo), "step": stp, "app_id": 20}).json()
-                if resp["status"]["code"] == 0:
-                    logs.append(f"奖励状态: 领取奖励[{stp}]成功, 获得[{resp['prize']['name']}]")
-                else:
-                    msg = str(resp["status"].get("msg") or "")
-                    if "未达到" in msg or "不在领取范围" in msg:
-                        logs.append(f"奖励状态: 领取奖励[{stp}]跳过（{msg}）")
-                    else:
-                        logs.append(f"奖励状态: 领取奖励[{stp}]失败, {msg}")
-            except Exception as exc:
-                logs.append(f"奖励状态: 领取奖励[{stp}]异常: {parse_error(exc)}")
-        return "\n".join(logs)
-
-    def ad_task(self, task_type: int, bus_type: int) -> str:
-        """看广告类任务：sign = HMAC-SHA256(silk_id&timestamp&nonce&bus_type)"""
-        time.sleep(random.uniform(3.0, 5.0))
-        timestamp = int(time.time())
-        nonce = "".join(random.choice(string.digits) for _ in range(6))
-        sign_text = (f"silk_id={int(self.teemo)}&timestamp={timestamp}"
-                     f"&nonce={nonce}&bus_type={int(bus_type)}")
-        signature = hmac.new(b"lcjkbqadfrzsewxy", sign_text.encode(), hashlib.sha256).digest()
-        payload = {"silk_id": int(self.teemo), "timestamp": timestamp, "nonce": nonce,
-                   "bus_type": int(bus_type), "sign": b64encode(signature).decode(),
-                   "task_type": task_type, "app_id": 20}
+        """
+        累计抽奖奖励：按进度决定要不要领（第 1 档需 3 次抽奖、第 2 档需 9 次）。
+        之前不看门槛硬领，第 2 档永远「未达到」；而且连发请求容易被限流打 500，
+        这里只对可能领到的档位发请求，500 当作抖动重试两次。
+        """
         try:
-            resp = self.call("SilkwormLottery", "SilkwormLotteryMobile.OnAdViewed", payload).json()
-            if resp["status"]["code"] == 0:
-                self.get_lottery_info()
-                return f"任务[{task_type}]完成, 抽奖次数+1"
-            return f"任务[{task_type}]失败, {resp['status']['msg']}"
+            progress = self.lottery_progress()
         except Exception as exc:
-            return f"任务[{task_type}]异常: {parse_error(exc)}"
-
-    def run_all(self) -> List[str]:
-        logs = [self.sign_in()]
-        for t in (1, 2, 8, 9, 10, 11):
-            logs.append(self.task(t))
-        logs.append(self.ad_task(6, 2))
-        logs.append(self.ad_task(7, 4))
-        for _ in range(20):
-            ret = self.lottery()
-            logs.append(ret)
-            if "抽奖成功" not in ret:
-                break
-            time.sleep(random.uniform(2.0, 4.0))
-        logs.append(self.receive_cumulative_reward())
-        logs.append(self.daily_task_step())
-        logs.append(self.yb_lottery_step())
-        return logs
+            return f"奖励状态: 查进度失败（{parse_error(exc)}）"
+        total = int(progress.get("lottery_count") or 0)
+        steps = ((1, int(progress.get("first_step_count") or 3), bool(progress.get("has_got_first_step_prize"))),
+                 (2, int(progress.get("second_step_count") or 9), bool(progress.get("has_got_second_step_prize"))))
+        logs = []
+        for stp, need, got in steps:
+            if str(stp) not in CUMULATIVE_STEPS:
+                continue
+            if got:
+                logs.append(f"奖励状态: 奖励[{stp}]已领过")
+                continue
+            if total < need:
+                logs.append(f"奖励状态: 奖励[{stp}]还差 {need - total} 次抽奖（需 {need} 次，今天 {total} 次）")
+                continue
+            for attempt in range(3):
+                try:
+                    resp = self.call("SilkwormLottery", "SilkwormLotteryMobile.ReceiveExtraLottery",
+                                     {"silk_id": int(self.teemo), "step": stp, "app_id": 20}).json()
+                    code = resp.get("status", {}).get("code")
+                    if code == 0:
+                        prize = (resp.get("prize") or {}).get("name") or "未知"
+                        logs.append(f"奖励状态: ✅ 领取奖励[{stp}]成功, 获得[{prize}]")
+                        break
+                    msg = str(resp.get("status", {}).get("msg") or "")
+                    if "已领" in msg or "不在领取范围" in msg:
+                        logs.append(f"奖励状态: 奖励[{stp}]已领过")
+                    else:
+                        logs.append(f"奖励状态: 奖励[{stp}]失败: {msg}")
+                    break
+                except Exception as exc:
+                    # 小蚕在连发请求后会返回 500，等一下再试（不要当成"领不到"）
+                    if attempt < 2 and "500" in str(exc):
+                        time.sleep(3)
+                        continue
+                    logs.append(f"奖励状态: 奖励[{stp}]接口异常（{parse_error(exc)}）")
+                    break
+        return "\n".join(logs)
 
     # ---------- 日常福利任务（任务中心 → 元宝） ----------
     TASK_SERVICE = "ActivityTask"
@@ -621,7 +608,7 @@ class Yuhua(BaseApiClient):
         防亏：余额不够不抽；请求超时**不重试**（重试要再扣一次）。
         """
         if not YB_LOTTERY:
-            return "元宝抽奖: 已关闭（xc_yb_lottery=0）"
+            return ""            # 关闭时不出日志
         info = self.yb_lottery_info()
         if not info:
             return "元宝抽奖: 拿不到活动信息（接口节流），跳过"
@@ -674,16 +661,16 @@ class Yuhua(BaseApiClient):
             return f"日常福利: 拉取失败 {parse_error(exc)}"
         tasks = data.get("list") or []
         auto = {}
-        manual = []
         for t in tasks:
             done = t.get("completed") == 1            # 1=今天已完成，2=待做
             line = f"{t.get('title')}({t.get('point')})"
             if done:
+                if str(t.get("id")) == "1":      # 每日签到 = 会员签到，避免重复一行
+                    continue
                 auto.setdefault("done", []).append(line)
             elif str(t.get("id")) in DAILY_TASK_IDS:
                 auto.setdefault("todo", []).append(t)
-            else:
-                manual.append(line)
+            # 其余需要真实操作的任务（下单/邀请/入群/关注/晒图/兑换）不再逐条打印
         logs = []
         for t in auto.get("todo", []):
             code, msg = self.complete_task(t["id"])
@@ -695,8 +682,6 @@ class Yuhua(BaseApiClient):
                 logs.append(f"日常福利: {t['title']} 未完成（{msg}）")
         if auto.get("done"):
             logs.append("日常福利: 已完成 " + "、".join(auto["done"][:6]))
-        if manual:
-            logs.append("日常福利: 需真实操作跳过 → " + "、".join(manual[:6]))
         return "\n".join(logs) if logs else "日常福利: 没有可做任务"
 
     def get_all_cards(self) -> str:
