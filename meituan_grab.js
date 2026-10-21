@@ -12,13 +12,18 @@ cron: 0 9 * * *
 
 工作方式（同一个脚本，按当前时间自动分两种模式）：
   ① 探测模式（每天 9:00 由 cron 触发）
-     登录 → 并发拉场次 → 找到今天最近的未结束场次
+     只用【1 个号】拉一次场次（场次是活动级的，所有号看到的一样；
+     实测未登录拿不到，会 401 passport，所以必须带一个号的 token）
      → 有场次：把【本任务】的 cron 改到「开场前 1 分钟」，退出
      → 无场次：把 cron 保持/改回 0 9 * * *，退出
   ② 抢券模式（开场前 1 分钟被 cron 叫醒）
-     登录 + 并发拉 grabToken → 等到开场前 LEAD_MS → 全账号【并发】抢
+     这时才把全部账号拉起来 → 各自拉 grabToken → 等到开场前 LEAD_MS
+     → 全账号【并发】抢（串行只有第一个号能抢到）
      → 写当日状态 → 若还有后续场次且仍有号没抢到，改到下一场前 1 分钟；
        否则改回 0 9 * * *（明天继续探测）
+
+风控注意：探测只打 1 次请求；抢券阶段每号只有「拉 token（最多几次短轮询）+ 抢 1 次」，
+不做无意义的重试；白天不会常驻轮询。
 
 环境变量：
   yyb_server            应用宝网关地址（与其它脚本共用），必需
@@ -696,7 +701,7 @@ async function main() {
   $.log('════════ 美团整点抢券（全账号并发） ════════');
   $.log(`🕒 ${nowText()}`);
 
-  // 1) 账号
+  // 1) 账号候选
   const loginCache = readLoginCache();
   const accounts = await resolveAccounts(loginCache).catch((e) => {
     $.log(`❌ [账号] 获取失败：${e.message}`);
@@ -706,44 +711,29 @@ async function main() {
     $.log('❌ [账号] 没有可用账号');
     return;
   }
-  $.log(`👥 账号数：${accounts.length}`);
+  $.log(`👥 候选账号：${accounts.length}`);
 
-  // 2) 登录（并发；缓存优先）
-  const prepared = await Promise.all(accounts.map(async (acc) => {
-    const r = await prepareAccount(acc, loginCache).catch((e) => ({ ok: false, error: e.message }));
-    return Object.assign({ acc }, r);
-  }));
-  writeLoginCache(loginCache);
-
-  const ready = prepared.filter((p) => p.ok);
-  for (const p of prepared) {
-    if (!p.ok) $.log(`  ✖ ${p.acc.label}：登录失败（${p.error}）`);
-  }
-  if (!ready.length) {
-    $.log('❌ [登录] 没有账号登录成功');
+  // 2) 探测：只用一个号拉场次
+  //    风控考虑：场次是【活动级】的，所有号看到的完全一样，没必要每个号都去打一次。
+  //    实测未登录拿不到（media 直接 401 passport），所以必须带【一个】号的 token。
+  const probe = accounts[0];
+  $.log(`🔍 探测：只用 1 个号（${probe.label}）`);
+  const probeLogin = await prepareAccount(probe, loginCache)
+    .catch((e) => ({ ok: false, error: e.message }));
+  if (!probeLogin.ok) {
+    $.log(`❌ [探测] ${probe.label} 登录失败：${probeLogin.error}`);
     return;
   }
-  $.log(`🔐 登录就绪：${ready.length} / ${accounts.length}`
-    + `（缓存命中 ${ready.filter((p) => p.fromCache).length}）`);
+  writeLoginCache(loginCache);
 
-  // 3) 并发拉场次（每个号各自一份：grabToken 是按账号下发的）
-  const infos = await Promise.all(ready.map(async (p) => {
-    const r = await grabInfo(p.ctx);
-    return { p, r };
-  }));
-
-  const okInfos = infos.filter((x) => x.r.ok);
-  for (const x of infos) {
-    if (!x.r.ok) $.log(`  ✖ ${x.p.acc.label} 拉场次失败：${x.r.error}`);
-  }
-  if (!okInfos.length) {
-    $.log('❌ [场次] 所有账号都拉不到场次（WAF 拦截或接口异常）');
+  const probeInfo = await grabInfo(probeLogin.ctx);
+  if (!probeInfo.ok) {
+    $.log(`❌ [探测] 拉场次失败：${probeInfo.error}`);
     return;
   }
 
   const nowMs = Date.now();
-  const first = okInfos[0].r.data;
-  const sessions = flatten(Array.isArray(first.activityList) ? first.activityList : [], nowMs);
+  const sessions = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
   if (!sessions.length) {
     $.log('ℹ️ 今天没有整点场次');
     await setCronSchedule(START_CRON);
@@ -775,62 +765,74 @@ async function main() {
     return;
   }
 
-  // 6) 抢券模式
+  // 6) 抢券模式：这时候才把所有账号拉起来（探测阶段只用了 1 个号）
+  $.log(`🚀 抢券模式：准备全部账号（目标场次 ${target.sessionCode}）`);
+  const prepared = await Promise.all(accounts.map(async (acc) => {
+    const r = await prepareAccount(acc, loginCache).catch((e) => ({ ok: false, error: e.message }));
+    return Object.assign({ acc }, r);
+  }));
+  writeLoginCache(loginCache);
+  const ready = prepared.filter((p) => p.ok);
+  for (const p of prepared) if (!p.ok) $.log(`  ✖ ${p.acc.label} 登录失败：${p.error}`);
+  if (!ready.length) {
+    $.log('❌ [登录] 没有账号登录成功');
+    return;
+  }
+  $.log(`🔐 登录就绪 ${ready.length}/${accounts.length}`
+    + `（缓存命中 ${ready.filter((p) => p.fromCache).length}）`);
+
+  // 当天抢到过的不再抢
   const state = readState();
-  const pending = okInfos.filter((x) => {
-    const done = state.accounts[tokenKey(x.p.acc.ref)];
-    return !done;
-  });
-  $.log(`🚀 抢券模式：目标场次 ${target.sessionCode}，开抢账号 ${pending.length}/${okInfos.length}`
-    + `（今日已抢到的跳过）`);
+  const pending = ready.filter((p) => !state.accounts[tokenKey(p.acc.ref)]);
+  $.log(`🎯 待抢 ${pending.length} 个号（今日已抢到跳过 ${ready.length - pending.length} 个）`);
   if (!pending.length) {
     $.log('ℹ️ 今天所有账号都已抢到过，不再抢');
-    await planNext(state, sessions, nowMs, okInfos.length);
+    await planNext(state, sessions, Date.now(), ready.length);
     return;
   }
 
-  // 等到开场前 LEAD_MS
+  // 7) 等到开场前 LEAD_MS
   const wait = target.startMs - LEAD_MS - Date.now();
   if (wait > 0) {
-    $.log(`⏳ 等待开场：${new Date(target.startMs).toTimeString().slice(0, 8)}`
+    $.log(`⏳ 等待开场 ${new Date(target.startMs).toTimeString().slice(0, 8)}`
       + `（${(wait / 1000).toFixed(2)}s 后开抢）`);
     await sleep(wait);
   }
 
-  // 开场瞬间拉 grabToken（开场后才下发）；没拿到就快速轮询，最多 2 秒
-  const tokenDeadline = Date.now() + 2000;
-  const tokens = await Promise.all(pending.map(async (x) => {
+  // 8) 开场瞬间拉 grabToken（开场后才下发）；没拿到就短轮询，总共最多 1.2 秒
+  const tokenDeadline = Date.now() + 1200;
+  const tokens = await Promise.all(pending.map(async (p) => {
     let lastErr = '未拿到 grabToken';
     while (Date.now() < tokenDeadline) {
-      const r = await grabInfoOnce(x.p.ctx, target);
+      const r = await grabInfoOnce(p.ctx, target);
       if (!r.ok) {
         lastErr = r.error;
         if (!r.blocked) break;          // 非 WAF 错误（如 token 失效）就别重试了
       } else {
         const list = flatten(Array.isArray(r.data.activityList) ? r.data.activityList : [], Date.now());
         const sess = list.find((s) => s.sessionCode === target.sessionCode);
-        if (sess && sess.grabToken) return { x, sess };
+        if (sess && sess.grabToken) return { p, sess };
         lastErr = sess ? '该场次还没下发 grabToken' : '找不到该场次';
       }
-      await sleep(180);
+      await sleep(250);
     }
-    return { x, error: lastErr };
+    return { p, error: lastErr };
   }));
 
   const shooters = tokens.filter((t) => t.sess && t.sess.grabToken);
   if (!shooters.length) {
     $.log('❌ [抢券] 没有任何账号拿到 grabToken');
-    for (const t of tokens) $.log(`   ✖ ${t.x.p.acc.label}：${t.error}`);
-    await planNext(state, sessions, Date.now(), okInfos.length);
+    for (const t of tokens) $.log(`   ✖ ${t.p.acc.label}：${t.error}`);
+    await planNext(state, sessions, Date.now(), ready.length);
     return;
   }
 
-  // 7) 全账号【并发】抢
-  $.log(`🎯 ${nowText()} 并发开抢（${shooters.length} 个号同时发请求）`);
+  // 9) 全账号【并发】抢（这是拆脚本的核心：串行会只有第一个号能抢到）
+  $.log(`🎯 ${nowText()} 并发开抢（${shooters.length} 个号同时发）`);
   const results = await Promise.all(shooters.map(async (t) => {
-    const { x, sess } = t;
+    const { p, sess } = t;
     const rights = grabbable(sess.rights);
-    if (!rights.length) return { x, ok: false, text: '本场次没有可抢的券' };
+    if (!rights.length) return { p, ok: false, text: '本场次没有可抢的券' };
     const right = rights[0];   // 一场只抢一张（同面额当天限一次）
     const req = {
       activityId: target.activityId,
@@ -838,39 +840,39 @@ async function main() {
       grabToken: sess.grabToken,
       rightCode: right.rightCode,
     };
-    let r = await grabCoupon(x.p.ctx, req);
+    let r = await grabCoupon(p.ctx, req);
     // 8000/8002/8004 是可重试失败，立刻补一枪（8001=券抢完就别浪费请求了）
     if (r.ok && [8000, 8002, 8004].includes(r.subCode)) {
       await sleep(120);
-      r = await grabCoupon(x.p.ctx, req);
+      r = await grabCoupon(p.ctx, req);
     }
     if (r.ok && r.subCode === 1) {
-      const info = r.couponInfo || {};
-      const name = info.couponName || info.name || right.rightCode;
-      const val = info.couponValue != null ? `（${(Number(info.couponValue) / 100).toFixed(0)}元）` : '';
-      return { x, ok: true, text: `${name}${val} 抢到了` };
+      const ci = r.couponInfo || {};
+      const name = ci.couponName || ci.name || right.rightCode;
+      const val = ci.couponValue != null ? `（${(Number(ci.couponValue) / 100).toFixed(0)}元）` : '';
+      return { p, ok: true, text: `${name}${val} 抢到了` };
     }
-    return { x, ok: false, subCode: r.subCode, text: r.ok ? r.text : r.error };
+    return { p, ok: false, text: r.ok ? r.text : r.error };
   }));
 
   let got = 0;
   for (const r of results) {
     if (r.ok) {
       got += 1;
-      state.accounts[tokenKey(r.x.p.acc.ref)] = {
+      state.accounts[tokenKey(r.p.acc.ref)] = {
         rightCode: 'ok', sessionCode: target.sessionCode, at: Date.now(),
       };
-      $.log(`  ✅ ${r.x.p.acc.label}：${r.text}`);
+      $.log(`  ✅ ${r.p.acc.label}：${r.text}`);
     } else {
-      $.log(`  ✖ ${r.x.p.acc.label}：${r.text}`);
+      $.log(`  ✖ ${r.p.acc.label}：${r.text}`);
     }
   }
   writeState(state);
-  $.log(`🏁 本轮结果：${got}/${results.length} 个号抢到`
+  $.log(`🏁 本轮：${got}/${results.length} 个号抢到`
     + `（耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s）`);
 
-  // 8) 收尾：还有没抢到的 + 后面还有场次 → 定到下一场；否则回 9:00
-  await planNext(state, sessions, Date.now(), okInfos.length, got);
+  // 10) 收尾：还有没抢到的 + 后面还有场次 → 定到下一场；否则回 9:00
+  await planNext(state, sessions, Date.now(), ready.length);
 }
 
 /** 决定下一次触发时间 */
