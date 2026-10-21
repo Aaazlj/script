@@ -568,6 +568,42 @@ class Yuhua(BaseApiClient):
     TASK_SERVICE = "ActivityTask"
     TASK_PREFIX = "ActivityTaskMobileService."
 
+    def ad_task(self, task_type: int, bus_type: int) -> str:
+        """看广告类任务：sign = HMAC-SHA256(silk_id&timestamp&nonce&bus_type)"""
+        time.sleep(random.uniform(3.0, 5.0))
+        timestamp = int(time.time())
+        nonce = "".join(random.choice(string.digits) for _ in range(6))
+        sign_text = (f"silk_id={int(self.teemo)}&timestamp={timestamp}"
+                     f"&nonce={nonce}&bus_type={int(bus_type)}")
+        signature = hmac.new(b"lcjkbqadfrzsewxy", sign_text.encode(), hashlib.sha256).digest()
+        payload = {"silk_id": int(self.teemo), "timestamp": timestamp, "nonce": nonce,
+                   "bus_type": int(bus_type), "sign": b64encode(signature).decode(),
+                   "task_type": task_type, "app_id": 20}
+        try:
+            resp = self.call("SilkwormLottery", "SilkwormLotteryMobile.OnAdViewed", payload).json()
+            if resp["status"]["code"] == 0:
+                return f"任务[{task_type}]完成, 抽奖次数+1"
+            return f"任务[{task_type}]失败, {resp['status']['msg']}"
+        except Exception as exc:
+            return f"任务[{task_type}]异常: {parse_error(exc)}"
+
+    def run_all(self) -> List[str]:
+        logs = [self.sign_in()]                 # 会员签到（= 日常福利「每日签到」，只做这一次）
+        for t in (2, 8, 9, 10, 11):             # 1 是签到，已由 sign_in 完成
+            logs.append(self.task(t))
+        logs.append(self.ad_task(6, 2))
+        logs.append(self.ad_task(7, 4))
+        for _ in range(20):                     # 有多少次抽多少次，风控/没次数就停
+            ret = self.lottery()
+            logs.append(ret)
+            if "抽奖成功" not in ret:
+                break
+            time.sleep(random.uniform(2.0, 4.0))
+        logs.append(self.receive_cumulative_reward())
+        logs.append(self.daily_task_step())
+        logs.append(self.yb_lottery_step())
+        return [x for x in logs if x]            # 关掉的步骤返回空串，别留空行
+
     def daily_tasks(self) -> Dict:
         """拉日常福利任务列表（需要 user_id，不是 silk_id）"""
         payload = {"silk_id": int(self.teemo), "user_id": int(self.vayne), "app_id": 20}
