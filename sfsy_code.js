@@ -275,20 +275,23 @@ function makeTunnelAgent(proxyUrl, secure) {
         }
         const rest = Buffer.from(buf.slice(idx + 4), 'latin1');
         if (rest.length) raw.unshift(rest);
-        if (!secure) return done(null, raw);
+        if (!secure) { raw.setTimeout(0); return done(null, raw); }
         const tlsSock = tls.connect({ socket: raw, servername: host });
-        tlsSock.once('secureConnect', () => done(null, tlsSock));
+        tlsSock.once('secureConnect', () => { raw.setTimeout(0); done(null, tlsSock); });
         tlsSock.once('error', (e) => done(e));
       };
       raw.on('data', onData);
       raw.once('error', (e) => done(e));
-      raw.setTimeout(15000, () => { raw.destroy(); done(new Error('代理连接超时')); });
+      // 只管建连阶段：坏节点 8 秒放弃；连上后清掉，别把偶发慢响应误杀
+      const CONNECT_TIMEOUT = Number(process.env.sf_connect_timeout || 8000);
+      raw.setTimeout(CONNECT_TIMEOUT, () => { raw.destroy(); done(new Error('代理连接超时')); });
       raw.once('connect', () => {
         raw.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${authHeader}\r\n`);
       });
     }
   }
-  return new TunnelAgent({ keepAlive: false });
+  // agent 已按「代理URL+secure」缓存，keepAlive 才能真正复用同一条隧道
+  return new TunnelAgent({ keepAlive: true, keepAliveMsecs: 15000, maxSockets: 4, maxFreeSockets: 2 });
 }
 
 const agentCache = new Map();
