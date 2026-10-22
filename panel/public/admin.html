@@ -695,8 +695,9 @@ function parseTags(value) {
 function describeTags(value) {
   const tags = parseTags(value);
   if (!tags.length) {
-    const offNames = scriptDefs().filter((d) => d.defaultOff).map((d) => d.name);
-    return offNames.length ? '默认脚本（不含 ' + offNames.join('、') + '）' : '全部脚本';
+    // 有「默认关」的脚本时，这一档就只是「默认脚本」——不再把具体名字标出来（用户要求）
+    const hasDefaultOff = scriptDefs().some((d) => d.defaultOff);
+    return hasDefaultOff ? '默认脚本' : '全部脚本';
   }
   return '只跑：' + tags.map(scriptName).join('、');
 }
@@ -844,7 +845,7 @@ function scriptToggles(a) {
   box.appendChild(node('span', {
     class: 'tag' + (unrestricted ? '' : ' primary'),
     title: '当前生效范围',
-    // 空标记不再是简单的「全部脚本」——有 defaultOff 脚本时要说清「不含谁」
+    // 空标记：有 defaultOff 脚本时叫「默认脚本」，否则就是「全部脚本」
     text: unrestricted ? describeTags('') : describeTags(tags.join(',')),
   }));
   return box;
