@@ -232,20 +232,27 @@ function getProxyAgents(userOverride) {
             }
             const rest = Buffer.from(buf.slice(idx + 4), "latin1");
             if (rest.length) raw.unshift(rest);   // CONNECT 响应后可能已经跟了数据
-            if (!secure) return done(null, raw);
+            if (!secure) { raw.setTimeout(0); return done(null, raw); }
             const tlsSock = tls.connect({ socket: raw, servername: host });
-            tlsSock.once("secureConnect", () => done(null, tlsSock));
+            tlsSock.once("secureConnect", () => { raw.setTimeout(0); done(null, tlsSock); });
             tlsSock.once("error", e => done(e));
           };
           raw.on("data", onData);
           raw.once("error", e => done(e));
-          raw.setTimeout(15000, () => { raw.destroy(); done(new Error("代理连接超时")); });
+          // 超时只管「建连阶段」：坏节点 8 秒就放弃、马上换出口重试；
+          // 建连成功后清掉 socket 超时，响应慢不慢交给请求层的 REQUEST_TIMEOUT。
+          // （原来是整个连接 15 秒 idle 就 destroy —— 朴朴偶发慢响应就被误杀，
+          //   日志里那种 15003~15015ms 的 ERR_GOT_REQUEST_ERROR 全都是它。）
+          const CONNECT_TIMEOUT = Number(process.env.ppcs_connect_timeout || 8000);
+          raw.setTimeout(CONNECT_TIMEOUT, () => { raw.destroy(); done(new Error("代理连接超时")); });
           raw.once("connect", () => {
             raw.write("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n" + authHeader + "\r\n");
           });
         }
       }
-      return new ProxyTunnelAgent({ keepAlive: false });
+      // keepAlive：同一账号复用同一条隧道，省掉每个请求 1~3 秒的 CONNECT 握手
+      // （每个粘性账号有独立 agent，换出口时会把旧 agent 的连接池 destroy 掉）
+      return new ProxyTunnelAgent({ keepAlive: true, keepAliveMsecs: 15000, maxSockets: 4, maxFreeSockets: 2 });
     }
 
     agents.http = makeAgent(false);
@@ -622,10 +629,17 @@ class BaseRequest {
    */
   _rotateStickyProxy(retryCount) {
     if (!PROXY_STICKY || !PROXY_PARTS || !this.proxyRef) return;
-    if (retryCount < 2) return;
+    if (retryCount < 1) return;             // 第一次失败就换，别在坏节点上再耗一轮
     const round = (this._proxyRound || 0) + 1;
     if (round > 6) return;                 // 轮换 6 次还不行，就认命
     this._proxyRound = round;
+    const prevUser = String(this.proxyUser || "");
+    const prevAgents = proxyAgentsCache.get(prevUser);
+    if (prevAgents) {                       // 旧节点的隧道连接池直接扔掉
+      try { prevAgents.http && prevAgents.http.destroy(); } catch (_) {}
+      try { prevAgents.https && prevAgents.https.destroy(); } catch (_) {}
+      proxyAgentsCache.delete(prevUser);
+    }
     this.proxyUser = stickyProxyUser(this.proxyRef, round);
     this.log("🔁 连续失败，切换出口 → " + this.proxyUser);
   }
