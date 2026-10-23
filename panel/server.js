@@ -26,6 +26,7 @@ const qinglong = require('./lib/qinglong');
 const yyb = require('./lib/yyb');
 const upload = require('./lib/upload');
 const sign = require('./lib/sign');
+const jd = require('./lib/jd');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_QR_SESSIONS = 200;
@@ -38,10 +39,21 @@ const sessions = new Map();
 function pruneSessions() {
   const cutoff = Date.now() - 30 * 60 * 1000;
   for (const [k, v] of sessions) {
-    if (v.createdAt < cutoff) sessions.delete(k);
+    if (v.createdAt < cutoff) {
+      // 京东会话背后有个 chromium 进程，过期必须关掉，否则内存会被吃光
+      if (v.mode === 'jd' && v.jdSession) {
+        try { jd.close(v.jdSession); } catch (_) { /* ignore */ }
+      }
+      sessions.delete(k);
+    }
   }
   while (sessions.size > MAX_QR_SESSIONS) {
-    sessions.delete(sessions.keys().next().value);
+    const oldest = sessions.keys().next().value;
+    const s = sessions.get(oldest);
+    if (s && s.mode === 'jd' && s.jdSession) {
+      try { jd.close(s.jdSession); } catch (_) { /* ignore */ }
+    }
+    sessions.delete(oldest);
   }
 }
 
@@ -108,6 +120,50 @@ route('POST', '/api/yyb/confirm', async (req, res) => {
 
   // 账号只存在网关里，脚本运行时自动发现，扫码不写青龙
   httpx.ok(res, { account: conf.account });
+});
+
+/* 京东扫码登录 → 采 pt_key/pt_pin → 写青龙 JD_COOKIE */
+
+route('POST', '/api/jd/qr', async (req, res) => {
+  const out = await jd.createSession();
+  if (!out.ok) return httpx.fail(res, 502, out.error);
+  const sid = newSession({ mode: 'jd', jdSession: out });
+  httpx.ok(res, { sid, imageBase64: out.image, fallback: !!out.fallback });
+});
+
+route('GET', '/api/jd/poll', async (req, res, url) => {
+  const sid = url.searchParams.get('sid') || '';
+  const sess = sessions.get(sid);
+  if (!sess || sess.mode !== 'jd') return httpx.fail(res, 404, '扫码会话不存在或已过期，请刷新重试');
+
+  const out = await jd.poll(sess.jdSession);
+  httpx.ok(res, { status: out.code, msg: out.msg || '', pin: out.pt_pin || '' });
+});
+
+route('POST', '/api/jd/confirm', async (req, res) => {
+  const body = await httpx.readJSON(req);
+  const sid = body.sid;
+  const sess = sessions.get(sid);
+  if (!sess || sess.mode !== 'jd') return httpx.fail(res, 404, '扫码会话不存在或已过期，请刷新重试');
+
+  const out = await jd.poll(sess.jdSession);
+  if (out.code !== 200) {
+    return httpx.fail(res, 400, out.code === 202 ? '手机上还没点「确认登录」' : '还没扫码成功');
+  }
+  await jd.close(sess.jdSession);
+  sessions.delete(sid);
+
+  const cfg = config.load();
+  if (!cfg.qinglong.host) return httpx.fail(res, 400, '还没配置青龙，请先到后台设置');
+
+  const written = await qinglong.appendEnvLine(cfg.qinglong, 'JD_COOKIE', out.cookie, `京东扫码 ${out.pt_pin}`);
+  if (!written.ok) return httpx.fail(res, 502, `拿到 cookie 但写青龙失败：${written.error || ''}`);
+
+  httpx.ok(res, {
+    pin: out.pt_pin,
+    preview: `${out.pt_key.slice(0, 6)}****${out.pt_key.slice(-4)}`,
+    qinglong: written.action || 'ok',
+  });
 });
 
 /* 美团签名服务（供青龙里的 meituan_code.js 调用，只需容器网络可达） */
