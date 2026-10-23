@@ -75,6 +75,20 @@ async function createSession() {
       await new Promise((r) => setTimeout(r, 400));
     }
 
+    // 关键：等图片真正加载完。domcontentloaded 时 img 往往还是占位/空图，
+    // 这时候截出来的码扫了会提示「二维码无效」——页面其实早换成新码了。
+    if (target) {
+      try {
+        await page.waitForFunction(() => {
+          const img = document.querySelector('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
+          return Boolean(img && img.complete && img.naturalWidth > 50);
+        }, { timeout: 12000 });
+      } catch (_) {
+        // 等不到就用当前状态截，至少不是空白页
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+
     let image;
     let fallback = false;
     if (target) {
