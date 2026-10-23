@@ -42,7 +42,8 @@ function env(...names) {
 }
 
 const COOKIE_RAW = env('jd_cookie', 'JD_COOKIE');
-const HOURS = (env('jd_grab_hour') || '8').split(/[,，\s]+/).map(Number).filter((n) => n >= 0 && n <= 23);
+const HOURS = (env('jd_grab_hour') || '8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23')
+  .split(/[,，\s]+/).map(Number).filter((n) => n >= 0 && n <= 23);
 const OPEN_SEC = Math.max(20, Number(env('jd_grab_open_sec') || 75));
 const ACT_ID = env('jd_grab_act_id') || '2BuMtujoMx1EPnFvUrUpsrYucqUK';
 const SHOT_DIR = env('jd_grab_shot_dir') || '/ql/data/jd_grab_shots';
@@ -82,20 +83,21 @@ function parseCookie(raw) {
   return out;
 }
 
-/* ---------- 目标场次 ---------- */
+/* ---------- 目标场次：最近一个还没开始的 ---------- */
 function pickTarget() {
   const now = new Date();
   const cands = [];
-  for (const h of HOURS) {
-    const t = new Date(now);
-    t.setHours(h, 0, 0, 0);
-    if (t.getTime() > now.getTime() - 1000) cands.push(t);       // 还没开始（或刚开始 1s 内）
-    const tomorrow = new Date(t);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    cands.push(tomorrow);                                        // 明天的同一场
+  const hours = HOURS.length ? HOURS : [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
+  for (const h of hours) {
+    for (let d = 0; d <= 1; d += 1) {
+      const t = new Date(now);
+      t.setDate(t.getDate() + d);
+      t.setHours(h, 0, 0, 0);
+      if (t.getTime() > now.getTime() - 2000) cands.push(t);   // 还没开始（含刚过 2s）
+    }
   }
   cands.sort((a, b) => a - b);
-  return cands[0];
+  return cands[0] || new Date(now.getTime() + 3600 * 1000);
 }
 
 /* ---------- 点击领取 ---------- */
