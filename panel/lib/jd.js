@@ -97,18 +97,40 @@ async function createSession() {
     // 用户拿到手时页面早换过一轮了（扫了提示「二维码无效」，poll 却还是 201）。
     // 走 img.src 拿到的是「页面此刻正在显示的那张」，和页面严格一致。
     if (target) {
+      // 先看 img.src 是什么形态
+      const srcInfo = await page.evaluate(() => {
+        const img = document.querySelector('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
+        return img ? { src: String(img.src || '').slice(0, 120), len: String(img.src || '').length } : null;
+      }).catch(() => null);
+      console.log('[jd] qr img src:', JSON.stringify(srcInfo));
+
       try {
         image = await page.evaluate(async () => {
           const img = document.querySelector('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
-          if (!img || !img.src) return '';
-          const r = await fetch(img.src, { credentials: 'include' });
+          if (!img) return '';
+          const src = String(img.src || '');
+          // data: URL 直接切出 base64
+          if (src.startsWith('data:image')) {
+            const i = src.indexOf(',');
+            return i > 0 ? src.slice(i + 1) : '';
+          }
+          // 普通 URL：页面内 fetch（带 cookie），保证和页面当前显示的一致
+          const r = await fetch(src, { credentials: 'include' });
           const buf = await r.arrayBuffer();
           const bytes = new Uint8Array(buf);
           let bin = '';
           for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
           return btoa(bin);
         });
-      } catch (_) { image = ''; }
+      } catch (e) {
+        console.log('[jd] img.src 取图失败:', e.message);
+        image = '';
+      }
+
+      // fetch 拿不到就退回元素截图（比整页截图准）
+      if (!image) {
+        try { image = await target.screenshot({ encoding: 'base64' }); } catch (_) { image = ''; }
+      }
     }
 
     if (!image) {
