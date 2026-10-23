@@ -81,6 +81,18 @@ async function createSession() {
       await page.authenticate({ username, password: rest.join(':') }).catch(() => {});
     }
     await page.setUserAgent(UA);
+
+    // 捕获页面加载到的真二维码（qr.m.jd.com/show 返回的 PNG）
+    let qrFromResponse = '';
+    page.on('response', async (r) => {
+      try {
+        const u = r.url();
+        if (!u.includes('qr.m.jd.com/show')) return;
+        if (r.status() !== 200) return;
+        const buf = await r.buffer();
+        if (buf && buf.length > 500) qrFromResponse = buf.toString('base64');
+      } catch (_) { /* ignore */ }
+    });
     await page.setViewport({ width: 420, height: 760, deviceScaleFactor: 2, isMobile: false });
 
     try {
@@ -128,65 +140,25 @@ async function createSession() {
       await new Promise((r) => setTimeout(r, 300));
     }
 
-    let image = '';
+    // 关键：真二维码是页面 JS 动态请求 qr.m.jd.com/show 拿到的（每次带新 t 参数），
+    // 页面上那张 img13.360buyimg.com/147px 的图只是「扫码登录」静态占位图 ——
+    // 之前一直截它，用户扫了当然一直是 201（未扫描）。
+    // 改为监听页面对 qr.m.jd.com/show 的响应，直接拿页面真正在用的那张码。
+    let image = qrFromResponse;
     let fallback = false;
 
-    // 优先：直接读 img.src，用页面内 fetch 取图。
-    // 为什么不用截图：京东登录页每 60s 自动换一张码，截图耗时 + 传输延迟下来，
-    // 用户拿到手时页面早换过一轮了（扫了提示「二维码无效」，poll 却还是 201）。
-    // 走 img.src 拿到的是「页面此刻正在显示的那张」，和页面严格一致。
-    if (target) {
-      // 先看 img.src 是什么形态
-      const srcInfo = await page.evaluate(() => {
-        const imgs = [...document.querySelectorAll('img')];
-        const img = imgs.find((el) => {
-          const s = String(el.src || '');
-          return s.includes('360buyimg.com') && !/logo/i.test(s)
-            && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
-        });
-        return img ? { src: String(img.src || '').slice(0, 100), len: String(img.src || '').length } : null;
-      }).catch(() => null);
-      console.log('[jd] qr img src:', JSON.stringify(srcInfo));
-
-      try {
-        image = await page.evaluate(async () => {
-          const imgs = [...document.querySelectorAll('img')];
-          const img = imgs.find((el) => {
-            const s = String(el.src || '');
-            return s.includes('360buyimg.com') && !/logo/i.test(s)
-              && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
-          });
-          if (!img) return '';
-          const src = String(img.src || '');
-          // data: URL 直接切出 base64
-          if (src.startsWith('data:image')) {
-            const i = src.indexOf(',');
-            return i > 0 ? src.slice(i + 1) : '';
-          }
-          // 普通 URL：页面内 fetch（带 cookie），保证和页面当前显示的一致
-          const r = await fetch(src, { credentials: 'include' });
-          const buf = await r.arrayBuffer();
-          const bytes = new Uint8Array(buf);
-          let bin = '';
-          for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
-          return btoa(bin);
-        });
-      } catch (e) {
-        console.log('[jd] img.src 取图失败:', e.message);
-        image = '';
-      }
-
-      // fetch 拿不到就退回元素截图（比整页截图准）
-      if (!image) {
-        try { image = await target.asElement().screenshot({ encoding: 'base64' }); } catch (_) { image = ''; }
+    if (!image) {
+      for (let i = 0; i < 60 && !image; i += 1) {
+        await new Promise((r) => setTimeout(r, 500));
+        image = qrFromResponse;
       }
     }
 
     if (!image) {
-      // 兜底：整页截图，让人自己找二维码
-      image = await page.screenshot({ encoding: 'base64' });
+      image = await page.screenshot({ encoding: 'base64' }).catch(() => '');
       fallback = true;
     }
+
     return { ok: true, browser, page, image, fallback, createdAt: Date.now() };
   } catch (e) {
     try { await browser.close(); } catch (_) { /* ignore */ }
