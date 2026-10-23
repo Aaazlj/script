@@ -61,16 +61,18 @@ async function createSession() {
     await page.setViewport({ width: 420, height: 760, deviceScaleFactor: 2, isMobile: false });
 
     try {
-      await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 45000 });
-    } catch (_) { /* 页面可能一直有轮询，networkidle 超时属正常，继续 */ }
+      // 用 domcontentloaded 而不是 networkidle2：登录页本身一直在轮询二维码状态，
+      // networkidle 永远等不到，会白等 45s 超时（二维码有效期才 2 分钟，耗不起）。
+      await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (_) { /* 超时也继续，下面直接找二维码 */ }
 
     // 等二维码元素出现（京东是 img[src*="qr.m.jd.com/show"]）
     let target = null;
-    for (let i = 0; i < 24; i += 1) {
+    for (let i = 0; i < 20; i += 1) {
       /* eslint-disable no-await-in-loop */
       target = await page.$('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
       if (target) break;
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 400));
     }
 
     let image;
