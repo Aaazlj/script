@@ -83,23 +83,10 @@ async function createSession() {
     await page.setUserAgent(UA);
     await page.setViewport({ width: 420, height: 760, deviceScaleFactor: 2, isMobile: false });
 
-    // 服务器在海外，京东登录页有几十个第三方资源（统计/字体/图标），全加载要 60s+。
-    // 只放行「登录页本身 + 京东 CDN 的图」，其余直接 abort，能压到 10s 内。
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const u = req.url();
-      const keep = /^https?:\/\/passport\.jd\.com\//.test(u)
-        || /^https?:\/\/(img\d*|misc|storage\d*)\.360buyimg\.com\//.test(u)
-        || /^https?:\/\/storage\.jd\.com\//.test(u)
-        || /^https?:\/\/qr\.m\.jd\.com\//.test(u)
-        || req.resourceType() === 'document';
-      if (keep) req.continue().catch(() => {});
-      else req.abort().catch(() => {});
-    });
-
     try {
-      // commit：导航一开始就返回，不等资源加载（这页几十个 JS，等完要 40s+）
-      await page.goto(LOGIN_URL, { waitUntil: 'commit', timeout: 20000 });
+      // 这页几十个 JS，domcontentloaded 通常 40~60s；commit 又太早（白屏）。
+      // 实证：直连京东 1.1s 就有响应，慢在页面资源，只能等它渲染完。
+      await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 75000 });
     } catch (_) { /* 超时也继续 */ }
 
     // 关键：页面是 JS 渲染的，commit 时还是白屏。必须等二维码 img 真正渲染出来
@@ -112,10 +99,10 @@ async function createSession() {
           return s.includes('360buyimg.com') && !/logo/i.test(s)
             && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
         });
-      }, { timeout: 35000, polling: 500 });
+      }, { timeout: 45000, polling: 500 });
     } catch (_) {
       const shot = await page.screenshot({ encoding: 'base64' }).catch(() => '');
-      return { ok: false, error: '等了 35 秒二维码还没渲染出来（页面可能被拦截或加载失败）', debugImage: shot };
+      return { ok: false, error: '等了 45 秒二维码还没渲染出来（页面可能被拦截或加载失败）', debugImage: shot };
     }
 
     const target = await page.evaluateHandle(() => {
