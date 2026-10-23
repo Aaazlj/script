@@ -21,6 +21,17 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 
 /** 扫码会话最长存活时间（毫秒），超时由调用方关闭 */
 const SESSION_TTL = 5 * 60 * 1000;
+/** 页面里哪个 img 是二维码：实测是 img13.360buyimg.com/imagetools/... 且 naturalWidth≈147 */
+const QR_PICK = `
+  const imgs = [...document.querySelectorAll('img')];
+  const isQr = (el) => {
+    const s = String(el.src || '');
+    return s.includes('360buyimg.com') && !/logo/i.test(s)
+      && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
+  };
+  const img = imgs.find(isQr) || null;
+`;
+
 
 let pptr = null;
 let pptrErr = '';
@@ -72,7 +83,8 @@ async function createSession() {
         const imgs = [...document.querySelectorAll('img')];
         return imgs.some((el) => {
           const s = String(el.src || '');
-          return s.includes('qr.m.jd.com') && el.complete && el.naturalWidth > 50;
+          return s.includes('360buyimg.com') && !/logo/i.test(s)
+            && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
         });
       }, { timeout: 35000, polling: 500 });
     } catch (_) {
@@ -84,7 +96,8 @@ async function createSession() {
       const imgs = [...document.querySelectorAll('img')];
       return imgs.find((el) => {
         const s = String(el.src || '');
-        return s.includes('qr.m.jd.com') && el.complete && el.naturalWidth > 50;
+        return s.includes('360buyimg.com') && !/logo/i.test(s)
+          && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
       }) || null;
     });
 
@@ -115,8 +128,8 @@ async function createSession() {
         const imgs = [...document.querySelectorAll('img')];
         const img = imgs.find((el) => {
           const s = String(el.src || '');
-          return (s.includes('qr.m.jd.com') || /qr|qrcode/i.test(el.className || ''))
-            && el.complete && el.naturalWidth > 50;
+          return s.includes('360buyimg.com') && !/logo/i.test(s)
+            && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
         });
         return img ? { src: String(img.src || '').slice(0, 100), len: String(img.src || '').length } : null;
       }).catch(() => null);
@@ -127,8 +140,8 @@ async function createSession() {
           const imgs = [...document.querySelectorAll('img')];
           const img = imgs.find((el) => {
             const s = String(el.src || '');
-            return (s.includes('qr.m.jd.com') || /qr|qrcode/i.test(el.className || ''))
-              && el.complete && el.naturalWidth > 50;
+            return s.includes('360buyimg.com') && !/logo/i.test(s)
+              && el.complete && el.naturalWidth >= 140 && el.naturalWidth <= 165;
           });
           if (!img) return '';
           const src = String(img.src || '');
