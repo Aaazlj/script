@@ -171,7 +171,10 @@ async function main() {
   const waitOpen = openAt - Date.now();
   $.log(`🎯 目标 ${target.toLocaleString('zh-CN')}（还有 ${((target - Date.now()) / 60000).toFixed(1)} 分钟）`);
 
-  if (waitOpen > 0) {
+  const NO_WAIT = env('jd_grab_no_wait') === '1';
+  if (NO_WAIT) {
+    $.log('⚠️ 测试模式（jd_grab_no_wait=1）：跳过等待，立即执行');
+  } else if (waitOpen > 0) {
     $.log(`⏳ 等 ${(waitOpen / 1000).toFixed(0)}s 后启动浏览器（提前 ${OPEN_SEC}s）`);
     await sleep(waitOpen);
   }
@@ -239,7 +242,7 @@ async function main() {
 
     // 等到整点
     const until = target.getTime() - Date.now();
-    if (until > 0) {
+    if (until > 0 && !NO_WAIT) {
       $.log(`⏳ 等到整点（${(until / 1000).toFixed(2)}s）`);
       await sleep(until);
     }
