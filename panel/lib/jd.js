@@ -61,30 +61,32 @@ async function createSession() {
     await page.setViewport({ width: 420, height: 760, deviceScaleFactor: 2, isMobile: false });
 
     try {
-      // commit：导航一开始就返回，不等 DOMContentLoaded / 资源加载。
-      // 这个页面很重（几十个 JS + 一直在轮询），等完要 40s，而二维码只有 2 分钟有效期。
+      // commit：导航一开始就返回，不等资源加载（这页几十个 JS，等完要 40s+）
       await page.goto(LOGIN_URL, { waitUntil: 'commit', timeout: 20000 });
-    } catch (_) { /* 超时也继续，下面直接找二维码 */ }
+    } catch (_) { /* 超时也继续 */ }
 
-    // 等「带真实 src」的二维码 img 出现（占位图 src 是空的）
-    let target = null;
-    for (let i = 0; i < 40; i += 1) {
-      /* eslint-disable no-await-in-loop */
-      target = await page.evaluateHandle(() => {
+    // 关键：页面是 JS 渲染的，commit 时还是白屏。必须等二维码 img 真正渲染出来
+    // （src 含 qr.m.jd.com 且 complete && naturalWidth>50），否则会截到白图。
+    try {
+      await page.waitForFunction(() => {
         const imgs = [...document.querySelectorAll('img')];
-        const hit = imgs.find((el) => {
+        return imgs.some((el) => {
           const s = String(el.src || '');
-          return (s.includes('qr.m.jd.com') || /qr|qrcode/i.test(el.className || ''))
-            && el.complete && el.naturalWidth > 50;
+          return s.includes('qr.m.jd.com') && el.complete && el.naturalWidth > 50;
         });
-        return hit || null;
-      });
-      const el = target.asElement();
-      if (el) break;
-      await target.dispose().catch(() => {});
-      target = null;
-      await new Promise((r) => setTimeout(r, 400));
+      }, { timeout: 35000, polling: 500 });
+    } catch (_) {
+      const shot = await page.screenshot({ encoding: 'base64' }).catch(() => '');
+      return { ok: false, error: '等了 35 秒二维码还没渲染出来（页面可能被拦截或加载失败）', debugImage: shot };
     }
+
+    const target = await page.evaluateHandle(() => {
+      const imgs = [...document.querySelectorAll('img')];
+      return imgs.find((el) => {
+        const s = String(el.src || '');
+        return s.includes('qr.m.jd.com') && el.complete && el.naturalWidth > 50;
+      }) || null;
+    });
 
     // 关键：等图片真正加载完。domcontentloaded 时 img 往往还是占位/空图，
     // 这时候截出来的码扫了会提示「二维码无效」——页面其实早换成新码了。
