@@ -36,9 +36,6 @@ services:
     image: script-scan-panel:latest
     container_name: scan-panel
     restart: unless-stopped
-    environment:
-      # 京东扫码用：浏览器走网关的国内出口隧道（直连海外加载登录页要 60s+）
-      - JD_PROXY=http://yyb-go:8000
     depends_on:
       - yyb-go
     ports:
@@ -47,6 +44,8 @@ services:
     environment:
       PORT: "5180"
       TZ: Asia/Shanghai
+      # 京东扫码用：浏览器走网关的国内出口隧道（海外直连加载登录页要 60s+）
+      JD_PROXY: http://yyb-go:8000
       # 面板后台「青龙面板地址」的初始默认值
       PANEL_QINGLONG_HOST: http://qinglong-web-1:5700
       # 面板服务端到应用宝网关的地址（走 compose 内网）
