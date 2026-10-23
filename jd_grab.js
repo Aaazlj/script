@@ -261,14 +261,24 @@ async function main() {
       $.log('❌ 页面标题不对，可能 cookie 失效或被重定向');
     }
 
-    // 等按钮出现
+    // 等按钮出现；金券区没渲染（接口 403 概率拦截）就刷新重试
     let st = { state: 'unknown', text: '' };
-    for (let i = 0; i < 20; i += 1) {
-      st = await findClaimable(page);
+    for (let round = 0; round < 3; round += 1) {
+      if (round) {
+        $.log(`🔄 金券区没出来，刷新重试（第 ${round + 1}/3 轮）`);
+        try {
+          await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
+        } catch (_) { /* 刷新失败就继续等 */ }
+        await sleep(2500);
+      }
+      for (let i = 0; i < 20; i += 1) {
+        st = await findClaimable(page);
+        if (st.state !== 'unknown') break;
+        await sleep(500);
+      }
       if (st.state !== 'unknown') break;
-      await sleep(500);
     }
-    $.log(`🔎 按钮状态：${st.state} ${st.text ? '(' + st.text + ')' : ''}`);
+    $.log(`🔎 按钮状态：${st.state} ${st.text ? '(' + st.text.slice(0, 40) + ')' : ''}`);
     if (st.state === 'done') {
       $.log(`ℹ️ 今天这场的券已经领过了（${st.text}），记录状态后退出`);
       writeState({ claimed: true, pin: cookies.pt_pin, at: nowText(), by: 'page-button' });
