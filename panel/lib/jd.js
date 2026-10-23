@@ -61,17 +61,28 @@ async function createSession() {
     await page.setViewport({ width: 420, height: 760, deviceScaleFactor: 2, isMobile: false });
 
     try {
-      // 用 domcontentloaded 而不是 networkidle2：登录页本身一直在轮询二维码状态，
-      // networkidle 永远等不到，会白等 45s 超时（二维码有效期才 2 分钟，耗不起）。
-      await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      // commit：导航一开始就返回，不等 DOMContentLoaded / 资源加载。
+      // 这个页面很重（几十个 JS + 一直在轮询），等完要 40s，而二维码只有 2 分钟有效期。
+      await page.goto(LOGIN_URL, { waitUntil: 'commit', timeout: 20000 });
     } catch (_) { /* 超时也继续，下面直接找二维码 */ }
 
-    // 等二维码元素出现（京东是 img[src*="qr.m.jd.com/show"]）
+    // 等「带真实 src」的二维码 img 出现（占位图 src 是空的）
     let target = null;
-    for (let i = 0; i < 20; i += 1) {
+    for (let i = 0; i < 40; i += 1) {
       /* eslint-disable no-await-in-loop */
-      target = await page.$('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
-      if (target) break;
+      target = await page.evaluateHandle(() => {
+        const imgs = [...document.querySelectorAll('img')];
+        const hit = imgs.find((el) => {
+          const s = String(el.src || '');
+          return (s.includes('qr.m.jd.com') || /qr|qrcode/i.test(el.className || ''))
+            && el.complete && el.naturalWidth > 50;
+        });
+        return hit || null;
+      });
+      const el = target.asElement();
+      if (el) break;
+      await target.dispose().catch(() => {});
+      target = null;
       await new Promise((r) => setTimeout(r, 400));
     }
 
@@ -99,14 +110,24 @@ async function createSession() {
     if (target) {
       // 先看 img.src 是什么形态
       const srcInfo = await page.evaluate(() => {
-        const img = document.querySelector('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
-        return img ? { src: String(img.src || '').slice(0, 120), len: String(img.src || '').length } : null;
+        const imgs = [...document.querySelectorAll('img')];
+        const img = imgs.find((el) => {
+          const s = String(el.src || '');
+          return (s.includes('qr.m.jd.com') || /qr|qrcode/i.test(el.className || ''))
+            && el.complete && el.naturalWidth > 50;
+        });
+        return img ? { src: String(img.src || '').slice(0, 100), len: String(img.src || '').length } : null;
       }).catch(() => null);
       console.log('[jd] qr img src:', JSON.stringify(srcInfo));
 
       try {
         image = await page.evaluate(async () => {
-          const img = document.querySelector('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
+          const imgs = [...document.querySelectorAll('img')];
+          const img = imgs.find((el) => {
+            const s = String(el.src || '');
+            return (s.includes('qr.m.jd.com') || /qr|qrcode/i.test(el.className || ''))
+              && el.complete && el.naturalWidth > 50;
+          });
           if (!img) return '';
           const src = String(img.src || '');
           // data: URL 直接切出 base64
@@ -129,7 +150,7 @@ async function createSession() {
 
       // fetch 拿不到就退回元素截图（比整页截图准）
       if (!image) {
-        try { image = await target.screenshot({ encoding: 'base64' }); } catch (_) { image = ''; }
+        try { image = await target.asElement().screenshot({ encoding: 'base64' }); } catch (_) { image = ''; }
       }
     }
 
