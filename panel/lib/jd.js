@@ -71,6 +71,20 @@ async function createSession() {
     await page.setUserAgent(UA);
     await page.setViewport({ width: 420, height: 760, deviceScaleFactor: 2, isMobile: false });
 
+    // 服务器在海外，京东登录页有几十个第三方资源（统计/字体/图标），全加载要 60s+。
+    // 只放行「登录页本身 + 京东 CDN 的图」，其余直接 abort，能压到 10s 内。
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const u = req.url();
+      const keep = /^https?:\/\/passport\.jd\.com\//.test(u)
+        || /^https?:\/\/(img\d*|misc|storage\d*)\.360buyimg\.com\//.test(u)
+        || /^https?:\/\/storage\.jd\.com\//.test(u)
+        || /^https?:\/\/qr\.m\.jd\.com\//.test(u)
+        || req.resourceType() === 'document';
+      if (keep) req.continue().catch(() => {});
+      else req.abort().catch(() => {});
+    });
+
     try {
       // commit：导航一开始就返回，不等资源加载（这页几十个 JS，等完要 40s+）
       await page.goto(LOGIN_URL, { waitUntil: 'commit', timeout: 20000 });
