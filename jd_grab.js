@@ -51,6 +51,7 @@ const HEADLESS = env('jd_grab_headless') !== '0';
 
 const PUPPETEER = env('jd_grab_puppeteer') || '/ql/data/puppeteer/node_modules/puppeteer-core';
 const CHROME = env('jd_grab_chrome') || '/usr/bin/chromium-browser';
+const STATE_FILE = env('jd_grab_state_file') || '/ql/data/jd_grab_state.json';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) '
   + 'Chrome/144.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI '
@@ -69,6 +70,28 @@ const mask = (s, h = 4, t = 4) => {
   s = String(s || '');
   return s.length <= h + t ? '***' : `${s.slice(0, h)}****${s.slice(-t)}`;
 };
+
+/* ---------- 当日已领状态：一个号一天只能领一张，领过就不再碰 ---------- */
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+function readState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (s && s.date === todayStr()) return s;
+  } catch (_) { /* 没有状态文件 */ }
+  return null;
+}
+
+function writeState(info) {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE,
+      JSON.stringify(Object.assign({ date: todayStr() }, info), null, 1), 'utf8');
+  } catch (_) { /* 写不了不影响主流程 */ }
+}
 
 /* ---------- cookie 解析 ---------- */
 function parseCookie(raw) {
@@ -168,6 +191,16 @@ async function main() {
   }
   $.log(`🔐 cookie 字段 ${Object.keys(cookies).length} 个 ｜ pin=${mask(cookies.pt_pin)}`);
 
+  // 一个号一天只能领一次：今天已经领过就直接退出，连浏览器都不开
+  const dayState = readState();
+  if (dayState && dayState.claimed) {
+    $.log(`✅ 今天（${dayState.date}）已经领过了${dayState.pin ? '，pin=' + mask(dayState.pin) : ''}`);
+    $.log('   按「一个号一天只能领一次」，本次不再发起领取，直接退出。');
+    $.log(`   如确认是误判，删掉 ${STATE_FILE} 再跑即可。`);
+    return;
+  }
+  $.log('🆕 今天还没领过，继续');
+
   const target = pickTarget();
   const openAt = target.getTime() - OPEN_SEC * 1000;
   const waitOpen = openAt - Date.now();
@@ -237,7 +270,8 @@ async function main() {
     }
     $.log(`🔎 按钮状态：${st.state} ${st.text ? '(' + st.text + ')' : ''}`);
     if (st.state === 'done') {
-      $.log(`ℹ️ 今天这场的券已经领过了（${st.text}），脚本结束`);
+      $.log(`ℹ️ 今天这场的券已经领过了（${st.text}），记录状态后退出`);
+      writeState({ claimed: true, pin: cookies.pt_pin, at: nowText(), by: 'page-button' });
       await page.screenshot({ path: path.join(SHOT_DIR, `done-${Date.now()}.png`), fullPage: false }).catch(() => {});
       return;
     }
@@ -271,6 +305,15 @@ async function main() {
     const res = await readResult(page);
     $.log(`📣 结果关键词：${res.hit.join('、') || '（无）'}`);
     $.log(`   页面片段：${res.snippet.slice(0, 160)}`);
+
+    // 领到了就落当日状态，今天不再重复领
+    const successHits = res.hit.filter((k) => /抢券成功|领取成功|去使用|已领取/.test(k));
+    if (successHits.length) {
+      writeState({ claimed: true, pin: cookies.pt_pin, at: nowText(), by: 'click', hit: successHits.join(',') });
+      $.log('💾 已记录「今天领过了」，当天不会再领');
+    } else {
+      $.log('ℹ️ 没看到成功关键词，不写当日状态（下次 cron / 手动跑还可以再试）');
+    }
 
     try { fs.mkdirSync(SHOT_DIR, { recursive: true }); } catch (_) {}
     const shot = path.join(SHOT_DIR, `${new Date().toISOString().replace(/[:.]/g, '-')}.png`);
