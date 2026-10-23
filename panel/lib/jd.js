@@ -89,12 +89,30 @@ async function createSession() {
       await new Promise((r) => setTimeout(r, 300));
     }
 
-    let image;
+    let image = '';
     let fallback = false;
+
+    // 优先：直接读 img.src，用页面内 fetch 取图。
+    // 为什么不用截图：京东登录页每 60s 自动换一张码，截图耗时 + 传输延迟下来，
+    // 用户拿到手时页面早换过一轮了（扫了提示「二维码无效」，poll 却还是 201）。
+    // 走 img.src 拿到的是「页面此刻正在显示的那张」，和页面严格一致。
     if (target) {
-      image = await target.screenshot({ encoding: 'base64' });
-    } else {
-      // 找不到就整页截一张，让人自己找二维码
+      try {
+        image = await page.evaluate(async () => {
+          const img = document.querySelector('img[src*="qr.m.jd.com"], #qr-img, .qrcode-img, img.qrcode');
+          if (!img || !img.src) return '';
+          const r = await fetch(img.src, { credentials: 'include' });
+          const buf = await r.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let bin = '';
+          for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+          return btoa(bin);
+        });
+      } catch (_) { image = ''; }
+    }
+
+    if (!image) {
+      // 兜底：整页截图，让人自己找二维码
       image = await page.screenshot({ encoding: 'base64' });
       fallback = true;
     }
