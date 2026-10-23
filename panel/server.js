@@ -519,6 +519,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/admin' || pathname === '/admin/') {
       return httpx.serveStatic(res, PUBLIC_DIR, '/admin.html');
     }
+    if (pathname === '/jd' || pathname === '/jd/') {
+      return httpx.serveStatic(res, PUBLIC_DIR, '/jd.html');
+    }
     if (req.method !== 'GET') return httpx.fail(res, 405, '方法不允许');
     return httpx.serveStatic(res, PUBLIC_DIR, pathname);
   } catch (e) {

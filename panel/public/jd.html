@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>京东扫码登录 · 扫码面板</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#2a2f3a; --text:#e8eaed; --muted:#9aa3b2; --ok:#2ecc71; --warn:#f5a623; --bad:#e74c3c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .card { width:100%; max-width:420px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:26px 24px 22px; text-align:center; }
+  h1 { font-size:18px; margin:0 0 6px; font-weight:600; }
+  .sub { font-size:12px; color:var(--muted); margin-bottom:18px; line-height:1.6; }
+  .qrbox { width:200px; height:200px; margin:0 auto 14px; display:flex; align-items:center; justify-content:center;
+           background:#fff; border-radius:10px; overflow:hidden; position:relative; }
+  .qrbox img { width:196px; height:196px; display:block; }
+  .qrbox .ph { color:#888; font-size:13px; }
+  .status { font-size:13px; min-height:20px; margin-bottom:4px; }
+  .status.ok { color:var(--ok); } .status.warn { color:var(--warn); } .status.bad { color:var(--bad); }
+  .hint { font-size:11px; color:var(--muted); line-height:1.6; }
+  button { margin-top:14px; padding:9px 20px; border-radius:9px; border:1px solid var(--line); background:#232833;
+           color:var(--text); font-size:13px; cursor:pointer; }
+  button:active { transform:scale(0.98); }
+  .countdown { font-variant-numeric:tabular-nums; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>京东扫码登录</h1>
+  <div class="sub">用 <b>京东 App</b> 扫码（不是微信）<br>码只活 2 分钟，本页会<b>自动换成最新的码</b></div>
+
+  <div class="qrbox" id="qrbox"><span class="ph">加载中…</span></div>
+  <div class="status" id="status">正在启动浏览器…</div>
+  <div class="hint" id="hint">首次生成约需 30~50 秒，请稍候</div>
+
+  <button id="reload" type="button">换一张码</button>
+</div>
+
+<script>
+(function () {
+  var sid = '';
+  var timer = null;
+  var reloadTimer = null;
+  var ok = false;
+  var elBox = document.getElementById('qrbox');
+  var elStatus = document.getElementById('status');
+  var elHint = document.getElementById('hint');
+
+  function setStatus(text, cls) {
+    elStatus.textContent = text;
+    elStatus.className = 'status' + (cls ? ' ' + cls : '');
+  }
+
+  function stopAll() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null; }
+  }
+
+  function showImage(b64) {
+    elBox.innerHTML = '';
+    var img = document.createElement('img');
+    img.src = 'data:image/png;base64,' + b64;
+    elBox.appendChild(img);
+  }
+
+  // 生成新码
+  function createQR() {
+    if (ok) return;
+    stopAll();
+    setStatus('正在生成二维码…', 'warn');
+    elHint.textContent = '首次生成约需 30~50 秒（服务器开无头浏览器），请稍候';
+    elBox.innerHTML = '<span class="ph">生成中…</span>';
+
+    fetch('/api/jd/qr', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (!res || !res.ok) throw new Error((res && res.error) || '生成失败');
+        sid = res.data.sid;
+        showImage(res.data.imageBase64);
+        setStatus('请用京东 App 扫码', '');
+        elHint.textContent = '本页会持续检测；二维码失效会自动换新码';
+        // 60 秒后主动换一张（页面里的码大约 2 分钟一换，提前换更稳）
+        reloadTimer = setTimeout(function () { if (!ok) createQR(); }, 60000);
+        pollLoop();
+      })
+      .catch(function (e) {
+        setStatus('生成失败：' + e.message, 'bad');
+        elHint.textContent = '点下面按钮重试';
+        elBox.innerHTML = '<span class="ph">—</span>';
+      });
+  }
+
+  // 轮询扫码状态
+  function pollLoop() {
+    if (!sid || ok) return;
+    fetch('/api/jd/poll?sid=' + encodeURIComponent(sid))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        var d = (res && res.data) || {};
+        if (d.status === 200) {
+          // 已扫码确认，写青龙
+          setStatus('已扫码，正在写入青龙…', 'warn');
+          doConfirm();
+          return;
+        }
+        if (d.status === 202) {
+          setStatus('已扫码，请在手机上点「确认登录」', 'warn');
+        } else if (d.status === 203) {
+          setStatus('二维码已失效，正在换新码…', 'bad');
+          createQR();
+          return;
+        } else {
+          setStatus('等待扫码…', '');
+        }
+        timer = setTimeout(pollLoop, 2000);
+      })
+      .catch(function () {
+        timer = setTimeout(pollLoop, 3000);
+      });
+  }
+
+  function doConfirm() {
+    fetch('/api/jd/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sid: sid }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (res && res.ok) {
+          ok = true;
+          stopAll();
+          setStatus('✅ 已写入青龙：' + res.data.pin, 'ok');
+          elHint.textContent = 'pt_key ' + res.data.preview + '（' + (res.data.qinglong === 'created' ? '新增' : '更新') + '）';
+          elBox.innerHTML = '<span class="ph" style="font-size:40px">✅</span>';
+        } else {
+          setStatus('写入失败：' + ((res && res.error) || '未知错误'), 'bad');
+          elHint.textContent = '可以点「换一张码」重试';
+        }
+      })
+      .catch(function (e) {
+        setStatus('写入失败：' + e.message, 'bad');
+      });
+  }
+
+  document.getElementById('reload').addEventListener('click', function () {
+    ok = false;
+    createQR();
+  });
+
+  createQR();
+})();
+</script>
+</body>
+</html>
