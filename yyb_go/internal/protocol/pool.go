@@ -84,11 +84,18 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	}
 }
 
-func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
+func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID, hostAppIDOverride string, accountID int64, tcpProxy string) (map[string]any, error) {
 	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
-		hostAppID := st.Session.HostAppID
+		// hostAppIDOverride 非空时用它当宿主小程序（调用方显式指定）。
+		// 背景：扫码时用的模板小程序会被写进 login_buffer 的 host_appid，
+		// 那样取出来的 code 就属于模板小程序；京东这类严格校验 appid 的业务会判 40029，
+		// 所以允许调用方传 host_appid 覆盖。不传则完全保持原行为。
+		hostAppID := []byte(hostAppIDOverride)
 		if len(hostAppID) == 0 {
-			hostAppID = hostAppIDDefault
+			hostAppID = st.Session.HostAppID
+			if len(hostAppID) == 0 {
+				hostAppID = hostAppIDDefault
+			}
 		}
 		plain := buildJSAPIPlaintext(st.Session.UIN, appID, jsLoginURL, jsLoginCmdID, nil, hostAppID, nil)
 		envelope, err := buildTransferPacket(st.Session, plain)

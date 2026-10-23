@@ -1274,8 +1274,16 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	return call(ctx, acc, appID, payload)
 }
 
-func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.tcpProxyValue())
+func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any) (map[string]any, error) {
+	// payload.host_appid 可选：显式指定宿主小程序（取出来的 code 归属它）。
+	// 不传时沿用账号扫码时的 host_appid，行为与以前完全一致。
+	hostAppID := ""
+	if payload != nil {
+		if s, ok := payload["host_appid"].(string); ok {
+			hostAppID = s
+		}
+	}
+	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, hostAppID, acc.ID, a.tcpProxyValue())
 }
 
 func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
