@@ -19,6 +19,11 @@ const LOGIN_URL = 'https://passport.jd.com/new/login.aspx';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) '
   + 'Chrome/144.0.0.0 Safari/537.36';
 
+// 服务器在海外，京东登录页资源全在国内，直连要 60s+ 才渲染出二维码，
+// 而二维码只有 2 分钟有效期。走国内出口（树脂）后能压到 10s 内。
+const PROXY_URL = process.env.JD_PROXY || '';
+const PROXY_AUTH = process.env.JD_PROXY_AUTH || '';   // 形如 user:pass
+
 /** 扫码会话最长存活时间（毫秒），超时由调用方关闭 */
 const SESSION_TTL = 5 * 60 * 1000;
 /** 页面里哪个 img 是二维码：实测是 img13.360buyimg.com/imagetools/... 且 naturalWidth≈147 */
@@ -57,17 +62,24 @@ async function createSession() {
   if (!loadPuppeteer()) return { ok: false, error: `puppeteer-core 未安装：${pptrErr}` };
   if (!fs.existsSync(CHROME_PATH)) return { ok: false, error: `找不到 chromium：${CHROME_PATH}` };
 
+  const args = [
+    '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-setuid-sandbox',
+    '--no-zygote', '--disable-accelerated-2d-canvas', '--js-flags=--max-old-space-size=256',
+  ];
+  if (PROXY_URL) args.push(`--proxy-server=${PROXY_URL}`);
+
   const browser = await pptr.launch({
     executablePath: CHROME_PATH,
     headless: true,
-    args: [
-      '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-setuid-sandbox',
-      '--no-zygote', '--disable-accelerated-2d-canvas', '--js-flags=--max-old-space-size=256',
-    ],
+    args,
   });
 
   try {
     const page = await browser.newPage();
+    if (PROXY_URL && PROXY_AUTH) {
+      const [username, ...rest] = PROXY_AUTH.split(':');
+      await page.authenticate({ username, password: rest.join(':') }).catch(() => {});
+    }
     await page.setUserAgent(UA);
     await page.setViewport({ width: 420, height: 760, deviceScaleFactor: 2, isMobile: false });
 

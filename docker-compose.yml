@@ -36,6 +36,9 @@ services:
     image: script-scan-panel:latest
     container_name: scan-panel
     restart: unless-stopped
+    environment:
+      # 京东扫码用：浏览器走网关的国内出口隧道（直连海外加载登录页要 60s+）
+      - JD_PROXY=http://yyb-go:8000
     depends_on:
       - yyb-go
     ports:
