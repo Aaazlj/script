@@ -58,9 +58,13 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
   + 'MiniProgramEnv/Mac MacWechat/WMPF MacWechat/3.8.7(0x13080712) UnifiedPCMacWechat(0xf2641f37) '
   + 'XWEB/25800 miniProgram/wxad169f0e9e78fe47';
 
-// 活动页新域名：旧地址 pro.m.jd.com/mini/active/... 会 302 到 h5static，
-// 跟随后页面在无头环境里渲染崩掉（"Oops! Something went wrong"），直接用新地址。
-const URL_PAGE = `https://h5static.m.jd.com/jdmini/active/${ACT_ID}/index.html`;
+// 活动页（2026-10 改版后）：
+//   旧 pro.m.jd.com/mini/active/... 已 302 到 h5static 的 /jdmini/ 路径，
+//   但 /jdmini/ 那版是「分享领」页，没有整点抢金券卡片；
+//   真正的金券页在 /mall/active/，且要带地址参数（addressID/lng/lat）才渲染。
+const ADDR_QS = env('jd_grab_addr')
+  || 'addressID=19214132330&provinceCode=19&cityCode=1601&districtCode=3633&townCode=63259&lng=113.343432&lat=23.174035';
+const URL_PAGE = `https://h5static.m.jd.com/mall/active/${ACT_ID}/index.html?babelChannel=ttt28&${ADDR_QS}&redirectCode=302`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
