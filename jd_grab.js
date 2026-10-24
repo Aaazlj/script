@@ -268,16 +268,16 @@ async function main() {
       $.log('❌ 页面标题不对，可能 cookie 失效或被重定向');
     }
 
-    // 新页面（h5static）首屏只有 banner 和分享模块，「整点抢」金券卡片在下方，
-    // 不滚动触发懒加载就永远找不到「立即领取」。
+    // 新页面金券模块在下方懒加载，滚动要够深、够慢
     $.log('📜 滚动加载金券模块…');
-    for (let i = 0; i < 6; i += 1) {
+    for (let i = 0; i < 12; i += 1) {
       /* eslint-disable no-await-in-loop */
-      await page.evaluate(() => window.scrollBy(0, 500));
-      await sleep(450);
+      await page.evaluate(() => window.scrollBy(0, 700));
+      await sleep(600);
     }
+    await sleep(2500);
     await page.evaluate(() => window.scrollTo(0, 0));
-    await sleep(400);
+    await sleep(600);
 
     // 等按钮出现；金券区没渲染（接口 403 概率拦截）就刷新重试
     let st = { state: 'unknown', text: '' };
