@@ -268,60 +268,41 @@ async function main() {
       $.log('❌ 页面标题不对，可能 cookie 失效或被重定向');
     }
 
-    // 新页面金券模块在下方懒加载，滚动要够深、够慢
-    $.log('📜 滚动加载金券模块…');
-    for (let i = 0; i < 12; i += 1) {
-      /* eslint-disable no-await-in-loop */
-      await page.evaluate(() => window.scrollBy(0, 700));
-      await sleep(600);
+    // 关键：金券模块只在活动时段（08:00-23:00）渲染，提前打开时页面上根本没有它，
+    // 所以整点前不做任何检测（之前在这里滚动+刷新 3 轮，白耗 60s，正好错过整点）。
+    // 先等到整点，整点后再滚动触发渲染 + 找按钮。
+    const until = target.getTime() - Date.now();
+    if (until > 0 && !NO_WAIT) {
+      $.log(`⏳ 等到整点（${(until / 1000).toFixed(1)}s）`);
+      await sleep(until);
     }
-    await sleep(2500);
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await sleep(600);
 
-    // 等按钮出现；金券区没渲染（接口 403 概率拦截）就刷新重试
-    let st = { state: 'unknown', text: '' };
-    for (let round = 0; round < 3; round += 1) {
-      if (round) {
-        $.log(`🔄 金券区没出来，刷新重试（第 ${round + 1}/3 轮）`);
-        try {
-          await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
-        } catch (_) { /* 刷新失败就继续等 */ }
-        await sleep(2500);
+    $.log(`🎯 ${nowText()} 开始找券（整点后模块才渲染）`);
+    let clicked = { clicked: false };
+    let st2 = { state: 'unknown', text: '' };
+    for (let round = 0; round < 10; round += 1) {
+      /* eslint-disable no-await-in-loop */
+      await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {});
+      await sleep(500);
+      st2 = await findClaimable(page);
+      if (st2.state === 'claimable') {
+        clicked = await clickClaim(page);
+        if (clicked.clicked) break;
+      } else if (st2.state === 'done') {
+        break;
       }
-      for (let i = 0; i < 20; i += 1) {
-        st = await findClaimable(page);
-        if (st.state !== 'unknown') break;
-        await sleep(500);
-      }
-      if (st.state !== 'unknown') break;
     }
-    $.log(`🔎 按钮状态：${st.state} ${st.text ? '(' + st.text.slice(0, 40) + ')' : ''}`);
-    if (st.state === 'done') {
-      $.log(`ℹ️ 今天这场的券已经领过了（${st.text}），记录状态后退出`);
+    $.log(`🔎 按钮状态：${st2.state}${st2.text ? '（' + st2.text.slice(0, 40) + '）' : ''}`);
+
+    if (st2.state === 'done') {
+      $.log(`ℹ️ 今天这场的券已经领过了（${st2.text}），记录状态后退出`);
       writeState({ claimed: true, pin: cookies.pt_pin, at: nowText(), by: 'page-button' });
       await page.screenshot({ path: path.join(SHOT_DIR, `done-${Date.now()}.png`), fullPage: false }).catch(() => {});
       return;
     }
 
-    // 等到整点
-    const until = target.getTime() - Date.now();
-    if (until > 0 && !NO_WAIT) {
-      $.log(`⏳ 等到整点（${(until / 1000).toFixed(2)}s）`);
-      await sleep(until);
-    }
-    $.log(`🎯 ${nowText()} 点击领取`);
-
-    let clicked = { clicked: false };
-    for (let i = 0; i < 8; i += 1) {
-      clicked = await clickClaim(page);
-      if (clicked.clicked) break;
-      await sleep(200);
-    }
     if (!clicked.clicked) {
       $.log('❌ 没找到可点的「立即领取」按钮');
-      st = await findClaimable(page);
-      $.log(`   当前状态：${st.state} ${st.text}`);
     } else {
       $.log(`👆 已点击「${clicked.text}」`);
       if (clicked.x) {
