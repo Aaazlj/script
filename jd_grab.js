@@ -53,10 +53,11 @@ const PUPPETEER = env('jd_grab_puppeteer') || '/ql/data/puppeteer/node_modules/p
 const CHROME = env('jd_grab_chrome') || '/usr/bin/chromium-browser';
 const STATE_FILE = env('jd_grab_state_file') || '/ql/data/jd_grab_state.json';
 
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) '
-  + 'Chrome/144.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI '
-  + 'MiniProgramEnv/Mac MacWechat/WMPF MacWechat/3.8.7(0x13080712) UnifiedPCMacWechat(0xf2641f37) '
-  + 'XWEB/25800 miniProgram/wxad169f0e9e78fe47';
+// /mall/ 是商城活动页（不是小程序 webview），用小程序 UA 会被降级成分享页，
+// 必须用普通浏览器 UA 才渲染整点抢金券卡片。
+const UA = env('jd_grab_ua')
+  || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) '
+  + 'Chrome/144.0.0.0 Safari/537.36';
 
 // 活动页（2026-10 改版后）：
 //   旧 pro.m.jd.com/mini/active/... 已 302 到 h5static 的 /jdmini/ 路径，
