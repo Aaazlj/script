@@ -58,7 +58,9 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
   + 'MiniProgramEnv/Mac MacWechat/WMPF MacWechat/3.8.7(0x13080712) UnifiedPCMacWechat(0xf2641f37) '
   + 'XWEB/25800 miniProgram/wxad169f0e9e78fe47';
 
-const URL_PAGE = `https://pro.m.jd.com/mini/active/${ACT_ID}/index.html`;
+// 活动页新域名：旧地址 pro.m.jd.com/mini/active/... 会 302 到 h5static，
+// 跟随后页面在无头环境里渲染崩掉（"Oops! Something went wrong"），直接用新地址。
+const URL_PAGE = `https://h5static.m.jd.com/jdmini/active/${ACT_ID}/index.html`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
