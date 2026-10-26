@@ -136,6 +136,7 @@ function pickTarget() {
 async function findClaimable(page) {
   return page.evaluate(() => {
     const want = ['立即领取', '马上抢', '立即抢', '去领取'];
+    const pending = ['待开抢', '即将开抢', '未开始'];
     const done = ['去使用', '已领取', '已抢完', '已抢光'];
     const nodes = [...document.querySelectorAll('div,span,button,a,p')];
     const visible = (e) => e && e.offsetParent !== null && e.getBoundingClientRect().width > 0;
@@ -143,6 +144,9 @@ async function findClaimable(page) {
     const texts = leafText.map((e) => (e.textContent || '').trim()).filter(Boolean);
     for (const w of want) {
       if (texts.includes(w)) return { state: 'claimable', text: w };
+    }
+    for (const p of pending) {
+      if (texts.includes(p)) return { state: 'pending', text: p };
     }
     for (const d of done) {
       if (texts.includes(d)) return { state: 'done', text: d };
@@ -287,7 +291,7 @@ async function main() {
     $.log(`🎯 ${nowText()} 开始找券（整点后模块才渲染）`);
     let clicked = { clicked: false };
     let st2 = { state: 'unknown', text: '' };
-    for (let round = 0; round < 10; round += 1) {
+    for (let round = 0; round < 60; round += 1) {
       /* eslint-disable no-await-in-loop */
       await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {});
       await sleep(500);
@@ -298,6 +302,7 @@ async function main() {
       } else if (st2.state === 'done') {
         break;
       }
+      // pending（待开抢）：继续等，不退出
     }
     $.log(`🔎 按钮状态：${st2.state}${st2.text ? '（' + st2.text.slice(0, 40) + '）' : ''}`);
 
