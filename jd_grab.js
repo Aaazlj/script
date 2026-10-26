@@ -67,7 +67,7 @@ const UA = env('jd_grab_ua')
 const ADDR_QS = env('jd_grab_addr')
   || 'addressID=19214132330&provinceCode=19&cityCode=1601&districtCode=3633&townCode=63259&lng=113.343432&lat=23.174035';
 const URL_PAGE = env('jd_grab_url')
-  || `https://pro.m.jd.com/mini/active/${ACT_ID}/index.html?babelChannel=ttt28&${ADDR_QS}`;
+  || `https://pro.m.jd.com/mall/active/${ACT_ID}/index.html`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
