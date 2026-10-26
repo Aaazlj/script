@@ -194,11 +194,16 @@ async function main() {
     return;
   }
   const cookies = parseCookie(COOKIE_RAW);
-  if (!cookies.pt_key || !cookies.pt_pin) {
-    $.log('❌ jd_cookie 里没有 pt_key / pt_pin，检查一下复制是否完整');
+  // 新版京东登录态是 pin + thor（没有 pt_key），老账号才有 pt_key，
+  // 两种都放行，只要有一套能标识登录即可。
+  const hasOld = cookies.pt_key && cookies.pt_pin;
+  const hasNew = cookies.pin && cookies.thor;
+  if (!hasOld && !hasNew) {
+    $.log('❌ jd_cookie 里既没有 pt_key/pt_pin，也没有 pin/thor，请重新扫码登录');
     return;
   }
-  $.log(`🔐 cookie 字段 ${Object.keys(cookies).length} 个 ｜ pin=${mask(cookies.pt_pin)}`);
+  const PIN = cookies.pt_pin || cookies.pin || '';
+  $.log(`🔐 cookie 字段 ${Object.keys(cookies).length} 个 ｜ pin=${mask(PIN)} ｜ 登录态=${hasOld ? 'pt_key' : 'pin+thor'}`);
 
   // 一个号一天只能领一次：今天已经领过就直接退出，连浏览器都不开
   const dayState = readState();
@@ -298,7 +303,7 @@ async function main() {
 
     if (st2.state === 'done') {
       $.log(`ℹ️ 今天这场的券已经领过了（${st2.text}），记录状态后退出`);
-      writeState({ claimed: true, pin: cookies.pt_pin, at: nowText(), by: 'page-button' });
+      writeState({ claimed: true, pin: PIN, at: nowText(), by: 'page-button' });
       await page.screenshot({ path: path.join(SHOT_DIR, `done-${Date.now()}.png`), fullPage: false }).catch(() => {});
       return;
     }
@@ -320,7 +325,7 @@ async function main() {
     // 领到了就落当日状态，今天不再重复领
     const successHits = res.hit.filter((k) => /抢券成功|领取成功|去使用|已领取/.test(k));
     if (successHits.length) {
-      writeState({ claimed: true, pin: cookies.pt_pin, at: nowText(), by: 'click', hit: successHits.join(',') });
+      writeState({ claimed: true, pin: PIN, at: nowText(), by: 'click', hit: successHits.join(',') });
       $.log('💾 已记录「今天领过了」，当天不会再领');
     } else {
       $.log('ℹ️ 没看到成功关键词，不写当日状态（下次 cron / 手动跑还可以再试）');
