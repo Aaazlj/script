@@ -253,7 +253,8 @@ async function main() {
     executablePath: CHROME,
     headless: HEADLESS,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-setuid-sandbox',
-      '--disable-accelerated-2d-canvas', '--no-zygote', '--js-flags=--max-old-space-size=256']
+      '--disable-accelerated-2d-canvas', '--no-zygote', '--js-flags=--max-old-space-size=256',
+      '--disable-blink-features=AutomationControlled', '--lang=zh-CN']
       .concat(PROXY ? [`--proxy-server=${PROXY}`] : []),
   });
   $.log(`🚀 浏览器已启动（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
@@ -262,6 +263,23 @@ async function main() {
     const page = await browser.newPage();
     await page.setUserAgent(UA);
     await page.setViewport({ width: 400, height: 860, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+    // 抹掉无头痕迹：h5st 由页面 babel-jssdk 用设备指纹现算，
+    // 一旦它识别出 webdriver / HeadlessChrome，算出来的签名就被京东 403。
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      window.chrome = window.chrome || { runtime: {} };
+      const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+      if (origQuery) {
+        window.navigator.permissions.query = (params) => (
+          params && params.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : origQuery.call(window.navigator.permissions, params)
+        );
+      }
+    });
+
     await page.setCookie(...Object.entries(cookies).map(([name, value]) => ({
       name, value, domain: '.jd.com', path: '/',
     })));
