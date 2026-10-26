@@ -137,7 +137,8 @@ async function findClaimable(page) {
   return page.evaluate(() => {
     const want = ['立即领取', '马上抢', '立即抢', '去领取'];
     const pending = ['待开抢', '即将开抢', '未开始'];
-    const done = ['去使用', '已领取', '已抢完', '已抢光'];
+    const soldout = ['已抢光', '已抢完', '抢光了'];
+    const done = ['去使用', '已领取'];
     const nodes = [...document.querySelectorAll('div,span,button,a,p')];
     const visible = (e) => e && e.offsetParent !== null && e.getBoundingClientRect().width > 0;
     const leafText = nodes.filter((e) => e.children.length === 0 && visible(e));
@@ -150,6 +151,9 @@ async function findClaimable(page) {
     }
     for (const d of done) {
       if (texts.includes(d)) return { state: 'done', text: d };
+    }
+    for (const so of soldout) {
+      if (texts.includes(so)) return { state: 'soldout', text: so };
     }
     return { state: 'unknown', text: texts.slice(0, 12).join('/') };
   });
@@ -311,6 +315,9 @@ async function main() {
       writeState({ claimed: true, pin: PIN, at: nowText(), by: 'page-button' });
       await page.screenshot({ path: path.join(SHOT_DIR, `done-${Date.now()}.png`), fullPage: false }).catch(() => {});
       return;
+    }
+    if (st2.state === 'soldout') {
+      $.log(`😢 本场券已抢光（${st2.text}）—— 不写当日状态，下一场还能抢`);
     }
 
     if (!clicked.clicked) {
