@@ -295,18 +295,38 @@ async function main() {
     $.log(`🎯 ${nowText()} 开始找券（整点后模块才渲染）`);
     let clicked = { clicked: false };
     let st2 = { state: 'unknown', text: '' };
-    for (let round = 0; round < 60; round += 1) {
+
+    // 整点后最多 45 秒窗口：期间反复「滚动 → 找按钮 → 刷新」。
+    // 刷新是必要的：qryCompositeMaterials 会概率性 403（页面提示"网络跑丢了"），
+    // 一旦 403 整点抢模块就整个不渲染，只能重载页面再赌一次。
+    const deadline = Date.now() + 45000;
+    let reloads = 0;
+    while (Date.now() < deadline) {
       /* eslint-disable no-await-in-loop */
-      await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {});
-      await sleep(500);
-      st2 = await findClaimable(page);
+      for (let i = 0; i < 3; i += 1) {
+        await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {});
+        await sleep(400);
+        st2 = await findClaimable(page);
+        if (st2.state === 'claimable' || st2.state === 'done' || st2.state === 'soldout') break;
+      }
       if (st2.state === 'claimable') {
         clicked = await clickClaim(page);
         if (clicked.clicked) break;
-      } else if (st2.state === 'done') {
+      } else if (st2.state === 'done' || st2.state === 'soldout') {
         break;
       }
-      // pending（待开抢）：继续等，不退出
+
+      // 没找到（unknown / pending）→ 刷新再赌；pending 时少刷几次，避免整点刚过的关键一秒被刷掉
+      if (reloads < 4) {
+        reloads += 1;
+        $.log(`🔄 第 ${reloads} 次重载页面（当前 ${st2.state}）`);
+        try {
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+        } catch (_) { /* ignore */ }
+        await sleep(1200);
+      } else {
+        await sleep(600);
+      }
     }
     $.log(`🔎 按钮状态：${st2.state}${st2.text ? '（' + st2.text.slice(0, 40) + '）' : ''}`);
 
