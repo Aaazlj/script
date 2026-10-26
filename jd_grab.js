@@ -59,13 +59,15 @@ const UA = env('jd_grab_ua')
   || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) '
   + 'Chrome/144.0.0.0 Safari/537.36';
 
-// 活动页（2026-10 改版后）：
-//   旧 pro.m.jd.com/mini/active/... 已 302 到 h5static 的 /jdmini/ 路径，
-//   但 /jdmini/ 那版是「分享领」页，没有整点抢金券卡片；
-//   真正的金券页在 /mall/active/，且要带地址参数（addressID/lng/lat）才渲染。
+// 活动页（2026-10 实测）：
+//   /mini/active/<id>/index.html  → 200，227KB，含「待开抢」「品质外卖金券」
+//     这才是「大额金券整点抢」那版（用户 H5 打开看到的就是它）
+//   /mall/active/<id>/index.html  → 分享领版（星巴克/华莱士…），没有整点抢
+//   注意：/mini/ 会间歇性 302 到 /jdmini/（那时就是分享页），要检查内容判断
 const ADDR_QS = env('jd_grab_addr')
   || 'addressID=19214132330&provinceCode=19&cityCode=1601&districtCode=3633&townCode=63259&lng=113.343432&lat=23.174035';
-const URL_PAGE = `https://h5static.m.jd.com/mall/active/${ACT_ID}/index.html?babelChannel=ttt28&${ADDR_QS}&redirectCode=302`;
+const URL_PAGE = env('jd_grab_url')
+  || `https://pro.m.jd.com/mini/active/${ACT_ID}/index.html?babelChannel=ttt28&${ADDR_QS}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
