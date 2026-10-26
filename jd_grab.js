@@ -48,6 +48,9 @@ const OPEN_SEC = Math.max(20, Number(env('jd_grab_open_sec') || 75));
 const ACT_ID = env('jd_grab_act_id') || '2BuMtujoMx1EPnFvUrUpsrYucqUK';
 const SHOT_DIR = env('jd_grab_shot_dir') || '/ql/data/jd_grab_shots';
 const HEADLESS = env('jd_grab_headless') !== '0';
+// 服务器 IP 会被京东概率性 403（qryCompositeMaterials 拿不到数据 → 页面降级成通用版），
+// 走网关的国内出口换 IP。默认不开，配 jd_grab_proxy 才启用。
+const PROXY = env('jd_grab_proxy') || '';
 
 const PUPPETEER = env('jd_grab_puppeteer') || '/ql/data/puppeteer/node_modules/puppeteer-core';
 const CHROME = env('jd_grab_chrome') || '/usr/bin/chromium-browser';
@@ -222,6 +225,7 @@ async function main() {
     return;
   }
   $.log('🆕 今天还没领过，继续');
+  if (PROXY) $.log(`🌐 浏览器走代理：${PROXY}`);
 
   const target = pickTarget();
   const openAt = target.getTime() - OPEN_SEC * 1000;
@@ -249,7 +253,8 @@ async function main() {
     executablePath: CHROME,
     headless: HEADLESS,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-setuid-sandbox',
-      '--disable-accelerated-2d-canvas', '--no-zygote', '--js-flags=--max-old-space-size=256'],
+      '--disable-accelerated-2d-canvas', '--no-zygote', '--js-flags=--max-old-space-size=256']
+      .concat(PROXY ? [`--proxy-server=${PROXY}`] : []),
   });
   $.log(`🚀 浏览器已启动（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
 
