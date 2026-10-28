@@ -461,7 +461,10 @@ async function setCronSchedule(name, schedule) {
 
 /** 场次时间 → cron 表达式（开场前 EXEC_LEAD_MIN 分钟） */
 function cronForSession(startMs) {
-  const d = new Date(startMs - EXEC_LEAD_MIN * 60 * 1000);
+  let at = startMs - EXEC_LEAD_MIN * 60 * 1000;
+  // 提前量已经过去（例如上一场刚跑完就排下一场），就卡在开场那一分钟，别排到过去的时间
+  if (at <= Date.now() + 20000) at = startMs;
+  const d = new Date(at);
   const mm = d.getMinutes();
   const hh = d.getHours();
   return `${mm} ${hh} * * *`;
@@ -761,7 +764,8 @@ async function main() {
     `${s.sessionCode}[${STATUS_TEXT[s.status] || s.status}`
     + `${s.startMs ? ' ' + new Date(s.startMs).toTimeString().slice(0, 5) : ''}]`).join('、'));
 
-  // 4) 选目标：最近的「未开始或进行中」场次
+  // 4) 选目标：优先「马上要开场」的场次
+  //    （上一场还在进行中时，它的券早就光了；选它会导致抢不到、还把下次时间排错）
   const alive = sessions.filter((s) => s.status !== 2 && s.startMs)
     .sort((a, b) => a.startMs - b.startMs);
   if (!alive.length) {
@@ -769,7 +773,9 @@ async function main() {
     await setCronSchedule(EXEC_CRON_NAME, IDLE_CRON);
     return;
   }
-  const target = alive[0];
+  // 只把「刚开场 60 秒内」的场次算作可抢；再早就已经光了，选它只会白跑并排错下次时间
+  const RECENT_MS = 60 * 1000;
+  const target = alive.find((s) => s.startMs >= nowMs - RECENT_MS) || alive[alive.length - 1];
   const untilStart = target.startMs - nowMs;
 
   // 5) 探测任务（probe）永远不抢，只负责调执行任务的时间；
