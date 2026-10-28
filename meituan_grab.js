@@ -36,6 +36,7 @@ cron: 0 9 * * *
   mt_grab_exec_lead_min 执行任务提前多少分钟被叫醒，默认 2
   mt_grab_enter_sec     距开场多少秒内算「抢券模式」，默认 180（必须大于 exec_lead_min*60）
   mt_grab_grace_sec     任务启动慢了时，允许开场后多少秒内补抢，默认 30
+  mt_grab_second_shot   第一轮没抢到时，按券的 couponStartTime 再打一枪，默认开（设 0 关闭）
   mt_sign_url           美团签名服务，默认 http://panel:5180/api/meituan/sign
   mt_grab_state_file    当日状态文件，默认 $QL_DIR/data/mt_grab_state.json
   mt_grab_login_cache   登录态缓存，默认 $QL_DIR/data/mt_grab_login_cache.json
@@ -972,6 +973,51 @@ async function main() {
     }
     return { p, ok: false, text: last && last.ok ? `${last.text}（已重试）` : (last ? last.error : '未知') };
   }));
+
+  // 9.5) 二审：券自己的 couponStartTime 往往比「场次开场」晚（实测 +44s），
+  //      第一轮没抢到就按这个时间再打一枪
+  const firstRight = grabbable(shooters[0].sess.rights)[0] || {};
+  const secondMs = Number(firstRight.couponStartTime || 0);
+  const failedNow = results.filter((r) => !r.ok);
+  if (process.env.mt_grab_second_shot !== '0' && failedNow.length
+      && secondMs > Date.now() + 800 && secondMs - Date.now() <= 120000) {
+    const waitMs = secondMs - Date.now() + 200;
+    $.log(`⏳ [二审] ${failedNow.length} 个号没抢到，按 couponStartTime `
+      + `${new Date(secondMs).toTimeString().slice(0, 8)} 再打一枪（${(waitMs / 1000).toFixed(1)}s 后）`);
+    await sleep(waitMs);
+    const retry = await Promise.all(failedNow.map(async (r0) => {
+      const p = r0.p;
+      let lastR = null;
+      for (let i = 0; i < 2; i += 1) {
+        const info = await grabInfoOnce(p.ctx, target);
+        if (!info.ok) { lastR = { ok: false, error: info.error }; break; }
+        const s = flatten(Array.isArray(info.data.activityList) ? info.data.activityList : [], Date.now())
+          .find((x) => x.sessionCode === target.sessionCode && x.grabToken);
+        const rights = s ? grabbable(s.rights) : [];
+        if (!s || !rights.length) { lastR = { ok: false, text: '没拿到 grabToken 或券' }; break; }
+        const g = await grabCoupon(p.ctx, {
+          activityId: target.activityId,
+          sessionCode: s.sessionCode,
+          grabToken: s.grabToken,
+          rightCode: rights[0].rightCode,
+        });
+        if (g.ok && g.subCode === 1) {
+          const ci = g.couponInfo || {};
+          const name = ci.couponName || ci.name || rights[0].rightCode;
+          const val = ci.couponValue != null ? `（${(Number(ci.couponValue) / 100).toFixed(0)}元）` : '';
+          return { p, ok: true, text: `${name}${val} 抢到了（二审）` };
+        }
+        lastR = g;
+        if (!(g.ok && g.subCode === 8004)) break;
+        await sleep(250);
+      }
+      return { p, ok: false, text: lastR && lastR.ok ? `${lastR.text}（二审）` : (lastR ? lastR.error : '二审失败') };
+    }));
+    for (const r of retry) {
+      const idx = results.findIndex((x) => x.p === r.p);
+      if (idx >= 0) results[idx] = r;
+    }
+  }
 
   let got = 0;
   for (const r of results) {
