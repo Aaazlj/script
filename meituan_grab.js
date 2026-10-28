@@ -35,6 +35,7 @@ cron: 0 9 * * *
   mt_grab_lead_ms       开场前多少毫秒开抢，默认 300
   mt_grab_exec_lead_min 执行任务提前多少分钟被叫醒，默认 2
   mt_grab_enter_sec     距开场多少秒内算「抢券模式」，默认 180（必须大于 exec_lead_min*60）
+  mt_grab_grace_sec     任务启动慢了时，允许开场后多少秒内补抢，默认 30
   mt_sign_url           美团签名服务，默认 http://panel:5180/api/meituan/sign
   mt_grab_state_file    当日状态文件，默认 $QL_DIR/data/mt_grab_state.json
   mt_grab_login_cache   登录态缓存，默认 $QL_DIR/data/mt_grab_login_cache.json
@@ -831,9 +832,28 @@ async function main() {
     await setCronSchedule(EXEC_CRON_NAME, IDLE_CRON);
     return;
   }
-  // 只把「刚开场 60 秒内」的场次算作可抢；再早就已经光了，选它只会白跑并排错下次时间
-  const RECENT_MS = 60 * 1000;
-  const target = alive.find((s) => s.startMs >= nowMs - RECENT_MS) || alive[alive.length - 1];
+  // 只认「离现在最近的场次」——正常情况下任务在开场前 2 分钟被叫醒，所以它必然还没开场。
+  // 已开场的场次只在「任务启动慢了」时兜底：最多允许开场后 GRACE_SEC 秒内补抢，
+  // 绝不可能选到上一小时那场（那已经差了 3600 秒）。
+  const GRACE_MS = Math.max(0, Number(env('mt_grab_grace_sec') || 30)) * 1000;
+  const nearest = alive.slice()
+    .sort((a, b) => Math.abs(a.startMs - nowMs) - Math.abs(b.startMs - nowMs))[0];
+  const late = nowMs - nearest.startMs;
+  const target = late <= GRACE_MS ? nearest : null;
+  if (!target) {
+    const future = alive.filter((s) => s.startMs > nowMs + 500)
+      .sort((a, b) => a.startMs - b.startMs)[0];
+    if (!future) {
+      $.log(`ℹ️ 最近场次已开场 ${Math.round(late / 1000)}s，今天没有后续场次，置休眠`);
+      await setCronSchedule(EXEC_CRON_NAME, IDLE_CRON);
+      return;
+    }
+    const cron = cronForSession(future.startMs);
+    $.log(`ℹ️ 跳过已开场 ${Math.round(late / 1000)}s 的场次，把执行任务排到下一场 `
+      + `${new Date(future.startMs).toTimeString().slice(0, 5)} → ${cron}`);
+    await setCronSchedule(EXEC_CRON_NAME, cron);
+    return;
+  }
   const untilStart = target.startMs - nowMs;
 
   // 5) 探测任务（probe）永远不抢，只负责调执行任务的时间；
