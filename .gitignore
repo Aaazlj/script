@@ -28,3 +28,11 @@ elmck.js
 elmck_code.js
 淘宝闪购*
 淘宝闪购-逆向工具/
+
+# 京东相关（已从仓库移除，仅保留本地）
+jd_grab.js
+jd_login_local.mjs
+jd_claim_grab.js
+jd-grab-extension/
+panel/lib/jd.js
+panel/public/jd.html
