@@ -14,13 +14,13 @@ cron: 0 9 * * *
   ①「美团整点抢券」cron 0 9 * * * —— `task meituan_grab.js probe`
      只用【1 个号】拉一次场次（场次是活动级的，所有号看到的一样；
      实测未登录拿不到，会 401 passport，所以必须带一个号的 token）。
-     有场次 → 把【执行任务】的 cron 改到「开场前 1 分钟」；没场次 → 执行任务置休眠。
+     有场次 → 把【执行任务】的 cron 改到「开场前 2 分钟」；没场次 → 执行任务置休眠。
      **它自己的时间谁都不许改**：这样即使执行任务那边出任何岔子，
      第二天 9 点照样会探测，不会「断了链条」。
   ②「美团整点抢券-执行」cron 0 0 1 1 *（休眠）—— `task meituan_grab.js grab`
      被叫醒后：把全部账号拉起来 → 各自拉 grabToken → 等到开场前 LEAD_MS
      → 全账号【并发】抢（串行只有第一个号能抢到）
-     → 写当日状态 → 抢完把自己置为休眠（或下一场前 1 分钟，如果还有号没抢到）。
+     → 写当日状态 → 抢完把自己置为休眠（或下一场前 2 分钟，如果还有号没抢到）。
 
 风控注意：探测只打 1 次请求；抢券阶段每号只有「拉 token（最多几次短轮询）+ 抢 1 次」，
 不做无意义的重试；白天不会常驻轮询。
@@ -33,7 +33,8 @@ cron: 0 9 * * *
   mt_grab_cron_name     探测任务在青龙里的名字，默认「美团整点抢券」（脚本不改它）
   mt_grab_exec_cron_name 执行任务名，默认「美团整点抢券-执行」（脚本改它的时间）
   mt_grab_lead_ms       开场前多少毫秒开抢，默认 300
-  mt_grab_enter_sec     距开场多少秒内算「抢券模式」，默认 90
+  mt_grab_exec_lead_min 执行任务提前多少分钟被叫醒，默认 2
+  mt_grab_enter_sec     距开场多少秒内算「抢券模式」，默认 180（必须大于 exec_lead_min*60）
   mt_sign_url           美团签名服务，默认 http://panel:5180/api/meituan/sign
   mt_grab_state_file    当日状态文件，默认 $QL_DIR/data/mt_grab_state.json
   mt_grab_login_cache   登录态缓存，默认 $QL_DIR/data/mt_grab_login_cache.json
@@ -124,11 +125,11 @@ const QL_CLIENT_SECRET = env('ql_client_secret');
 /*
  * 两个任务，职责分开（关键：探测任务的 9 点永远不动，改时间只改执行任务）
  *   ① 「美团整点抢券」      cron 0 9 * * *      跑 `task meituan_grab.js probe`
- *      —— 只探测场次，有场次就把【执行任务】的时间改到开场前 1 分钟。
+ *      —— 只探测场次，有场次就把【执行任务】的时间改到开场前 2 分钟。
  *         它自己的时间谁都不许改，这样即便执行任务那边出任何岔子，
  *         第二天 9 点照样会探测，不会「断了链条」。
  *   ② 「美团整点抢券-执行」 cron 0 0 1 1 *（休眠）  跑 `task meituan_grab.js grab`
- *      —— 被叫醒后抢券，抢完把自己改回休眠（或下一场前 1 分钟）。
+ *      —— 被叫醒后抢券，抢完把自己改回休眠（或下一场前 2 分钟）。
  */
 const CRON_NAME = env('mt_grab_cron_name') || '美团整点抢券';
 const EXEC_CRON_NAME = env('mt_grab_exec_cron_name') || '美团整点抢券-执行';
@@ -137,7 +138,10 @@ const MODE = (process.argv[2] || '').toLowerCase();   // probe | grab
 
 // 探测任务在青龙里固定 0 9 * * *，脚本永远不改它（断了链条第二天就不跑了）
 const LEAD_MS = Math.max(0, Number(env('mt_grab_lead_ms') || 300));
-const ENTER_SEC = Math.max(10, Number(env('mt_grab_enter_sec') || 90));
+// 执行任务提前多少分钟被叫醒（默认 2 分钟：留出登录/预热时间，别卡在最后 60 秒）
+const EXEC_LEAD_MIN = Math.max(0, Number(env('mt_grab_exec_lead_min') || 2));
+// 距开场多少秒内算「抢券模式」；必须大于 EXEC_LEAD_MIN*60，否则提前醒来会被当成探测而不抢
+const ENTER_SEC = Math.max(10, Number(env('mt_grab_enter_sec') || 180));
 const SIGN_URL = (env('mt_sign_url', 'MT_SIGN_URL')
   || (process.env.QL_DIR ? 'http://panel:5180/api/meituan/sign' : '')).replace(/\/+$/, '');
 const DEBUG = process.env.MT_DEBUG === '1';
@@ -455,9 +459,9 @@ async function setCronSchedule(name, schedule) {
   return false;
 }
 
-/** 场次时间 → cron 表达式（开场前 1 分钟） */
+/** 场次时间 → cron 表达式（开场前 EXEC_LEAD_MIN 分钟） */
 function cronForSession(startMs) {
-  const d = new Date(startMs - 60 * 1000);
+  const d = new Date(startMs - EXEC_LEAD_MIN * 60 * 1000);
   const mm = d.getMinutes();
   const hh = d.getHours();
   return `${mm} ${hh} * * *`;
