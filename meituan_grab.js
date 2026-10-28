@@ -656,9 +656,13 @@ function flatten(activityList, nowMs) {
   return out;
 }
 
-/** 券能不能抢：状态 2=AVAILABLE（字段缺失时放行，让服务端裁决） */
-const grabbable = (rights) => (rights || []).filter((r) => r && r.rightCode
-  && (r.status == null || Number(r.status) === 2));
+/** 券列表：带 rightCode 的都能抢，按面额从大到小
+ *  注意 status 语义没公开，实测「可抢」是 1（不是 2）；早期只认 2 导致永远报「本场次没有可抢的券」。
+ *  所以这里不按 status 过滤，交给服务端裁决（抢完会回 8001）。
+ */
+const grabbable = (rights) => (rights || [])
+  .filter((r) => r && r.rightCode)
+  .sort((a, b) => Number(b.couponValue || 0) - Number(a.couponValue || 0));
 
 /* ============ 账号准备 ============ */
 
@@ -754,6 +758,60 @@ async function main() {
   }
 
   const nowMs = Date.now();
+
+  // debug 模式：原样打印场次与券列表（含 status），用来判断「没有可抢的券」到底是真没券还是状态判断错
+  if (MODE === 'debug') {
+    const act = Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [];
+    for (const a of act) {
+      $.log(`📋 活动 ${a.activityId || ''} 场次数 ${(a.sessionList || []).length}`);
+      for (const s of a.sessionList || []) {
+        const st = statusOf(s, nowMs);
+        $.log(`  ・场次 ${s.sessionCode} status=${s.status} 推导=${STATUS_TEXT[st] || st}`
+          + ` start=${s.startTime || ''} ${s.startTimestamp || ''} 券数=${(s.rightList || []).length}`
+          + ` grabToken=${s.grabToken ? '有' : '无'}`);
+        for (const r of s.rightList || []) {
+          $.log(`      - rightCode=${r.rightCode} status=${r.status} 面额=${r.amount || r.discount || ''}`
+            + ` 描述=${(r.rightName || r.name || r.title || '').slice(0, 20)} 剩余=${r.stock != null ? r.stock : '?'}`);
+        }
+      }
+    }
+    if (probeInfo.data && probeInfo.data.currentSession) {
+      const cs = probeInfo.data.currentSession;
+      $.log(`⭐ 顶层 currentSession ${cs.sessionCode} grabToken=${cs.grabToken ? '有' : '无'}`);
+    }
+    for (const a of act) {
+      const cs = a.currentSession;
+      if (!cs) { $.log('   （该活动无 currentSession）'); continue; }
+      $.log(`⭐ ${a.activityId} currentSession=${cs.sessionCode}`
+        + ` start=${cs.startTimestamp || ''} end=${cs.endTimestamp || ''}`
+        + ` grabToken=${cs.grabToken ? cs.grabToken.slice(0, 12) + '…' : '无'}`
+        + ` 券数=${(cs.rightList || []).length}`);
+      for (const r of cs.rightList || []) {
+        $.log(`      - ${JSON.stringify(r)}`);
+      }
+      $.log(`      ▶ 经 grabbable 过滤后可抢 ${grabbable(cs.rightList).length} 张`);
+    }
+    $.log('（debug 模式，不抢）');
+    return;
+  }
+
+  // trygrab 模式：对「当前进行中」的场次真打一枪（1 个号），用来看服务端真实返回码
+  if (MODE === 'trygrab') {
+    const list = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
+    const sess = list.find((s) => s.grabToken && grabbable(s.rights).length);
+    if (!sess) { $.log('❌ 当前没有带 grabToken 的可抢场次'); return; }
+    const right = grabbable(sess.rights)[0];
+    $.log(`🎯 trygrab：场次 ${sess.sessionCode} 券 ${right.rightCode}`
+      + `（${(Number(right.couponValue || 0) / 100).toFixed(0)}元/满${(Number(right.priceLimit || 0) / 100).toFixed(0)}）`);
+    const r = await grabCoupon(probeLogin.ctx, {
+      activityId: sess.activityId,
+      sessionCode: sess.sessionCode,
+      grabToken: sess.grabToken,
+      rightCode: right.rightCode,
+    });
+    $.log(`📨 返回：${JSON.stringify(r).slice(0, 400)}`);
+    return;
+  }
   const sessions = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
   if (!sessions.length) {
     $.log('ℹ️ 今天没有整点场次，把执行任务置为休眠');
@@ -856,28 +914,43 @@ async function main() {
   $.log(`🎯 ${nowText()} 并发开抢（${shooters.length} 个号同时发）`);
   const results = await Promise.all(shooters.map(async (t) => {
     const { p, sess } = t;
-    const rights = grabbable(sess.rights);
-    if (!rights.length) return { p, ok: false, text: '本场次没有可抢的券' };
-    const right = rights[0];   // 一场只抢一张（同面额当天限一次）
-    const req = {
-      activityId: target.activityId,
-      sessionCode: sess.sessionCode,
-      grabToken: sess.grabToken,
-      rightCode: right.rightCode,
-    };
-    let r = await grabCoupon(p.ctx, req);
-    // 8000/8002/8004 是可重试失败，立刻补一枪（8001=券抢完就别浪费请求了）
-    if (r.ok && [8000, 8002, 8004].includes(r.subCode)) {
-      await sleep(120);
-      r = await grabCoupon(p.ctx, req);
+    const rights0 = grabbable(sess.rights);
+    if (!rights0.length) return { p, ok: false, text: '本场次没有可抢的券' };
+    // 8004 = 抢券失败请刷新页面重试（grabToken 过期/已消费），所以失败要刷新 token 再打
+    let sessNow = sess;
+    let last = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const rights = grabbable(sessNow.rights);
+      if (!rights.length) break;
+      let done = false;
+      for (const right of rights.slice(0, 3)) {
+        const r = await grabCoupon(p.ctx, {
+          activityId: target.activityId,
+          sessionCode: sessNow.sessionCode,
+          grabToken: sessNow.grabToken,
+          rightCode: right.rightCode,
+        });
+        if (r.ok && r.subCode === 1) {
+          const ci = r.couponInfo || {};
+          const name = ci.couponName || ci.name || right.rightCode;
+          const val = ci.couponValue != null ? `（${(Number(ci.couponValue) / 100).toFixed(0)}元）` : '';
+          return { p, ok: true, text: `${name}${val} 抢到了（第 ${attempt + 1} 轮）` };
+        }
+        last = r;
+        // 8001=已抢完，换下一张券；其它错误直接进刷新重试
+        if (!(r.ok && r.subCode === 8001)) { done = true; break; }
+      }
+      if (!done) break;                                  // 所有券都 8001，没得试了
+      if (last && last.ok && ![8000, 8002, 8004].includes(last.subCode)) break;  // 不可重试的错误
+      await sleep(450);
+      const info = await grabInfoOnce(p.ctx, target);
+      if (!info.ok) break;
+      const s2 = flatten(Array.isArray(info.data.activityList) ? info.data.activityList : [], Date.now())
+        .find((s) => s.sessionCode === target.sessionCode && s.grabToken);
+      if (!s2) break;
+      sessNow = s2;
     }
-    if (r.ok && r.subCode === 1) {
-      const ci = r.couponInfo || {};
-      const name = ci.couponName || ci.name || right.rightCode;
-      const val = ci.couponValue != null ? `（${(Number(ci.couponValue) / 100).toFixed(0)}元）` : '';
-      return { p, ok: true, text: `${name}${val} 抢到了` };
-    }
-    return { p, ok: false, text: r.ok ? r.text : r.error };
+    return { p, ok: false, text: last && last.ok ? `${last.text}（已重试）` : (last ? last.error : '未知') };
   }));
 
   let got = 0;
