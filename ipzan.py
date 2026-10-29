@@ -531,6 +531,9 @@ def main():
     # 把最早可领的时间写回青龙任务，下次到点才跑，脚本里不必干等
     pending = [next_allowed(state, phone) for phone, password in accounts
                if password and next_allowed(state, phone) > time.time()]
+    if counts["fail"]:
+        # 这一轮有账号失败，明天补跑一次，别等满整整一周
+        pending.append((int(time.time()) + 86400) // 60 * 60)
     if pending:
         reschedule(min(pending))
     else:
