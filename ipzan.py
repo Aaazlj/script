@@ -424,7 +424,8 @@ def handle_account(idx, total, phone, password, proxy, state):
     buffer_seconds = env_int("pz_buffer", 120)
     now = time.time()
     next_at = next_allowed(state, phone)
-    if next_at > now:
+    # 留 5 秒容差：调度器偶尔会在整分钟边界上早几百毫秒触发
+    if next_at > now + 5:
         # 没满 7 天时服务端只会回「请一周后再次领取」，这次请求可以直接省掉
         print(f"⏳ 还没满一周：{time.strftime('%m-%d %H:%M', time.localtime(next_at))} 之后可领"
               f"（还剩 {fmt_duration(next_at - now)}），本次跳过")
