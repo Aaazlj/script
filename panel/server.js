@@ -81,9 +81,11 @@ function route(method, pattern, handler, opts = {}) {
 
 /**
  * 是否来自容器内网/本机。
- * 脚本上报走这个判断，所以故意不看 X-Forwarded-For（那是可以随便写的）。
+ * 脚本上报走这个判断：带了 X-Forwarded-For / X-Real-IP 说明过了 nginx 或
+ * cloudflared，一律不算内网（否则外面也能伪造上报）。
  */
 function isInternalRequest(req) {
+  if (req.headers['x-forwarded-for'] || req.headers['x-real-ip']) return false;
   const ip = String((req.socket && req.socket.remoteAddress) || '');
   if (ip === '::1' || ip === '127.0.0.1') return true;
   return /^(::ffff:)?(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
