@@ -1237,6 +1237,7 @@ class PupuUser extends BaseRequest {
       if (errorCode === 0) {
         let { balance, expiring_coin, expire_time } = result?.data;
 
+        this.coin_after = balance;
         let diff = balance - (this.coin_before ?? balance);
         let diffStr = "（本次 " + (diff > 0 ? "+" : "") + diff + "）";
         this.log("💰 总朴分: " + balance + diffStr);
@@ -1304,6 +1305,7 @@ class PupuUser extends BaseRequest {
       let errorCode = CommonUtils.get(result, "errcode", statusCode);
       if (errorCode === 0) {
         let balance = result?.data?.balance;
+        this.coin_after = balance;
         this.log("💰 执行后朴分：" + balance);
       }
     } catch (exception) {
@@ -1575,6 +1577,116 @@ async function checkVersion(retryCount = 0) {
   }
 }
 
+// ==================== 汇总表格 ====================
+// 中文/全角按两格算，否则中英混排会歪
+function dispWidth(text) {
+  return String(text == null ? "" : text)
+    .split("")
+    .reduce((w, ch) => w + (/[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2 : 1), 0);
+}
+const padRight = (text, width) => String(text) + " ".repeat(Math.max(0, width - dispWidth(text)));
+const padLeft = (text, width) => " ".repeat(Math.max(0, width - dispWidth(text))) + String(text);
+
+const fmtCoin = (value) => (value == null ? "-" : String(Math.round(Number(value) * 100) / 100));
+
+/** 每个账号的朴分变动，任务结束时统一打一张表 */
+function printCoinSummary() {
+  const users = CommonUtils.userList || [];
+  if (!users.length) return;
+
+  const rows = users.map((user) => {
+    const before = user.coin_before ?? null;
+    const after = user.coin_after ?? null;
+    let note = "";
+    if (!user.valid) note = "登录失败";
+    else if (before == null || after == null) note = "朴分未取到";
+    return {
+      label: (user.index >= 0 ? (user.index + 1) + ". " : "") + (user.name || user.ref || "-"),
+      before,
+      after,
+      note,
+    };
+  });
+
+  const nameWidth = Math.max(6, ...rows.map((row) => dispWidth(row.label)));
+  const lines = [
+    "",
+    "=============== 朴分变动汇总 ===============",
+    padRight("账号", nameWidth + 2) + padLeft("朴分前", 9) + padLeft("朴分后", 9) + padLeft("变动", 8) + "   备注",
+  ];
+
+  let gained = 0;
+  let withData = 0;
+  for (const row of rows) {
+    const delta = (row.before != null && row.after != null)
+      ? Number(row.after) - Number(row.before)
+      : null;
+    if (delta != null) {
+      gained += delta;
+      withData++;
+    }
+    lines.push(
+      padRight(row.label, nameWidth + 2)
+      + padLeft(fmtCoin(row.before), 9)
+      + padLeft(fmtCoin(row.after), 9)
+      + padLeft(delta == null ? "-" : (delta > 0 ? "+" : "") + fmtCoin(delta), 8)
+      + (row.note ? "   " + row.note : "")
+    );
+  }
+  lines.push("合计：" + (gained >= 0 ? "+" : "") + fmtCoin(gained)
+    + " 朴分（" + withData + " 个账号有数据 / 共 " + rows.length + " 个）");
+  lines.push("============================================");
+
+  console.log(lines.join("\n"));
+}
+
+/** 极简 POST JSON（不引依赖、失败就当面板不在线） */
+function postJSON(url, payload, timeout = 5000) {
+  return new Promise((resolve) => {
+    try {
+      const target = new URL(url);
+      const body = Buffer.from(JSON.stringify(payload));
+      const req = require("http").request({
+        hostname: target.hostname,
+        port: target.port || 80,
+        path: target.pathname + target.search,
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Content-Length": body.length },
+        timeout,
+      }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+      });
+      req.on("error", () => resolve(false));
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.write(body);
+      req.end();
+    } catch (_) {
+      resolve(false);
+    }
+  });
+}
+
+/** 把各账号的朴分同步给扫码面板（只用于后台展示，失败不影响签到） */
+async function reportPointsToPanel() {
+  const items = (CommonUtils.userList || [])
+    .filter((user) => user.open_id && user.coin_after != null)
+    .map((user) => ({
+      openid: user.open_id,
+      points: user.coin_after,
+      before: user.coin_before ?? null,
+      ok: !!user.valid,
+      note: user.name || "",
+    }));
+  if (!items.length) return;
+
+  const base = String(process.env.panel_url || process.env.PANEL_URL || "http://scan-panel:5180")
+    .replace(/\/+$/, "");
+  if (await postJSON(base + "/api/points/report", { script: "ppcs", items })) {
+    console.log("📊 朴分已同步到面板（" + items.length + " 个账号）");
+  }
+}
+
 // ==================== 通用工具类 ====================
 function createCommonUtils(scriptName) {
   return new class {
@@ -1794,7 +1906,11 @@ function createCommonUtils(scriptName) {
 
       let validCount = CommonUtils.userList.filter(u => u.valid).length;
       console.log("======🎉 完成 " + validCount + " / 共 " + CommonUtils.userCount + " 账号，耗时 " + duration.toFixed(1) + "s======");
+      printCoinSummary();
+      await reportPointsToPanel();
 
+      // 马上 exit 的话管道里的 stdout 可能还没刷完，日志尾部会被截断
+      await this.wait(200);
       process.exit(0);
     }
 

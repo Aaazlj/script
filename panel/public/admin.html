@@ -703,6 +703,8 @@ function describeTags(value) {
 }
 
 let acctData = [];
+// 脚本上报的积分快照：{ openid: { ppcs: {...}, sfsy: {...} } }
+let pointsData = {};
 let acctStatsEl, acctFilterSel, keepAliveEl;
 
 function buildAccounts() {
@@ -811,6 +813,31 @@ function checkedKeys(box, defs) {
     const cb = box.querySelector('input[data-script="' + d.key + '"]');
     return cb && cb.checked;
   }).map((d) => d.key);
+}
+
+/**
+ * 脚本上报的积分（朴朴 / 顺丰）。
+ * 数据由脚本跑完 POST /api/points/report 写入，面板只负责展示；没有就不显示。
+ */
+function pointsLine(a) {
+  const rec = (pointsData && a.openid && pointsData[a.openid]) || null;
+  if (!rec) return null;
+
+  const tags = [];
+  for (const [key, label] of [['ppcs', '朴朴'], ['sfsy', '顺丰']]) {
+    const it = rec[key];
+    if (!it || typeof it.points !== 'number') continue;
+    const delta = (typeof it.before === 'number') ? Math.round((it.points - it.before) * 100) / 100 : null;
+    tags.push(node('span', {
+      class: 'tag' + (it.ok === false ? ' err' : ''),
+      text: label + ' ' + it.points + (delta ? '（' + (delta > 0 ? '+' : '') + delta + '）' : ''),
+      title: (it.ok === false ? '本次失败 · ' : '') + '更新于 ' + fmtTime(it.at) + (it.note ? ' · ' + it.note : ''),
+    }));
+  }
+  if (!tags.length) return null;
+
+  return node('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-top:7px;align-items:center' },
+    [node('span', { style: 'font-size:12px;color:var(--muted)', text: '积分' })].concat(tags));
 }
 
 /**
@@ -947,6 +974,7 @@ function accountRow(a) {
         node('span', { html: '入库 <b>' + fmtTime(a.created_at) + '</b>' }),
         node('span', { html: '最近刷新 <b>' + fmtTime(a.updated_at) + '</b>' }),
       ]),
+      pointsLine(a),
       scriptToggles(a),
       node('div', { class: 'acct-actions' }, [
         btn('刷新登录态', (e) => doAccountAction(e.target, '/api/yyb/accounts/refresh', a.ref)),
@@ -1084,7 +1112,12 @@ async function runKeepAlive(btn) {
 async function loadAccounts(btn) {
   if (btn) btn.disabled = true;
   try {
-    const r = await api('GET', '/api/yyb/accounts');
+    const [r, p] = await Promise.all([
+      api('GET', '/api/yyb/accounts'),
+      // 积分只是附带信息，读不到不该让整个账号列表报错
+      api('GET', '/api/points').catch(() => ({ accounts: {} })),
+    ]);
+    pointsData = (p && p.accounts) || {};
     renderAccounts(r.accounts);
     acctOut.innerHTML = '';
     loadKeepAlive();

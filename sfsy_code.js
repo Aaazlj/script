@@ -227,6 +227,52 @@ function printPointsSummaryOnce(preface, write) {
   printPointsSummary(SUMMARY, write);
 }
 
+/** 极简 POST JSON（不引依赖、失败就当面板不在线） */
+function postJSON(url, payload, timeout = 5000) {
+  return new Promise((resolve) => {
+    try {
+      const target = new URL(url);
+      const body = Buffer.from(JSON.stringify(payload));
+      const req = require('http').request({
+        hostname: target.hostname,
+        port: target.port || 80,
+        path: target.pathname + target.search,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
+        timeout,
+      }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.write(body);
+      req.end();
+    } catch (_) {
+      resolve(false);
+    }
+  });
+}
+
+/** 把各账号积分同步给扫码面板（只用于后台展示，失败不影响签到） */
+async function reportPointsToPanel() {
+  const items = SUMMARY
+    .filter((row) => row.openid && row.after != null)
+    .map((row) => ({
+      openid: row.openid,
+      points: row.after,
+      before: row.before != null ? row.before : null,
+      ok: !!row.ok,
+      note: row.note || '',
+    }));
+  if (!items.length) return;
+
+  const base = String(ENV('panel_url') || ENV('PANEL_URL') || 'http://scan-panel:5180').replace(/\/+$/, '');
+  if (await postJSON(`${base}/api/points/report`, { script: 'sfsy', items })) {
+    LOG(`📊 积分已同步到面板（${items.length} 个账号）`);
+  }
+}
+
 /** 顺丰业务签名：signature = md5(token&timestamp&sysCode) */
 function signHeaders() {
   const timestamp = String(Date.now());
@@ -1338,6 +1384,8 @@ async function runAccount(account, index, total, proxyPool, inviterId) {
   };
   const row = {
     index: index + 1,
+    // 面板按 openid 把积分挂到对应账号卡片上
+    openid: account.openid || '',
     name: account.remark || '',
     before: null,
     after: null,
@@ -1625,6 +1673,7 @@ async function main() {
 
     // 所有账号跑完后，统一输出一次积分变动汇总
     printPointsSummaryOnce();
+    await reportPointsToPanel();
   } finally {
     clearInterval(keepAlive);
     clearTimeout(watchdog);

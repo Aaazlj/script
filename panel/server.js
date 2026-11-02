@@ -27,6 +27,7 @@ const yyb = require('./lib/yyb');
 const upload = require('./lib/upload');
 const sign = require('./lib/sign');
 const jd = require('./lib/jd');
+const points = require('./lib/points');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_QR_SESSIONS = 200;
@@ -37,10 +38,16 @@ const MAX_QR_SESSIONS = 200;
 const sessions = new Map();
 
 function pruneSessions() {
-  const cutoff = Date.now() - 30 * 60 * 1000;
+  const now = Date.now();
+  const cutoff = now - 30 * 60 * 1000;
   for (const [k, v] of sessions) {
-    if (v.createdAt < cutoff) {
-      // 京东会话背后有个 chromium 进程，过期必须关掉，否则内存会被吃光
+    // 京东会话背后是常驻 chromium，且带 --proxy-server 指向 yyb-go：
+    // 页面在 passport.jd.com 上会自己不停轮询（sso/sgm/storage.360buyimg），
+    // 网关那边就一直有「需求」，出口永远不进入闲置期 —— 结果是每 3 分钟
+    // 提一次品赞（实测 18 次/小时、24 小时不停）。所以到点必须杀掉浏览器，
+    // 不能只等 30 分钟，更不能只靠「下次新建会话时顺手清理」。
+    const jdExpired = v.mode === 'jd' && now - v.createdAt > jd.SESSION_TTL;
+    if (v.createdAt < cutoff || jdExpired) {
       if (v.mode === 'jd' && v.jdSession) {
         try { jd.close(v.jdSession); } catch (_) { /* ignore */ }
       }
@@ -70,6 +77,16 @@ const routes = [];
 
 function route(method, pattern, handler, opts = {}) {
   routes.push({ method, pattern, handler, admin: !!opts.admin });
+}
+
+/**
+ * 是否来自容器内网/本机。
+ * 脚本上报走这个判断，所以故意不看 X-Forwarded-For（那是可以随便写的）。
+ */
+function isInternalRequest(req) {
+  const ip = String((req.socket && req.socket.remoteAddress) || '');
+  if (ip === '::1' || ip === '127.0.0.1') return true;
+  return /^(::ffff:)?(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
 }
 
 /* 公共 */
@@ -230,8 +247,21 @@ route('GET', '/api/yyb/avatar', async (req, res, url) => {
   httpx.pipeThrough(target, res);
 }, { admin: true });
 
-/* 动态出口（品赞）开关与状态（管理后台） */
+/* 积分快照（青龙里的朴朴 / 顺丰脚本跑完上报，只允许容器内网调用） */
 
+route('POST', '/api/points/report', async (req, res) => {
+  if (!isInternalRequest(req)) return httpx.fail(res, 403, '只允许内网调用');
+  const body = await httpx.readJSON(req, 256 * 1024);
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return httpx.fail(res, 400, '没有要上报的账号');
+  httpx.ok(res, points.report(body.script, items));
+});
+
+route('GET', '/api/points', async (req, res) => {
+  httpx.ok(res, points.summary());
+}, { admin: true });
+
+/* 动态出口（品赞）开关与状态（管理后台） */
 route('GET', '/api/yyb/proxy', async (req, res) => {
   const cfg = config.load();
   const out = await yyb.proxySummary(cfg.yyb);
@@ -543,6 +573,9 @@ function parseArgs(argv) {
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
   const cfg = config.load();
+  // 定时清理会话：只在新会话创建时清理的话，用户开了京东扫码页就走人，
+  // 那个 chromium 会一直挂着占代理（见 pruneSessions 注释）。
+  setInterval(pruneSessions, 60 * 1000).unref();
   server.listen(args.port, args.host, () => {
     console.log(`[panel] 扫码面板已启动：http://${args.host}:${args.port}`);
     console.log(`[panel] 用户入口：/        管理后台：/admin`);
