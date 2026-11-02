@@ -2,7 +2,10 @@
  * 各脚本的积分快照（脚本跑完主动上报）
  *
  * 存 data/points.json：
- *   { updated_at: 1761..., accounts: { "<openid>": { ppcs: {...}, sfsy: {...} } } }
+ *   { updated_at: 1761..., accounts: { "<ref>": { ppcs: {...}, sfsy: {...} } } }
+ *
+ * key 优先用网关账号 ref；没有 ref 的脚本（顺丰）用网关 openid。
+ * 注意别用「小程序自己的 openid」当 key —— 同一微信在朴朴和顺丰里是两串不同的值。
  *
  * 纯展示用：文件丢了最多是面板上不显示积分，不影响签到脚本。
  */
@@ -34,8 +37,8 @@ function save(data) {
 
 /** 记录一批上报：script 是脚本 key（ppcs / sfsy），items 里每条要 openid + points */
 function report(script, items) {
-  const key = String(script || '').trim().toLowerCase();
-  if (!key) return { updated: 0, total: 0 };
+  const scriptKey = String(script || '').trim().toLowerCase();
+  if (!scriptKey) return { updated: 0, total: 0 };
 
   const now = Math.floor(Date.now() / 1000);
   const data = load();
@@ -43,15 +46,16 @@ function report(script, items) {
   let updated = 0;
 
   for (const item of Array.isArray(items) ? items : []) {
-    const openid = String((item && item.openid) || '').trim();
+    // ref（网关账号 id）优先：小程序自己的 openid 在朴朴/顺丰里是两套值，对不上账号卡片
+    const acctKey = String((item && (item.ref || item.openid)) || '').trim();
     const raw = item && item.points;
-    if (!openid || raw === '' || raw == null) continue;
+    if (!acctKey || raw === '' || raw == null) continue;
     const points = Number(raw);
     if (!Number.isFinite(points)) continue;
 
     const before = Number(item.before);
-    accounts[openid] = Object.assign({}, accounts[openid], {
-      [key]: {
+    accounts[acctKey] = Object.assign({}, accounts[acctKey], {
+      [scriptKey]: {
         points,
         before: Number.isFinite(before) ? before : null,
         at: now,

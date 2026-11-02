@@ -1670,9 +1670,11 @@ function postJSON(url, payload, timeout = 5000) {
 /** 把各账号的朴分同步给扫码面板（只用于后台展示，失败不影响签到） */
 async function reportPointsToPanel() {
   const items = (CommonUtils.userList || [])
-    .filter((user) => user.open_id && user.coin_after != null)
+    .filter((user) => user.coin_after != null && (user.ref || user.open_id))
     .map((user) => ({
-      openid: user.open_id,
+      // 朴朴小程序的 openid 和网关账号的 openid 不是同一串，用 ref 才能对上账号卡片
+      ref: String(user.ref || ""),
+      openid: user.open_id || "",
       points: user.coin_after,
       before: user.coin_before ?? null,
       ok: !!user.valid,
