@@ -820,9 +820,12 @@ function checkedKeys(box, defs) {
  * 数据由脚本跑完 POST /api/points/report 写入，面板只负责展示；没有就不显示。
  */
 function pointsLine(a) {
-  // 朴朴按网关 ref 上报（小程序的 openid 跟账号卡片对不上），顺丰按网关 openid
-  const rec = (pointsData && ((a.ref && pointsData[a.ref]) || (a.openid && pointsData[a.openid]))) || null;
-  if (!rec) return null;
+  // 朴朴按网关 ref 上报，顺丰按网关 openid 上报 —— 同一个账号会有两条，合并后再显示
+  if (!pointsData) return null;
+  const rec = Object.assign({},
+    (a.openid && pointsData[a.openid]) || {},
+    (a.ref && pointsData[a.ref]) || {});
+  if (!Object.keys(rec).length) return null;
 
   const tags = [];
   for (const [key, label] of [['ppcs', '朴朴'], ['sfsy', '顺丰']]) {
