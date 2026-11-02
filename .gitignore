@@ -34,5 +34,3 @@ jd_grab.js
 jd_login_local.mjs
 jd_claim_grab.js
 jd-grab-extension/
-panel/lib/jd.js
-panel/public/jd.html
