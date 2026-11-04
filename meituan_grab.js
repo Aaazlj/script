@@ -150,6 +150,9 @@ const DEBUG = process.env.MT_DEBUG === '1';
 const MT_OPENIDS = env('mt_openid').split(/[&,，\s]+/).map((s) => s.trim()).filter(Boolean);
 // 账号的 scripts 标记：默认和 meituan_code.js 共用 'mt'，面板勾一次两个脚本都认
 const SCRIPT_KEY = (env('yyb_script_key') || 'mt').toLowerCase();
+// 抢券专用标记：面板「脚本列」里配成 mtgrab=整点抢!off（默认不勾选），勾了才抢
+const GRAB_TAG = (env('yyb_grab_tag') || 'mtgrab').toLowerCase();
+const GRAB_TAG_STRICT = (env('yyb_grab_tag_strict') || '1') !== '0';
 const TAG_FILTER = (env('yyb_tag_filter') || '1').toLowerCase() !== '0';
 
 const DATA_DIR = process.env.QL_DIR ? path.join(process.env.QL_DIR, 'data') : path.join(__dirname, 'data');
@@ -235,15 +238,26 @@ async function resolveSignature(method, rawUrl, bodyBuf) {
   const bodyHash = bodyBuf
     ? crypto.createHash('md5').update(bodyBuf.slice(0, 16200)).digest('hex') : '';
   const data = JSON.stringify({ method, url: rawUrl, bodyHash });
-  const r = await request('POST', SIGN_URL, {
-    body: Buffer.from(data, 'utf8'),
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 10000,
-  });
-  if (r.json && r.json.ok && r.json.data && r.json.data.url) {
-    return { url: r.json.data.url, headers: r.json.data.headers || {} };
+  // 签名服务（panel）有频率限制：多账号并发时会回「签名请求过于频繁」。
+  // 这时绝不能拿不到签名就发出去 —— 没签名的请求会被 WAF 403 / 2213 风控拦掉。
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const r = await request('POST', SIGN_URL, {
+      body: Buffer.from(data, 'utf8'),
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
+    if (r.json && r.json.ok && r.json.data && r.json.data.url) {
+      return { url: r.json.data.url, headers: r.json.data.headers || {} };
+    }
+    const msg = String((r.json && r.json.error) || r.error || '');
+    const throttled = /频繁|too many|rate.?limit/i.test(msg);
+    if (throttled && attempt < 5) {
+      await sleep(120 + attempt * 180 + Math.round(Math.random() * 120));
+      continue;
+    }
+    $.log(`⚠️ [签名] 签名服务不可用（${SIGN_URL}）：${r.error || jsonPreview(r.json || r.text, 120)}`);
+    break;
   }
-  $.log(`⚠️ [签名] 签名服务不可用（${SIGN_URL}）：${r.error || jsonPreview(r.json || r.text, 120)}`);
   return { url: rawUrl, headers: {} };
 }
 
@@ -251,11 +265,14 @@ async function resolveSignature(method, rawUrl, bodyBuf) {
 
 const gwHeaders = () => ({ 'User-Agent': USER_AGENT, Accept: '*/*' });
 
-/** scripts 标记：空=允许；含本 key=允许；否则跳过（yyb_tag_filter=0 可关掉过滤） */
+/** 整点抢是「按账号 opt-in」的：只有面板后台勾了「整点抢」的账号才参与抢券。
+ *  与 meituan_code.js 的 mt 标记互不影响（那个是日常领券）。
+ *  默认严格模式：标记里没有 yyb_grab_tag 就不抢（空标记 = 不勾选）。 */
 function tagAllows(acc) {
-  if (!TAG_FILTER) return true;
   const tags = String((acc && acc.scripts) || '')
     .split(/[,，;；\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (GRAB_TAG && GRAB_TAG_STRICT) return tags.includes(GRAB_TAG);
+  if (!TAG_FILTER) return true;
   if (!tags.length) return true;
   return tags.includes(SCRIPT_KEY);
 }
@@ -692,12 +709,12 @@ async function resolveAccounts(loginCache) {
     const label = nickname && nickname !== '-' ? nickname : ref;
     if (!tagAllows(a)) {
       skipped += 1;
-      $.log(`⏭️ [账号] 跳过「${label}」：标记 [${String(a.scripts || '').trim()}] 不含 [${SCRIPT_KEY}]`);
+      $.log(`⏭️ [账号] 跳过「${label}」：标记 [${String(a.scripts || '').trim()}] 不含 [${GRAB_TAG_STRICT && GRAB_TAG ? GRAB_TAG : SCRIPT_KEY}]`);
       continue;
     }
     out.push({ ref, label });
   }
-  if (skipped) $.log(`ℹ️ [账号] 按标记过滤掉 ${skipped} 个（yyb_tag_filter=0 可关闭）`);
+  if (skipped) $.log(`ℹ️ [账号] 按标记过滤掉 ${skipped} 个（面板里勾选「整点抢」的账号才参与）`);
   return out;
 }
 
