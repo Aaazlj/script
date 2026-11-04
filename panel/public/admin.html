@@ -884,7 +884,7 @@ async function saveScriptToggles(a, box, defs, extras) {
     const r = await api('POST', '/api/yyb/accounts/scripts', { items: [{ ref: a.ref, scripts: value }] });
     if (r.accounts && r.accounts.length) renderAccounts(r.accounts);
     else await loadAccounts();
-    show(acctOut, 'ok', [`✅「${name}」：${value ? describeTags(value) : '全部脚本（不限制）'}`]);
+    show(acctOut, 'ok', [`✅「${name}」：${value ? parseTags(value).map(scriptName).join('、') : '全部脚本（不限制）'}`]);
   } catch (e) {
     show(acctOut, 'err', ['保存失败：' + e.message]);
     await loadAccounts();   // 界面上的勾选回滚成服务端的真实状态
