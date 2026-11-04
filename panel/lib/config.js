@@ -39,7 +39,7 @@ const DEFAULTS = {
       { key: 'sfsy', name: '顺丰' },
       { key: 'ppcs', name: '朴朴' },
       // 整点抢是 opt-in：默认不勾选，勾了 meituan_grab.js 才会给这个账号抢券
-      { key: 'mtgrab', name: '整点抢', defaultOff: true },
+      { key: 'mtgrab', name: '美团整点抢券', defaultOff: true },
     ],
   },
 };

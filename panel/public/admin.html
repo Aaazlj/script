@@ -873,12 +873,6 @@ function scriptToggles(a) {
       title: '脚本标记：' + def.key,
     }, [cb, node('span', { text: def.name })]));
   }
-  box.appendChild(node('span', {
-    class: 'tag' + (unrestricted ? '' : ' primary'),
-    title: '当前生效范围',
-    // 空标记：有 defaultOff 脚本时叫「默认脚本」，否则就是「全部脚本」
-    text: unrestricted ? describeTags('') : describeTags(tags.join(',')),
-  }));
   return box;
 }
 
@@ -897,7 +891,7 @@ async function saveScriptToggles(a, box, defs, extras) {
   }
 }
 
-function accountRow(a) {
+function accountRow(a, idx) {
   const name = a.nickname || a.alias || a.openid || ('#' + a.ref);
   const initial = (a.nickname || a.alias || a.openid || '#').slice(0, 1);
   const avatar = a.hasAvatar
@@ -965,6 +959,12 @@ function accountRow(a) {
     },
   }, [
     handle,
+    idx ? node('span', {
+      text: String(idx),
+      title: '序号',
+      style: 'flex:0 0 auto;min-width:20px;text-align:right;font-size:12px;'
+        + 'color:var(--muted);font-variant-numeric:tabular-nums;user-select:none',
+    }) : null,
     avatar,
     node('div', { class: 'acct-body' }, [
       node('div', { class: 'acct-head' }, [
@@ -1061,7 +1061,7 @@ function renderAccounts(accounts) {
     acctListEl.appendChild(node('div', { class: 'note info', text: '当前筛选下没有账号。' }));
     return;
   }
-  for (const a of items) acctListEl.appendChild(accountRow(a));
+  items.forEach((a, i) => acctListEl.appendChild(accountRow(a, i + 1)));
 }
 
 async function loadKeepAlive() {
