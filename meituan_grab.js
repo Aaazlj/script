@@ -781,6 +781,11 @@ async function main() {
   // debug 模式：原样打印场次与券列表（含 status），用来判断「没有可抢的券」到底是真没券还是状态判断错
   if (MODE === 'debug') {
     const act = Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [];
+    // 原始响应落盘，便于排查风控/字段变动（不打印，太长了）
+    try {
+      fs.writeFileSync(path.join(DATA_DIR, 'mt_grab_info_debug.json'), JSON.stringify(probeInfo.data, null, 1));
+      $.log(`📝 原始响应已写入 ${path.join(DATA_DIR, 'mt_grab_info_debug.json')}`);
+    } catch (_) { /* 写不了就算了 */ }
     for (const a of act) {
       $.log(`📋 活动 ${a.activityId || ''} 场次数 ${(a.sessionList || []).length}`);
       for (const s of a.sessionList || []) {
@@ -814,21 +819,63 @@ async function main() {
     return;
   }
 
-  // trygrab 模式：对「当前进行中」的场次真打一枪（1 个号），用来看服务端真实返回码
+  // trygrab 模式：对「当前进行中」的场次逐张券真打一枪（1 个号），看服务端真实返回码
   if (MODE === 'trygrab') {
     const list = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
     const sess = list.find((s) => s.grabToken && grabbable(s.rights).length);
     if (!sess) { $.log('❌ 当前没有带 grabToken 的可抢场次'); return; }
-    const right = grabbable(sess.rights)[0];
-    $.log(`🎯 trygrab：场次 ${sess.sessionCode} 券 ${right.rightCode}`
-      + `（${(Number(right.couponValue || 0) / 100).toFixed(0)}元/满${(Number(right.priceLimit || 0) / 100).toFixed(0)}）`);
-    const r = await grabCoupon(probeLogin.ctx, {
+    for (const right of grabbable(sess.rights)) {
+      const val = (Number(right.couponValue || 0) / 100).toFixed(0);
+      const lim = (Number(right.priceLimit || 0) / 100).toFixed(0);
+      $.log(`🎯 trygrab：${right.couponName || right.rightCode} ${val}元/满${lim}（status=${right.status} 剩=${right.remainStock}）`);
+      const r = await grabCoupon(probeLogin.ctx, {
+        activityId: sess.activityId,
+        sessionCode: sess.sessionCode,
+        grabToken: sess.grabToken,
+        rightCode: right.rightCode,
+      });
+      $.log(`📨 返回：${JSON.stringify(r).slice(0, 300)}`);
+      if (r.ok && r.subCode === 1) { $.log('🎉 抢到了，停止后续尝试'); return; }
+    }
+    return;
+  }
+  // variants 模式：换几种请求形态打同一张券，看 2213 是「参数问题」还是「账号被风控」
+  if (MODE === 'variants') {
+    const list = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
+    const sess = list.find((s) => s.grabToken && grabbable(s.rights).length);
+    if (!sess) { $.log('❌ 当前没有可抢场次'); return; }
+    const rights = grabbable(sess.rights);
+    const right = rights[rights.length - 1];              // 用最小面额那张试，减少影响
+    const base = Object.assign(baseBody(probeLogin.ctx), {
+      identityScene: IDENTITY_SCENE,
       activityId: sess.activityId,
       sessionCode: sess.sessionCode,
       grabToken: sess.grabToken,
       rightCode: right.rightCode,
+      pageId: '', moduleId: MODULE_ID, sessionId: '', unpl: UNPL, osType: 'Windows',
     });
-    $.log(`📨 返回：${JSON.stringify(r).slice(0, 400)}`);
+    const cases = [
+      ['原样', {}],
+      ['去 unpl', { unpl: null }],
+      ['去 moduleId', { moduleId: null }],
+      ['去 unpl+moduleId+osType', { unpl: null, moduleId: null, osType: null }],
+      ['sessionId=sessionCode', { sessionId: sess.sessionCode }],
+      ['加 scene=seckill', { scene: 'seckill', source: 'h5' }],
+    ];
+    $.log(`🧪 variants：券 ${right.couponName} ${(Number(right.couponValue) / 100).toFixed(0)}元`);
+    for (const [name, patch] of cases) {
+      const body = Object.assign({}, base);
+      for (const k of Object.keys(patch)) {
+        if (patch[k] === null) delete body[k];
+        else body[k] = patch[k];
+      }
+      const r = await grabPost(probeLogin.ctx, GRAB_PATH, body, 'variants');
+      const info = r.ok
+        ? `code=${r.raw && r.raw.code} subCode=${r.data && r.data.subCode}`
+        : (r.error || '?');
+      $.log(`  ・${name} → ${String(info).slice(0, 120)}`);
+      await sleep(400);
+    }
     return;
   }
   const sessions = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
@@ -954,14 +1001,15 @@ async function main() {
     const { p, sess } = t;
     const rights0 = grabbable(sess.rights);
     if (!rights0.length) return { p, ok: false, text: '本场次没有可抢的券' };
-    // 8004 = 抢券失败请刷新页面重试（grabToken 过期/已消费），所以失败要刷新 token 再打
+    // 每轮把本场次所有券都试一遍：最热的那张（18元）常回 8001/2213，
+    // 但同场次还有别的券有货（如堂食 7元/13元），不能让一张券的失败拖垮整轮
     let sessNow = sess;
     let last = null;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
       const rights = grabbable(sessNow.rights);
       if (!rights.length) break;
-      let done = false;
-      for (const right of rights.slice(0, 3)) {
+      let retryable = false;
+      for (const right of rights.slice(0, 4)) {
         const r = await grabCoupon(p.ctx, {
           activityId: target.activityId,
           sessionCode: sessNow.sessionCode,
@@ -975,12 +1023,12 @@ async function main() {
           return { p, ok: true, text: `${name}${val} 抢到了（第 ${attempt + 1} 轮）` };
         }
         last = r;
-        // 8001=已抢完，换下一张券；其它错误直接进刷新重试
-        if (!(r.ok && r.subCode === 8001)) { done = true; break; }
+        const code = r.ok ? r.subCode : 'ERR';
+        if ([8000, 8002, 8004, 2213].includes(code)) retryable = true;
+        $.log(`  · ${p.label} 券${(Number(right.couponValue || 0) / 100).toFixed(0)}元 → ${r.ok ? code + ' ' + r.text : r.error}`);
       }
-      if (!done) break;                                  // 所有券都 8001，没得试了
-      if (last && last.ok && ![8000, 8002, 8004].includes(last.subCode)) break;  // 不可重试的错误
-      await sleep(450);
+      if (!retryable) break;                       // 全是「已抢完/不支持」类，重试没意义
+      await sleep(400);
       const info = await grabInfoOnce(p.ctx, target);
       if (!info.ok) break;
       const s2 = flatten(Array.isArray(info.data.activityList) ? info.data.activityList : [], Date.now())
