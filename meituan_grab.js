@@ -213,8 +213,8 @@ const TAG_FILTER = (env('yyb_tag_filter') || '1').toLowerCase() !== '0';
  * 只支持 http/https 代理（自建 CONNECT 隧道）；socks 一律回退直连。
  * 没配 mt_proxy 时复用同机其它脚本已有的国内住宅出口（xc_proxy / pz_proxy）。
  */
-const PROXY_RAW = env('mt_proxy', 'MT_PROXY', 'script_proxy', 'SCRIPT_PROXY')
-  || [env('xc_proxy'), env('pz_proxy')].find(Boolean) || '';
+// 只认显式配置的 mt_proxy；⚠️ 别自动复用 xc_proxy/pz_proxy——实测住宅出口 IP 会被 WAF 封（403）
+const PROXY_RAW = env('mt_proxy', 'MT_PROXY', 'script_proxy', 'SCRIPT_PROXY');
 const PROXY_URL = (() => {
   if (!PROXY_RAW) return '';
   let raw = PROXY_RAW;
