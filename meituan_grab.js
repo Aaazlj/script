@@ -47,6 +47,8 @@ cron: 0 9 * * *
 
 const https = require('https');
 const http = require('http');
+const net = require('net');
+const tls = require('tls');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -64,6 +66,58 @@ const GRAB_PATH = '/fulishemini/couponActivity/limitTimeGrab';
 const IDENTITY_SCENE = { sendCouponIdentity: 4, sendCouponScene: 13 };
 const MODULE_ID = 'b_waimai_jayhgcnt_mv';
 const UNPL = 'v1_4AHi-LokTshbKe0CTLVFiRfpi2gcMVypu2V3bcBL-lxh8gsU0RWoDhMxZHRdAilG';
+
+/* ===== H5 容器形态（2026-11-11 真机抓包，成功拿到 7 元券的那条） =====
+ * 秒杀接口只认 H5 这套身份：appId=mtunion_h5、iOS、带 mtFingerprint。
+ * 用小程序那套（wxde8… / windows / 空指纹）会一律回 2213 风控。
+ * 指纹和 uuid 是设备级的，换成别的号要重新抓一份（可用环境变量覆盖）。
+ */
+// 默认仍走小程序形态（能用、info 200）；h5 形态留作实验（需要 H5 token，目前公开链路拿不到）
+const GRAB_SHAPE = (env('mt_grab_shape') || 'app').toLowerCase();
+const H5_QUERY = '?yodaReady=h5&csecplatform=4&csecversion=4.3.0';
+const H5_WM_UUID = env('mt_h5_uuid') || '1794365955227-iasgfzzj5d';
+const H5_UNPL = env('mt_h5_unpl')
+  || 'v1_Ooq77WIjR-ypd8RrCHcj-sVe5FMnXxslDQoabHh8cFMuBvxcPMu356DyaTfoQQxP';
+const H5_PAGE_ID = env('mt_h5_page_id') || 'c_waimai_2o6ecnjo';
+const H5_SESSION_ID = env('mt_h5_session_id') || '1a1c88b7074-86ae-5fb3-9fc6';
+const DROP_PAGE = (env('mt_grab_drop_page') || '0') === '1';
+const H5_CITY2 = env('mt_h5_city2') || '440100';const H5_LAT = Number(env('mt_h5_lat') || 23177555);
+const H5_LNG = Number(env('mt_h5_lng') || 113335283);
+// 真机微信 iPhone UA（H5 页面用的是这个，不是 Windows 小程序那套）
+const H5_UA = env('mt_h5_ua') || 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_2 like Mac OS X) '
+  + 'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 '
+  + 'MicroMessenger/8.0.80(0x18005033) NetType/WIFI Language/zh_CN miniProgram/wxde8ac0a21135c07d';
+// H5 的设备 cookie（真机抓包值；同账号同设备可复用）
+const H5_LXSDK_S = env('mt_h5_lxsdk_s')
+  || '_lxsdk_s=1a1c86b2b23-225-cb4-3b8%7C%7C177';
+const H5_WEBDFPID = env('mt_h5_webdfpid')
+  || '11v93711xz5y568u11u33y3499886z758z8x13y685z879586074w1wz-1794450230647-1794363828705'
+  + 'OAQYAWO868c0ee73ab28e1d0b03bc83148500064249';
+const H5_UTM_RG = env('mt_h5_utm')
+  || 'AM%25a63k2kU%25537%25PPW5D1PPXAOHOMcjPPjDDHDg55ccMA1OcAcXPDHMcOAc15OcMv1g4P4A';
+const H5_CUID = env('mt_h5_cuid')
+  || '1a1c86b2b22c8-06f678db458e258-591c7f08-505c8-1a1c86b2b22c8';
+
+/** 真机 H5 的 Cookie 串 */
+function h5Cookie() {
+  return `${H5_LXSDK_S}; unpl=${H5_UNPL}; WEBDFPID=${H5_WEBDFPID}; `
+    + `utm_source_rg=${H5_UTM_RG}; _lxsdk_cuid=${H5_CUID}`;
+}
+
+/** 页面 Referer（带 token / userId / openId，真机就是这么带的） */
+function h5Referer(ctx) {
+  const q = [
+    't=1', 'c=2', 'p=gcPTRb1zPcoQ',
+    `uuid=${ctx.openId}`, `openId=${ctx.openId}`,
+    `openIdCipher=${encodeURIComponent(ctx.openIdCipher || '')}`,
+    'mina_name=mt-weapp', 'app_version=10.45.1',
+    `token=${ctx.token}`, `userId=${ctx.userId}`, `userid=${ctx.userId}`,
+    'lat=23.17755454275273', 'lng=113.33528303085309', 'loc_type=WX',
+    'cityId=20', 'cityid=20', 'ci=20',
+  ].join('&');
+  return `https://mtunion.meituan.com/fx/center?${q}`;
+}
+const H5_FP = env('mt_h5_fingerprint') || 'H5dfp_4.3.0_tttt_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';
 
 const SUBCODE_TEXT = {
   1: '抢券成功！',
@@ -155,6 +209,25 @@ const GRAB_TAG = (env('yyb_grab_tag') || 'mtgrab').toLowerCase();
 const GRAB_TAG_STRICT = (env('yyb_grab_tag_strict') || '1') !== '0';
 const TAG_FILTER = (env('yyb_tag_filter') || '1').toLowerCase() !== '0';
 
+/* ===== 代理（秒杀接口会看出口 IP，机房 IP 大概率被判风控） =====
+ * 只支持 http/https 代理（自建 CONNECT 隧道）；socks 一律回退直连。
+ * 没配 mt_proxy 时复用同机其它脚本已有的国内住宅出口（xc_proxy / pz_proxy）。
+ */
+const PROXY_RAW = env('mt_proxy', 'MT_PROXY', 'script_proxy', 'SCRIPT_PROXY')
+  || [env('xc_proxy'), env('pz_proxy')].find(Boolean) || '';
+const PROXY_URL = (() => {
+  if (!PROXY_RAW) return '';
+  let raw = PROXY_RAW;
+  if (!raw.includes('://')) raw = `http://${raw}`;
+  try {
+    const u = new URL(raw);
+    if (u.protocol === 'socks5:' || u.protocol === 'socks5h:') return '';
+    return raw;
+  } catch (_) { return ''; }
+})();
+const PROXY_VALIDATE = (env('mt_proxy_validate') || '1').toLowerCase() !== '0';
+let proxyEnabled = false;
+
 const DATA_DIR = process.env.QL_DIR ? path.join(process.env.QL_DIR, 'data') : path.join(__dirname, 'data');
 const STATE_FILE = env('mt_grab_state_file') || path.join(DATA_DIR, 'mt_grab_state.json');
 const LOGIN_CACHE_FILE = env('mt_grab_login_cache') || path.join(DATA_DIR, 'mt_grab_login_cache.json');
@@ -185,6 +258,87 @@ const tokenKey = (s) => crypto.createHash('sha256').update(String(s)).digest('he
 
 /* ============ HTTP ============ */
 
+/** 把 http 代理 URL 变成可复用的 CONNECT 隧道 Agent（https 目标在隧道上再套一层 TLS） */
+function makeTunnelAgent(proxyUrl, secure) {
+  const u = new URL(proxyUrl);
+  const proxyHost = u.hostname;
+  const proxyPort = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+  const authHeader = (u.username || u.password)
+    ? 'Proxy-Authorization: Basic '
+      + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password || '')}`).toString('base64')
+      + '\r\n'
+    : '';
+  const BaseAgent = secure ? https.Agent : http.Agent;
+
+  class TunnelAgent extends BaseAgent {
+    createConnection(options, cb) {
+      let settled = false;
+      const done = (err, sock) => { if (!settled) { settled = true; cb(err, sock); } };
+      const host = options.host || options.hostname;
+      const port = options.port || (secure ? 443 : 80);
+      const target = `${host}:${port}`;
+      const raw = net.connect(proxyPort, proxyHost);
+      let buf = '';
+      const onData = (chunk) => {
+        buf += chunk.toString('latin1');
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx < 0) return;
+        raw.removeListener('data', onData);
+        const status = parseInt(String(buf).split(' ')[1], 10);
+        if (status !== 200) {
+          raw.destroy();
+          return done(new Error(`代理 CONNECT 失败：${buf.split('\r\n')[0]}`));
+        }
+        const rest = Buffer.from(buf.slice(idx + 4), 'latin1');
+        if (rest.length) raw.unshift(rest);
+        raw.setTimeout(0);
+        if (!secure) return done(null, raw);
+        const tlsSock = tls.connect({ socket: raw, servername: host });
+        tlsSock.once('secureConnect', () => done(null, tlsSock));
+        tlsSock.once('error', (e) => done(e));
+      };
+      raw.on('data', onData);
+      raw.once('error', (e) => done(e));
+      raw.setTimeout(15000, () => { raw.destroy(); done(new Error('代理连接超时')); });
+      raw.once('connect', () => {
+        raw.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${authHeader}\r\n`);
+      });
+    }
+  }
+  return new TunnelAgent({ keepAlive: false });
+}
+
+const agentCache = new Map();
+function agentFor(secure) {
+  if (!PROXY_URL) return undefined;
+  const key = `${secure ? 's' : 'h'}|${PROXY_URL}`;
+  if (!agentCache.has(key)) {
+    try { agentCache.set(key, makeTunnelAgent(PROXY_URL, secure)); } catch (_) { return undefined; }
+  }
+  return agentCache.get(key);
+}
+
+/** 启动时验证代理连通性；不通过就回退直连（避免整轮全挂） */
+async function validateProxy() {
+  if (!PROXY_URL) {
+    $.log('🌐 [代理] 未配置，本次直连（秒杀接口对机房 IP 敏感，建议配 mt_proxy）');
+    return false;
+  }
+  proxyEnabled = true;
+  if (!PROXY_VALIDATE) {
+    $.log(`🌐 [代理] 已启用（跳过验证）：${PROXY_URL}`);
+    return true;
+  }
+  const r = await request('GET', 'https://media.meituan.com/', { timeout: 12000, proxy: true });
+  if (r.status >= 200 && r.status < 500) {
+    $.log(`🌐 [代理] 连通性验证通过（HTTP ${r.status}）：${PROXY_URL}`);
+    return true;
+  }
+  $.log(`⚠️ [代理] 验证失败（${r.error || r.status}），本次回退直连`);
+  proxyEnabled = false;
+  return false;
+}
+
 function request(method, url, opts = {}) {
   return new Promise((resolve) => {
     let u;
@@ -207,14 +361,21 @@ function request(method, url, opts = {}) {
     }
     if (payload) headers['Content-Length'] = payload.length;
 
-    const req = mod.request({
+    const reqOpts = {
       method,
       hostname: u.hostname,
       port: u.port || (isHttps ? 443 : 80),
       path: u.pathname + u.search,
       headers,
       timeout: opts.timeout || REQUEST_TIMEOUT,
-    }, (res) => {
+    };
+    // 走代理：换成自建 CONNECT 隧道 Agent；直连则用默认 Agent
+    if (opts.proxy && proxyEnabled) {
+      const ag = agentFor(isHttps);
+      if (ag) reqOpts.agent = ag;
+    }
+
+    const req = mod.request(reqOpts, (res) => {
       const chunks = [];
       res.on('data', (d) => chunks.push(d));
       res.on('end', () => {
@@ -539,14 +700,23 @@ function headersFor(ctx, bodyLen) {
  * （yodaReady=wx&csecappid=...），带了会被 media.meituan.com 的 openresty 直接 403。
  * 且该 path 的 WAF 是概率性放行（同请求有时 200 有时 403），所以必须退避重试。
  */
-async function grabPost(ctx, apiPath, bodyObj, tag) {
+async function grabPost(ctx, apiPath, bodyObj, tag, extraHeaders) {
   const rawBody = Buffer.from(JSON.stringify(bodyObj), 'utf8');
   const url = `${MEDIA_BASE}${apiPath}`;
   const headers = headersFor(ctx, rawBody.length);
+  if (extraHeaders) {
+    for (const k of Object.keys(extraHeaders)) {
+      // 头名大小写不敏感，先删掉同名旧值再写
+      for (const h of Object.keys(headers)) if (h.toLowerCase() === k.toLowerCase()) delete headers[h];
+      headers[k] = extraHeaders[k];
+    }
+  }
   const sig = await resolveSignature('POST', url, rawBody);
   Object.assign(headers, sig.headers || {});
 
-  const r = await request('POST', sig.url || url, { body: rawBody, headers, timeout: REQUEST_TIMEOUT });
+  const r = await request('POST', sig.url || url, {
+    body: rawBody, headers, timeout: REQUEST_TIMEOUT, proxy: true,
+  });
   if (DEBUG) {
     $.log(`  [debug] ${tag}: ${r.json ? jsonPreview(r.json, 400) : (r.text || r.error || '-').slice(0, 200)}`);
   }
@@ -586,8 +756,36 @@ async function grabInfo(ctx, target, tries = 4) {
   return last;
 }
 
+/** H5 容器形态的抢券请求体（字段与真机抓包逐一对齐，顺序也照抄） */
+function h5GrabBody(ctx, p) {
+  return {
+    wm_uuid: H5_WM_UUID,
+    mtFingerprint: H5_FP,
+    fp_platform: 11,
+    wm_appversion: '1.1.0',
+    city_id_level2: H5_CITY2,
+    wm_actual_latitude: H5_LAT,
+    wm_actual_longitude: H5_LNG,
+    appId: 'mtunion_h5',
+    open_id: ctx.openId,
+    expoId: ctx.openIdCipher,
+    wm_dplatform: 'ios',
+    container: 'mt_applet',
+    identityScene: IDENTITY_SCENE,
+    activityId: p.activityId,
+    sessionCode: p.sessionCode,
+    grabToken: p.grabToken,
+    rightCode: p.rightCode,
+    pageId: DROP_PAGE ? undefined : H5_PAGE_ID,
+    moduleId: MODULE_ID,
+    sessionId: DROP_PAGE ? undefined : (p.sessionId || H5_SESSION_ID),
+    unpl: DROP_PAGE ? undefined : H5_UNPL,
+  };
+}
+
 async function grabCoupon(ctx, p) {
-  const body = Object.assign(baseBody(ctx), {
+  const h5 = GRAB_SHAPE === 'h5';
+  const body = h5 ? h5GrabBody(ctx, p) : Object.assign(baseBody(ctx), {
     identityScene: IDENTITY_SCENE,
     activityId: p.activityId,
     sessionCode: p.sessionCode,
@@ -599,7 +797,16 @@ async function grabCoupon(ctx, p) {
     unpl: UNPL,
     osType: 'Windows',
   });
-  const r = await grabPost(ctx, GRAB_PATH, body, 'limitTimeGrab');
+  const r = await grabPost(ctx, h5 ? GRAB_PATH + H5_QUERY : GRAB_PATH, body, 'limitTimeGrab',
+    h5 ? {
+      token: ctx.token,                     // 真机靠这个头鉴权，body 里没有 wm_logintoken
+      Origin: 'https://mtunion.meituan.com',
+      Referer: h5Referer(ctx),
+      Cookie: h5Cookie(),
+      'User-Agent': H5_UA,
+      'Accept-Language': 'zh-CN,zh-Hans;q=0.9',
+      Accept: 'application/json, text/plain, */*',
+    } : null);
   if (!r.ok) return r;
   const d = r.data;
   return {
@@ -744,6 +951,7 @@ async function main() {
   $.log('');
   $.log('════════ 美团整点抢券（全账号并发） ════════');
   $.log(`🕒 ${nowText()}`);
+  await validateProxy();
 
   // 1) 账号候选
   const loginCache = readLoginCache();
@@ -824,7 +1032,11 @@ async function main() {
     const list = flatten(Array.isArray(probeInfo.data.activityList) ? probeInfo.data.activityList : [], nowMs);
     const sess = list.find((s) => s.grabToken && grabbable(s.rights).length);
     if (!sess) { $.log('❌ 当前没有带 grabToken 的可抢场次'); return; }
+    // 可选第三参数：只打某个面额，如 `trygrab 13` 只打 13 元那张
+    const wantYuan = Number(process.argv[3] || 0);
     for (const right of grabbable(sess.rights)) {
+      const yuan = Number(right.couponValue || 0) / 100;
+      if (wantYuan && yuan !== wantYuan) continue;
       const val = (Number(right.couponValue || 0) / 100).toFixed(0);
       const lim = (Number(right.priceLimit || 0) / 100).toFixed(0);
       $.log(`🎯 trygrab：${right.couponName || right.rightCode} ${val}元/满${lim}（status=${right.status} 剩=${right.remainStock}）`);
