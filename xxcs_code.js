@@ -37,8 +37,10 @@ cron: 5 9 * * *
    xxcs_poi                                        门店 ID，默认 10002122。
                                                    买菜币活动不分城市，用默认值即可
    xxcs_task                                       默认 1。设 0 则只签到、不领任务奖励
-   xxcs_continuous                                 默认 0。设 1 才额外领「连续签到奖励」
-                                                   （getWeekContinuousRewardNew，未验证过副作用，默认关）
+   xxcs_continuous                                 默认 0。设 1 时只在连续签到第 3 / 7 天去领里程碑奖励
+                                                   （页面气泡文案 thirdDay/seventhDay）。
+                                                   其它日子调这个接口只会回「设备已经参加过活动」，
+                                                   所以按天数门控，开着也不会每天发无效请求
 
 4. 其它（可选）：
    xxcs_login_cache                                默认 1。设 0 关闭「登录态复用」，每次都去网关取 code
@@ -792,6 +794,7 @@ async function runChains(ctx) {
   let authFail = false;
   let ok = false;
   let reward = '';
+  let justSigned = false;
 
   /* 1) 签到前的状态 */
   const before = await getStatus(ctx);
@@ -826,6 +829,7 @@ async function runChains(ctx) {
       lines.push('⚠️ 签到：服务端返回 result=false');
     } else {
       reward = sign.reward;
+      justSigned = true;
       $.log(`✅ [签到] 签到成功 +${reward || '?'} 买菜币`);
       lines.push(`✅ 签到：成功 +${reward || '?'} 买菜币`);
     }
@@ -838,16 +842,29 @@ async function runChains(ctx) {
     lines.push(`📅 本周签到进度：${week.count} 天`);
   }
 
-  /* 4) 连续奖励（默认关） */
+  /* 4) 连续奖励：只有第 3 / 7 天是里程碑（页面气泡文案 thirdDay/seventhDay），
+        其它日子调这个接口只会回「您的设备已经参加过活动」，纯噪音，所以按天数门控。 */
   if (DO_CONTINUOUS) {
-    const cont = await claimContinuous(ctx);
-    if (cont.ok) {
-      const v = cont.data && cont.data.rewardValue != null ? ` +${cont.data.rewardValue}` : '';
-      $.log(`🎁 [连续] 连续签到奖励${v || '已处理'}`);
-      lines.push(`🎁 连续签到奖励：${v ? '领到' + v : '已处理'}`);
+    const day = week ? Number(week.count) || 0 : 0;
+    if (!justSigned) {
+      // 今天不是本次签的，里程碑奖励一般随签到一起发，不再重复调
+      $.log('🎁 [连续] 今日非本次签到，跳过连续奖励领取');
+    } else if (day !== 3 && day !== 7) {
+      $.log(`🎁 [连续] 本周第 ${day} 天，未到 3/7 天里程碑，跳过`);
+      lines.push(`🎁 连续奖励：本周第 ${day} 天，未到里程碑`);
     } else {
-      $.log(`⚠️ [连续] ${cont.error}`);
-      lines.push(`⚠️ 连续签到奖励：${cont.error}`);
+      const cont = await claimContinuous(ctx);
+      if (cont.ok) {
+        const v = cont.data && cont.data.rewardValue != null ? ` +${cont.data.rewardValue}` : '';
+        $.log(`🎁 [连续] 第 ${day} 天里程碑奖励${v || '已处理'}`);
+        lines.push(`🎁 连续奖励（第 ${day} 天）：${v ? '领到' + v : '已处理'}`);
+      } else if (/已经参加|重复|已领/i.test(cont.error || '')) {
+        $.log(`🎁 [连续] 第 ${day} 天里程碑奖励已领过：${cont.error}`);
+        lines.push(`🎁 连续奖励（第 ${day} 天）：已领过`);
+      } else {
+        $.log(`⚠️ [连续] ${cont.error}`);
+        lines.push(`⚠️ 连续签到奖励：${cont.error}`);
+      }
     }
   }
 
