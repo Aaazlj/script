@@ -756,7 +756,8 @@ function buildAccounts() {
       '脚本列',
       acctScriptsInput,
       '决定每个账号后面显示哪几个脚本的勾选框，格式 key=显示名，逗号分隔（如 mt=美团, sfsy=顺丰, ppcs=朴朴）。'
-      + ' key 必须和脚本里自报的一致（sfsy_code.js→sfsy、ppcs_code.js→ppcs、meituan_code.js→mt、lupi_code.js→lupi、xcbwc_code.py→xc）。'
+      + ' key 必须和脚本里自报的一致（sfsy_code.js→sfsy、ppcs_code.js→ppcs、meituan_code.js→mt、'
+      + 'xxcs_code.js→xxcs、xcbwc_code.py→xc）。'
       + ' 名字后面加 !off 表示「默认不勾选」：新账号不会自动跑它，需要你手工勾上才跑。改完点右上角「保存配置」。',
     ),
     node('div', { class: 'row', style: 'margin-bottom:6px' }, [

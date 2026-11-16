@@ -38,8 +38,11 @@ const DEFAULTS = {
       { key: 'mt', name: '美团' },
       { key: 'sfsy', name: '顺丰' },
       { key: 'ppcs', name: '朴朴' },
-      // 整点抢是 opt-in：默认不勾选，勾了 meituan_grab.js 才会给这个账号抢券
-      { key: 'mtgrab', name: '美团整点抢券', defaultOff: true },
+      { key: 'xc', name: '小蚕霸王餐', defaultOff: true },
+      { key: 'xxcs', name: '小象超市', defaultOff: true },
+      // 整点抢已并进 meituan_code.js（链路 C，靠环境变量 mt_claim_grab 控制），
+      // 独立的 meituan_grab.js 两个任务都已停用，所以不再提供 mtgrab 勾选项。
+      // 以后要复活独立脚本：在后台「脚本列」里加回 mtgrab=美团整点抢券!off 即可。
     ],
   },
 };
