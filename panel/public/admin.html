@@ -623,7 +623,7 @@ async function doSave(silent) {
         baseUrl: cfg.yyb.baseUrl,
         publicBaseUrl: cfg.yyb.publicBaseUrl,
         // 账号页还没构建时不要动它（undefined 的键会被 JSON.stringify 丢掉）
-        scripts: acctScriptsInput ? textToScripts(acctScriptsInput.value) : undefined,
+        scripts: acctScriptsEditor ? editorValues() : undefined,
       },
     });
     qlSecret.value = '';
@@ -643,7 +643,7 @@ async function doSave(silent) {
 
 /* ---------- 应用宝账号 ---------- */
 
-let acctListEl, acctOut, acctFileInput, acctScriptsInput;
+let acctListEl, acctOut, acctFileInput;
 let dragRef = null;
 
 /* ---------- 「账号跑哪些脚本」的列定义 ---------- */
@@ -659,28 +659,140 @@ function scriptName(key) {
   return (hit && hit.name) || key;
 }
 
-/** 数组 → 输入框文本：mt=美团, sfsy=顺丰, xc=小蚕霸王餐!off（!off = 默认不勾选） */
-function scriptsToText(list) {
-  return (list || []).map((s) => {
-    const label = (s.name && s.name !== s.key ? s.key + '=' + s.name : s.key) + (s.defaultOff ? '!off' : '');
-    return label;
-  }).join(', ');
+/* ---------- 脚本列编辑器（结构化行，不再让用户手写 key=名称 的字符串） ---------- */
+
+let scriptDraft = null;      // [{key, name, defaultOff}]
+let acctScriptsEditor = null;
+let seDragIdx = null;
+
+/** 编辑器里的草稿 → 干净的定义数组（丢空行、key 去重、key 小写） */
+function editorValues() {
+  const seen = new Set();
+  const out = [];
+  for (const s of (scriptDraft || [])) {
+    const key = String((s && s.key) || '').trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const name = String(s.name || '').trim();
+    const item = { key, name: name || key };
+    if (s.defaultOff) item.defaultOff = true;
+    out.push(item);
+  }
+  return out;
 }
 
-/** 输入框文本 → 数组：mt=美团, sfsy=顺丰（也接受只写 key） */
-function textToScripts(text) {
-  return String(text || '')
-    .split(/[,，;；]+/)
-    .map((part) => {
-      const i = part.indexOf('=');
-      const key = (i === -1 ? part : part.slice(0, i)).trim().toLowerCase();
-      let name = (i === -1 ? '' : part.slice(i + 1)).trim();
-      // !off = 这个脚本默认不勾选（新账号不会自动跑它，需要手工勾）
-      const defaultOff = /!off\s*$/i.test(name);
-      name = name.replace(/!off\s*$/i, '').trim();
-      return { key, name: name || key, defaultOff };
-    })
-    .filter((s) => s.key);
+/** 用当前生效的配置重置草稿 */
+function resetScriptDraft() {
+  scriptDraft = scriptDefs().map((s) => ({
+    key: s.key,
+    name: s.name && s.name !== s.key ? s.name : '',
+    defaultOff: !!s.defaultOff,
+  }));
+}
+
+/**
+ * 构建脚本列编辑器。
+ * 返回 { el, paint }：el 直接塞进表单，paint 用于外部改了草稿后重画。
+ * 编辑期间只改草稿，真正落盘还是走「保存配置 / 保存脚本列」。
+ */
+function buildScriptsEditor() {
+  const rowsEl = node('div', { class: 'se-rows' });
+  const emptyEl = node('div', { class: 'se-empty', text: '还没有脚本，点下面「添加脚本」加一行' });
+
+  const paint = () => {
+    rowsEl.textContent = '';
+    const list = scriptDraft || [];
+    emptyEl.style.display = list.length ? 'none' : 'block';
+    list.forEach((item, idx) => rowsEl.appendChild(scriptRow(item, idx, paint)));
+  };
+
+  const addBtn = node('button', {
+    class: 'btn small ghost', type: 'button', text: '＋ 添加脚本',
+    onclick: () => {
+      scriptDraft = (scriptDraft || []).concat([{ key: '', name: '', defaultOff: false }]);
+      paint();
+      const last = rowsEl.querySelector('.se-row:last-child .se-key');
+      if (last) last.focus();
+    },
+  });
+
+  const el = node('div', { class: 'se-wrap' }, [
+    rowsEl,
+    emptyEl,
+    node('div', { class: 'se-foot' }, [addBtn]),
+  ]);
+
+  resetScriptDraft();
+  paint();
+  return { el, paint };
+}
+
+/** 一行：拖动柄 + key + 显示名 + 默认不勾选 + 上移/下移/删除 */
+function scriptRow(item, idx, paint) {
+  const total = (scriptDraft || []).length;
+
+  const keyIn = node('input', {
+    type: 'text', class: 'se-key', placeholder: 'key', autocomplete: 'off',
+    value: item.key || '',
+  });
+  keyIn.addEventListener('input', () => { item.key = keyIn.value; });
+
+  const nameIn = node('input', {
+    type: 'text', class: 'se-name', placeholder: '显示名（留空则用 key）', autocomplete: 'off',
+    value: item.name || '',
+  });
+  nameIn.addEventListener('input', () => { item.name = nameIn.value; });
+
+  const offChk = node('input', { type: 'checkbox' });
+  offChk.checked = !!item.defaultOff;
+  offChk.addEventListener('change', () => { item.defaultOff = offChk.checked; });
+  const offWrap = node('label', { class: 'se-off', title: '勾上后，新账号不会自动跑这个脚本，要手工勾选才跑' }, [
+    offChk,
+    node('span', { text: '默认不勾选' }),
+  ]);
+
+  const move = (delta) => {
+    const to = idx + delta;
+    if (to < 0 || to >= total) return;
+    const [x] = scriptDraft.splice(idx, 1);
+    scriptDraft.splice(to, 0, x);
+    paint();
+  };
+  const up = node('button', { class: 'se-icon', type: 'button', title: '上移', text: '↑', onclick: () => move(-1) });
+  const down = node('button', { class: 'se-icon', type: 'button', title: '下移', text: '↓', onclick: () => move(1) });
+  if (idx === 0) up.disabled = true;
+  if (idx === total - 1) down.disabled = true;
+
+  const del = node('button', {
+    class: 'se-icon se-del', type: 'button', title: '删除', text: '×',
+    onclick: () => { scriptDraft.splice(idx, 1); paint(); },
+  });
+
+  const handle = node('div', { class: 'se-handle', title: '拖动排序', text: '⠿', draggable: 'true' });
+  handle.addEventListener('dragstart', (e) => {
+    seDragIdx = idx;
+    try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(idx)); } catch (_) {}
+    e.currentTarget.parentElement.classList.add('dragging');
+  });
+  handle.addEventListener('dragend', (e) => {
+    e.currentTarget.parentElement.classList.remove('dragging');
+    seDragIdx = null;
+  });
+
+  const row = node('div', { class: 'se-row' }, [handle, keyIn, nameIn, offWrap, up, down, del]);
+  row.addEventListener('dragover', (e) => {
+    if (seDragIdx === null || seDragIdx === idx) return;
+    e.preventDefault();
+  });
+  row.addEventListener('drop', (e) => {
+    if (seDragIdx === null || seDragIdx === idx) return;
+    e.preventDefault();
+    const [x] = scriptDraft.splice(seDragIdx, 1);
+    scriptDraft.splice(idx, 0, x);
+    seDragIdx = null;
+    paint();
+  });
+  return row;
 }
 
 /** 账号的标记串 → key 数组（逗号 / 空格混用都能解析） */
@@ -716,7 +828,7 @@ function buildAccounts() {
     style: 'display:none',
     onchange: (e) => importAccounts(e.target),
   });
-  acctScriptsInput = input('acctScripts', { value: scriptsToText(scriptDefs()) });
+  acctScriptsEditor = buildScriptsEditor();
 
   acctStatsEl = node('div', { class: 'acct-stats' });
   keepAliveEl = node('div');
@@ -754,11 +866,11 @@ function buildAccounts() {
     ]),
     field(
       '脚本列',
-      acctScriptsInput,
-      '决定每个账号后面显示哪几个脚本的勾选框，格式 key=显示名，逗号分隔（如 mt=美团, sfsy=顺丰, ppcs=朴朴）。'
-      + ' key 必须和脚本里自报的一致（sfsy_code.js→sfsy、ppcs_code.js→ppcs、meituan_code.js→mt、'
+      acctScriptsEditor.el,
+      '决定每个账号后面显示哪几个脚本的勾选框，顺序就是勾选框的显示顺序。'
+      + ' key 必须和脚本里自报的一致（meituan_code.js→mt、sfsy_code.js→sfsy、ppcs_code.js→ppcs、'
       + 'xxcs_code.js→xxcs、xcbwc_code.py→xc）。'
-      + ' 名字后面加 !off 表示「默认不勾选」：新账号不会自动跑它，需要你手工勾上才跑。改完点右上角「保存配置」。',
+      + ' 勾上「默认不勾选」，新账号就不会自动跑它，需要手工勾选。改完点下面「保存脚本列」。',
     ),
     node('div', { class: 'row', style: 'margin-bottom:6px' }, [
       node('button', { class: 'btn small ghost', text: '保存脚本列', onclick: (e) => saveScriptColumns(e.target) }),
@@ -775,7 +887,9 @@ async function saveScriptColumns(btn) {
   if (btn) btn.disabled = true;
   const ok = await doSave(true);
   if (ok) {
-    acctScriptsInput.value = scriptsToText(scriptDefs());
+    // 保存成功后 cfg 已刷新，用服务端规整过的结果回填编辑器（丢空行/去重/补默认名）
+    resetScriptDraft();
+    acctScriptsEditor.paint();
     show(acctOut, 'ok', ['✅ 已保存脚本列：' + (scriptDefs().map((s) => s.name + '（' + s.key + '）').join('、') || '（空）')]);
     await loadAccounts();
   } else {
